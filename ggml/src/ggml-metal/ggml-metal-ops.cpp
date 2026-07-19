@@ -2969,7 +2969,8 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         } else {
             nwg = 32;
             nsg = 1;
-            while (2*nwg*nsg*ncpsg < ne11 && nsg < 4) {
+            const int64_t nsg_max = ne11 >= 65536 ? 16 : 4;
+            while (2*nwg*nsg*ncpsg < ne11 && nsg < nsg_max) {
                 nsg *= 2;
             }
         }

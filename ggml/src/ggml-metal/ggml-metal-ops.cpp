@@ -2533,6 +2533,44 @@ bool ggml_metal_op_flash_attn_ext_use_vec(const ggml_tensor * op) {
     return (ne01 < 20) && (ne00 % 32 == 0);
 }
 
+static bool ggml_metal_op_flash_attn_ext_use_vec_gqa_shared(const ggml_tensor * op) {
+    assert(op->op == GGML_OP_FLASH_ATTN_EXT);
+
+    GGML_TENSOR_LOCALS( int32_t, ne0, op->src[0], ne);
+    GGML_TENSOR_LOCALS( int32_t, ne1, op->src[1], ne);
+    GGML_TENSOR_LOCALS( int32_t, ne2, op->src[2], ne);
+
+    if (!ggml_metal_op_flash_attn_ext_use_vec(op)) {
+        return false;
+    }
+
+    if (op->src[1]->type != GGML_TYPE_F16) {
+        return false;
+    }
+
+    // for shallow KV the working set still fits in cache and the per-head re-reads of the
+    // regular vec path are cheap - the shared path pays off only past ~64k (M4 Pro)
+    if (ne11 <= 65536) {
+        return false;
+    }
+
+    if (ne00 != 256 || ne10 != 256 || ne20 != 256) {
+        return false;
+    }
+
+    if (ne01 != 1 || ne03 != 1) {
+        return false;
+    }
+
+    if (ne12 <= 0 || ne02 % ne12 != 0) {
+        return false;
+    }
+
+    const int32_t gqa_ratio = ne02/ne12;
+
+    return gqa_ratio >= 8 && gqa_ratio % 8 == 0 && ne02 % 8 == 0;
+}
+
 size_t ggml_metal_op_flash_attn_ext_extra_pad(const ggml_tensor * op) {
     assert(op->op == GGML_OP_FLASH_ATTN_EXT);
 
@@ -2892,7 +2930,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         // half4x4 kernel
         const int nqptg = OP_FLASH_ATTN_EXT_VEC_NQPSG; // queries per threadgroup
         const int ncpsg = OP_FLASH_ATTN_EXT_VEC_NCPSG; // cache values per simdgroup !! sync with kernel template arguments !!
-        const int nhptg = 1;                           // heads per threadgroup
+        const int nhptg = ggml_metal_op_flash_attn_ext_use_vec_gqa_shared(op) ? 8 : 1; // heads per threadgroup
 
         GGML_ASSERT(nqptg <= 32);
         GGML_ASSERT(nqptg  % 1  == 0);
@@ -2955,6 +2993,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         // each simdgroup has a full f32 head vector in shared mem to accumulate results
         //
 #define FATTN_SMEM(nsg) (GGML_PAD(((GGML_PAD(ne00, 128) + 4*ncpsg + 2*GGML_PAD(ne20, 128))*(nsg))*(sizeof(float)/2), 16))
+#define FATTN_SMEM_GQA(nsg) (GGML_PAD((8*GGML_PAD(ne00, 128) + 3*GGML_PAD(ne20, 128)*(nsg))*(sizeof(float)/2), 16))
 
         int64_t nsg = 1;
 
@@ -3010,7 +3049,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             /*.logit_softcap =*/ logit_softcap,
         };
 
-        auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext_vec(lib, op, has_mask, has_sinks, has_bias, has_scap, has_kvpad, nsg, nwg);
+        auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext_vec(lib, op, has_mask, has_sinks, has_bias, has_scap, has_kvpad, nsg, nwg, nhptg);
 
         GGML_ASSERT(nsg*32 <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
 
@@ -3022,7 +3061,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_buffer  (enc, bid_src3, 4);
         ggml_metal_encoder_set_buffer  (enc, bid_src4, 5);
 
-        const size_t smem = FATTN_SMEM(nsg);
+        const size_t smem = nhptg == 8 ? FATTN_SMEM_GQA(nsg) : FATTN_SMEM(nsg);
 
         //printf("smem: %zu, max: %zu, nsg = %d, nsgmax = %d\n", smem, props_dev->max_theadgroup_memory_size, (int) nsg, (int) nsgmax);
         GGML_ASSERT(smem <= props_dev->max_theadgroup_memory_size);
@@ -3072,6 +3111,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
                 ggml_metal_encoder_dispatch_threadgroups(enc, nrows, 1, 1, 32*nwg, 1, 1);
             }
         }
+#undef FATTN_SMEM_GQA
 #undef FATTN_SMEM
     }
 

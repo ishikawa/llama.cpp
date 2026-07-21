@@ -2673,7 +2673,10 @@ size_t ggml_metal_op_flash_attn_ext_extra_tmp(const ggml_tensor * op) {
     // note: always reserve the temp buffer to avoid graph reallocations
     //if (ggml_metal_op_flash_attn_ext_use_vec(op)) {
     if (true) {
-        const int64_t nwg = 32;
+        // shared-read path (nhptg==8, see ggml_metal_op_flash_attn_ext_use_vec_gqa_shared) uses
+        // nwg=64 to keep GPU occupancy up for deep KV; must match the dispatch-side nwg below,
+        // otherwise the temp buffer underallocates and the reduce kernel overruns it
+        const int64_t nwg = ggml_metal_op_flash_attn_ext_use_vec_gqa_shared(op) ? 64 : 32;
         const int64_t ne01_max = std::min(ne01, 32);
 
         // temp buffer for writing the results from each workgroup
@@ -3006,7 +3009,9 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             nwg = 1;
             nsg = 4;
         } else {
-            nwg = 32;
+            // shared-read path (nhptg==8) launches 1/8 the threadgroups of the non-shared path,
+            // so raise nwg to 64 there to keep the GPU fed; must match extra_tmp's nwg above
+            nwg = nhptg == 8 ? 64 : 32;
             nsg = 1;
             const int64_t nsg_max = ne11 >= 65536 ? 16 : 4;
             while (2*nwg*nsg*ncpsg < ne11 && nsg < nsg_max) {
@@ -3108,7 +3113,10 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
                 ggml_metal_encoder_set_buffer  (enc, bid_tmp, 1);
                 ggml_metal_encoder_set_buffer  (enc, bid_dst, 2);
 
-                ggml_metal_encoder_dispatch_threadgroups(enc, nrows, 1, 1, 32*nwg, 1, 1);
+                // fixed 32 simdgroups (1024 threads) regardless of nwg - must match NSG_RED in
+                // kernel_flash_attn_ext_vec_reduce, which folds nwg partials per lane when nwg > 32
+                constexpr int32_t nsg_reduce = 32;
+                ggml_metal_encoder_dispatch_threadgroups(enc, nrows, 1, 1, 32*nsg_reduce, 1, 1);
             }
         }
 #undef FATTN_SMEM_GQA

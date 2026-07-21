@@ -8128,19 +8128,50 @@ kernel void kernel_flash_attn_ext_vec_reduce(
 #define NWG (FC_flash_attn_ext_vec_reduce_NWG)
 #define DV  (FC_flash_attn_ext_vec_reduce_DV)
 
+    // number of simdgroups in the reduce threadgroup, fixed independently of NWG so the
+    // threadgroup stays within the 1024 threads/threadgroup limit even when NWG > 32.
+    // each lane folds ceil(NWG/NSG_RED) partials locally (registers) before the cross-lane
+    // simd_max/simd_sum, so NWG can grow past N_SIMDWIDTH without changing the launch geometry.
+    constexpr short NSG_RED  = N_SIMDWIDTH;
+    constexpr short NREP_MAX = 4; // supports NWG up to NSG_RED*NREP_MAX = 128
+
     const uint64_t rid = tgpig;
 
-    const short iwg = tiisg;
+    device const float * ss = (device const float *) htmp + (uint64_t)args.nrows*DV*NWG;
 
-    device const float  * ss    = (device const float  *) htmp + (uint64_t)args.nrows*DV*NWG;
+    short iwg[NREP_MAX];
+    float Sp[NREP_MAX];
+    float Mp[NREP_MAX];
 
-    float S = ss[rid*(2*NWG) + 2*iwg + 0];
-    float M = ss[rid*(2*NWG) + 2*iwg + 1];
+    float lm = -FLT_MAX/2;
 
-    const float m  = simd_max(M);
-    const float ms = exp(M - m);
+    FOR_UNROLL (short k = 0; k < NREP_MAX; ++k) {
+        iwg[k] = tiisg + k*NSG_RED;
 
-    S = simd_sum(S*ms);
+        if (iwg[k] < NWG) {
+            Sp[k] = ss[rid*(2*NWG) + 2*iwg[k] + 0];
+            Mp[k] = ss[rid*(2*NWG) + 2*iwg[k] + 1];
+        } else {
+            Sp[k] = 0.0f;
+            Mp[k] = -FLT_MAX/2;
+        }
+
+        lm = max(lm, Mp[k]);
+    }
+
+    // pass 1: global max M across all NWG partials (per-lane fold, then cross-lane simd_max)
+    const float m = simd_max(lm);
+
+    // pass 2: rescale every partial by exp(M_j - m) before accumulating S and O
+    float ms[NREP_MAX];
+    float S = 0.0f;
+
+    FOR_UNROLL (short k = 0; k < NREP_MAX; ++k) {
+        ms[k] = exp(Mp[k] - m);
+        S += Sp[k]*ms[k];
+    }
+
+    S = simd_sum(S);
     S = S == 0.0f ? 0.0f : 1.0f/S;
 
     const short DV4 = DV/4;
@@ -8148,10 +8179,18 @@ kernel void kernel_flash_attn_ext_vec_reduce(
     device const float4 * htmp4 = (device const float4 *) htmp + rid*DV4*NWG;
     device       float4 * dst4  = (device       float4 *) dst  + rid*DV4;
 
-    for (short i = sgitg; i < DV4; i += NWG) {
-        const float4 v = simd_sum(htmp4[i*NWG + iwg]*ms);
+    for (short i = sgitg; i < DV4; i += NSG_RED) {
+        float4 v = 0.0f;
 
-        if (iwg == 0) {
+        FOR_UNROLL (short k = 0; k < NREP_MAX; ++k) {
+            if (iwg[k] < NWG) {
+                v += htmp4[i*NWG + iwg[k]]*ms[k];
+            }
+        }
+
+        v = simd_sum(v);
+
+        if (tiisg == 0) {
             dst4[i] = v*S;
         }
     }

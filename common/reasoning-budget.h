@@ -9,6 +9,7 @@ enum common_reasoning_budget_state {
     REASONING_BUDGET_IDLE,         // waiting for start sequence
     REASONING_BUDGET_COUNTING,     // counting down tokens
     REASONING_BUDGET_FORCING,      // forcing budget message + end sequence
+    REASONING_BUDGET_MIN_FORCING,  // forcing continuation before minimum
     REASONING_BUDGET_WAITING_UTF8, // budget exhausted, waiting for UTF-8 completion
     REASONING_BUDGET_DONE,         // passthrough forever
 };
@@ -29,6 +30,9 @@ enum common_reasoning_budget_state {
 //   end_tokens     - token sequence for natural deactivation
 //   forced_tokens  - token sequence forced when budget expires
 //   budget         - max tokens allowed in the reasoning block
+//   min_tokens     - min tokens to keep in the reasoning block (-1 = disabled)
+//   min_forced     - continuation sequence forced before min_tokens
+//   max_min_forces - max number of continuation injections
 //   initial_state  - initial state
 //
 struct llama_sampler * common_reasoning_budget_init(
@@ -37,6 +41,17 @@ struct llama_sampler * common_reasoning_budget_init(
         const std::vector<llama_token> & end_tokens,
         const std::vector<llama_token> & forced_tokens,
         int32_t                          budget,
+        common_reasoning_budget_state    initial_state = REASONING_BUDGET_IDLE);
+
+struct llama_sampler * common_reasoning_budget_init(
+        const struct llama_vocab       * vocab,
+        const std::vector<llama_token> & start_tokens,
+        const std::vector<llama_token> & end_tokens,
+        const std::vector<llama_token> & forced_tokens,
+        int32_t                          budget,
+        int32_t                          min_tokens,
+        const std::vector<llama_token> & min_forced,
+        int32_t                          max_min_forces,
         common_reasoning_budget_state    initial_state = REASONING_BUDGET_IDLE);
 
 common_reasoning_budget_state common_reasoning_budget_get_state(const struct llama_sampler * smpl);

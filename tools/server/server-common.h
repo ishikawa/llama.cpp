@@ -33,6 +33,10 @@ using raw_buffer = std::vector<uint8_t>;
 
 static constexpr int SERVER_REASONING_EFFORT_MINIMAL_BUDGET_TOKENS = 256;
 static constexpr int SERVER_REASONING_EFFORT_LOW_BUDGET_TOKENS     = 2048;
+// Temporary value pending model eval.
+static constexpr int SERVER_REASONING_EFFORT_XHIGH_MIN_TOKENS      = 8192;
+static constexpr const char * SERVER_REASONING_MIN_MESSAGE         = "Wait,";
+static constexpr int SERVER_REASONING_MIN_INJECTIONS               = 8;
 
 enum server_reasoning_effort {
     SERVER_REASONING_EFFORT_NONE,
@@ -40,6 +44,7 @@ enum server_reasoning_effort {
     SERVER_REASONING_EFFORT_LOW,
     SERVER_REASONING_EFFORT_MEDIUM,
     SERVER_REASONING_EFFORT_HIGH,
+    SERVER_REASONING_EFFORT_XHIGH,
 };
 
 bool server_reasoning_effort_parse(const std::string & value, server_reasoning_effort & effort);
@@ -312,6 +317,9 @@ struct server_chat_params {
     bool enable_thinking = true;
     int  reasoning_budget = -1;
     std::string reasoning_budget_message;
+    int  reasoning_min = -1;
+    std::string reasoning_min_message;
+    int  reasoning_min_injections = SERVER_REASONING_MIN_INJECTIONS;
     std::string media_path;
     bool force_pure_content = false;
 };

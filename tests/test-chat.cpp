@@ -1909,7 +1909,7 @@ static void test_convert_responses_to_chatcmpl() {
     }
 
     // Test Responses reasoning effort conversion
-    for (const auto & effort : { "none", "minimal", "low", "medium", "high" }) {
+    for (const auto & effort : { "none", "minimal", "low", "medium", "high", "xhigh" }) {
         json input = {
             {"input", "Hello"},
             {"model", "test-model"},
@@ -6068,33 +6068,51 @@ static void assert_reasoning_budget(const json & llama_params, int expected) {
     assert_equals(expected, llama_params.at("reasoning_budget_tokens").get<int>());
 }
 
+static void assert_reasoning_min(const json & llama_params, int expected) {
+    if (!llama_params.contains("reasoning_min_tokens")) {
+        throw std::runtime_error("reasoning_min_tokens missing from llama_params");
+    }
+    assert_equals(expected, llama_params.at("reasoning_min_tokens").get<int>());
+}
+
 static void test_reasoning_effort_chat_params() {
     LOG_DBG("%s\n", __func__);
 
     {
         json llama_params = parse_reasoning_effort_chat_params({{"reasoning_effort", "none"}});
         assert_reasoning_budget(llama_params, 1234);
+        assert_reasoning_min(llama_params, -1);
         assert_contains(llama_params.at("prompt").get<std::string>(), "<think>\n\n</think>\n\n");
     }
     {
         json llama_params = parse_reasoning_effort_chat_params({{"reasoning_effort", "minimal"}});
         assert_reasoning_budget(llama_params, SERVER_REASONING_EFFORT_MINIMAL_BUDGET_TOKENS);
+        assert_reasoning_min(llama_params, -1);
     }
     {
         json llama_params = parse_reasoning_effort_chat_params({{"reasoning_effort", "low"}});
         assert_reasoning_budget(llama_params, SERVER_REASONING_EFFORT_LOW_BUDGET_TOKENS);
+        assert_reasoning_min(llama_params, -1);
     }
     {
         json llama_params = parse_reasoning_effort_chat_params({{"reasoning_effort", "medium"}});
         assert_reasoning_budget(llama_params, 1234);
+        assert_reasoning_min(llama_params, -1);
     }
     {
         json llama_params = parse_reasoning_effort_chat_params({{"reasoning_effort", "high"}});
         assert_reasoning_budget(llama_params, -1);
+        assert_reasoning_min(llama_params, -1);
+    }
+    {
+        json llama_params = parse_reasoning_effort_chat_params({{"reasoning_effort", "xhigh"}}, -1);
+        assert_reasoning_budget(llama_params, -1);
+        assert_reasoning_min(llama_params, SERVER_REASONING_EFFORT_XHIGH_MIN_TOKENS);
     }
     {
         json llama_params = parse_reasoning_effort_chat_params({{"reasoning_effort", "invalid"}});
         assert_reasoning_budget(llama_params, 1234);
+        assert_reasoning_min(llama_params, -1);
     }
     {
         json llama_params = parse_reasoning_effort_chat_params({
@@ -6102,6 +6120,7 @@ static void test_reasoning_effort_chat_params() {
             {"reasoning_budget_tokens", 99},
         });
         assert_reasoning_budget(llama_params, 99);
+        assert_reasoning_min(llama_params, -1);
     }
     {
         json llama_params = parse_reasoning_effort_chat_params({
@@ -6111,6 +6130,7 @@ static void test_reasoning_effort_chat_params() {
             }},
         });
         assert_reasoning_budget(llama_params, 1234);
+        assert_reasoning_min(llama_params, -1);
         assert_not_contains(llama_params.at("prompt").get<std::string>(), "<think>\n\n</think>\n\n");
     }
     {
@@ -6121,30 +6141,63 @@ static void test_reasoning_effort_chat_params() {
             }},
         });
         assert_reasoning_budget(llama_params, -1);
+        assert_reasoning_min(llama_params, -1);
+    }
+    {
+        json llama_params = parse_reasoning_effort_chat_params({
+            {"reasoning_effort", "xhigh"},
+            {"reasoning_min_tokens", 42},
+        }, -1);
+        assert_reasoning_budget(llama_params, -1);
+        assert_reasoning_min(llama_params, 42);
+    }
+    {
+        json llama_params = parse_reasoning_effort_chat_params({
+            {"reasoning_min_tokens", 3},
+            {"reasoning_budget_tokens", 5},
+        }, -1);
+        assert_reasoning_budget(llama_params, 5);
+        assert_reasoning_min(llama_params, 3);
+    }
+    {
+        json llama_params = parse_reasoning_effort_chat_params({
+            {"reasoning_min_tokens", 20},
+            {"reasoning_budget_tokens", 5},
+        }, -1);
+        assert_reasoning_budget(llama_params, 5);
+        assert_reasoning_min(llama_params, 5);
     }
 }
 
 static void test_reasoning_effort_responses_params() {
     LOG_DBG("%s\n", __func__);
 
-    const std::vector<std::pair<std::string, int>> cases = {
-        {"none", 1234},
-        {"minimal", SERVER_REASONING_EFFORT_MINIMAL_BUDGET_TOKENS},
-        {"low", SERVER_REASONING_EFFORT_LOW_BUDGET_TOKENS},
-        {"medium", 1234},
-        {"high", -1},
+    struct effort_case {
+        std::string effort;
+        int budget;
+        int min;
+        int opt_budget;
+    };
+    const std::vector<effort_case> cases = {
+        {"none", 1234, -1, 1234},
+        {"minimal", SERVER_REASONING_EFFORT_MINIMAL_BUDGET_TOKENS, -1, 1234},
+        {"low", SERVER_REASONING_EFFORT_LOW_BUDGET_TOKENS, -1, 1234},
+        {"medium", 1234, -1, 1234},
+        {"high", -1, -1, 1234},
+        {"xhigh", -1, SERVER_REASONING_EFFORT_XHIGH_MIN_TOKENS, -1},
     };
 
     for (const auto & c : cases) {
         json responses_body = {
             {"input", "hello"},
             {"reasoning", {
-                {"effort", c.first},
+                {"effort", c.effort},
             }},
         };
         json chat_body = server_chat_convert_responses_to_chatcmpl(responses_body);
-        json llama_params = parse_reasoning_effort_chat_params(chat_body);
-        assert_reasoning_budget(llama_params, c.second);
+        json llama_params = parse_reasoning_effort_chat_params(chat_body, c.opt_budget);
+        assert_reasoning_budget(llama_params, c.budget);
+        assert_reasoning_min(llama_params, c.min);
     }
 
     {
@@ -6157,6 +6210,7 @@ static void test_reasoning_effort_responses_params() {
         json chat_body = server_chat_convert_responses_to_chatcmpl(responses_body);
         json llama_params = parse_reasoning_effort_chat_params(chat_body);
         assert_reasoning_budget(llama_params, 1234);
+        assert_reasoning_min(llama_params, -1);
     }
 }
 

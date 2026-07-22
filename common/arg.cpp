@@ -3438,6 +3438,29 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_THINK_BUDGET_MESSAGE"));
     add_opt(common_arg(
+        {"--reasoning-min"}, "N",
+        "minimum tokens for thinking: -1 for disabled, N>=0 for token minimum (default: -1)",
+        [](common_params & params, int value) {
+            if (value < -1) { throw std::invalid_argument("invalid value"); }
+            params.sampling.reasoning_min_tokens = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_THINK_MIN"));
+    add_opt(common_arg(
+        {"--reasoning-min-message"}, "MESSAGE",
+        "message injected when thinking ends before --reasoning-min (default: Wait,)",
+        [](common_params & params, const std::string & value) {
+            params.sampling.reasoning_min_message = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_THINK_MIN_MESSAGE"));
+    add_opt(common_arg(
+        {"--reasoning-min-injections"}, "N",
+        "maximum continuation injections for --reasoning-min (default: 8)",
+        [](common_params & params, int value) {
+            if (value < 0) { throw std::invalid_argument("invalid value"); }
+            params.sampling.reasoning_min_injections = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_THINK_MIN_INJECTIONS"));
+    add_opt(common_arg(
         {"--reasoning-preserve"},
         {"--no-reasoning-preserve"},
         "preserve reasoning trace in the full history, not just the last assistant message (default: template default)\n"

@@ -383,6 +383,14 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
         ->set_hard_limits(-1, INT32_MAX)
         ->set_desc("Number of tokens in the reasoning budget (-1 = disabled)"));
 
+    add((new field_num("reasoning_min_tokens", params.sampling.reasoning_min_tokens))
+        ->set_hard_limits(-1, INT32_MAX)
+        ->set_desc("Minimum number of tokens in the reasoning block (-1 = disabled)"));
+
+    add((new field_num("reasoning_min_injections", params.sampling.reasoning_min_injections))
+        ->set_hard_limits(0, INT32_MAX)
+        ->set_desc("Maximum number of continuation injections for reasoning_min_tokens"));
+
     add((new field_str("reasoning_budget_start_tag"))
         ->set_desc("Token string marking the start of the reasoning budget section")
         ->set_handler([&](field_eval_context & ctx, const json & data) {
@@ -405,6 +413,15 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
             std::string end_tag = json_value(data, "reasoning_budget_end_tag", std::string());
             std::string message = data.at("reasoning_budget_message").get<std::string>();
             ctx.params.sampling.reasoning_budget_forced = common_tokenize(ctx.vocab, message + end_tag, false, true);
+        }));
+
+    add((new field_str("reasoning_min_message"))
+        ->set_desc("Message forced when a reasoning block ends before reasoning_min_tokens")
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            GGML_ASSERT(ctx.vocab != nullptr);
+            std::string message = data.at("reasoning_min_message").get<std::string>();
+            ctx.params.sampling.reasoning_min_message = message;
+            ctx.params.sampling.reasoning_min_forced = common_tokenize(ctx.vocab, message, false, true);
         }));
 
     add((new field_json("logit_bias"))
@@ -546,11 +563,13 @@ task_params eval_llama_cmpl_schema(
     // debugging
     {
         auto budget = params.sampling.reasoning_budget_tokens;
-        SRV_DBG("reasoning budget: tokens=%d, generation_prompt='%s', start=%zu toks, end=%zu toks, forced=%zu toks\n",
-                budget, params.sampling.generation_prompt.c_str(),
+        auto min = params.sampling.reasoning_min_tokens;
+        SRV_DBG("reasoning budget: tokens=%d, min=%d, generation_prompt='%s', start=%zu toks, end=%zu toks, forced=%zu toks, min_forced=%zu toks\n",
+                budget, min, params.sampling.generation_prompt.c_str(),
                 params.sampling.reasoning_budget_start.size(),
                 params.sampling.reasoning_budget_end.size(),
-                params.sampling.reasoning_budget_forced.size());
+                params.sampling.reasoning_budget_forced.size(),
+                params.sampling.reasoning_min_forced.size());
     }
 
     return params;

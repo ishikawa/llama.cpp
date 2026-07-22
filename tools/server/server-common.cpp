@@ -79,6 +79,10 @@ bool server_reasoning_effort_parse(const std::string & value, server_reasoning_e
         effort = SERVER_REASONING_EFFORT_HIGH;
         return true;
     }
+    if (value == "xhigh") {
+        effort = SERVER_REASONING_EFFORT_XHIGH;
+        return true;
+    }
     return false;
 }
 
@@ -1188,11 +1192,28 @@ json oaicompat_chat_params_parse(
             reasoning_budget = opt.reasoning_budget;
         }
 
+        const bool has_reasoning_min = body.contains("reasoning_min_tokens") && !body.at("reasoning_min_tokens").is_null();
+        int reasoning_min = -1;
+        if (has_reasoning_min) {
+            reasoning_min = json_value(body, "reasoning_min_tokens", -1);
+        } else if (has_reasoning_effort && reasoning_effort == SERVER_REASONING_EFFORT_XHIGH) {
+            reasoning_min = SERVER_REASONING_EFFORT_XHIGH_MIN_TOKENS;
+        } else {
+            reasoning_min = opt.reasoning_min;
+        }
+        if (reasoning_min >= 0 && reasoning_budget >= 0 && reasoning_min > reasoning_budget) {
+            SRV_WRN("reasoning_min_tokens=%d exceeds reasoning_budget_tokens=%d, clamping\n", reasoning_min, reasoning_budget);
+            reasoning_min = reasoning_budget;
+        }
+
         if (!chat_params.thinking_end_tag.empty()) {
             llama_params["reasoning_budget_tokens"] = reasoning_budget;
+            llama_params["reasoning_min_tokens"] = reasoning_min;
             llama_params["reasoning_budget_start_tag"] = chat_params.thinking_start_tag;
             llama_params["reasoning_budget_end_tag"] = chat_params.thinking_end_tag;
             llama_params["reasoning_budget_message"] = json_value(body, "reasoning_budget_message", opt.reasoning_budget_message);
+            llama_params["reasoning_min_message"] = json_value(body, "reasoning_min_message", opt.reasoning_min_message.empty() ? std::string(SERVER_REASONING_MIN_MESSAGE) : opt.reasoning_min_message);
+            llama_params["reasoning_min_injections"] = json_value(body, "reasoning_min_injections", opt.reasoning_min_injections);
             llama_params["reasoning_control"] = json_value(body, "reasoning_control", false);
         }
     }

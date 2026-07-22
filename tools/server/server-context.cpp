@@ -1474,6 +1474,9 @@ private:
                 /* enable_thinking       */ enable_thinking,
                 /* reasoning_budget      */ params_base.sampling.reasoning_budget_tokens,
                 /* reasoning_budget_msg  */ params_base.sampling.reasoning_budget_message,
+                /* reasoning_min         */ params_base.sampling.reasoning_min_tokens,
+                /* reasoning_min_msg     */ params_base.sampling.reasoning_min_message,
+                /* reasoning_min_inj     */ params_base.sampling.reasoning_min_injections,
                 /* media_path            */ params_base.media_path,
                 /* force_pure_content    */ params_base.force_pure_content_parser
             };

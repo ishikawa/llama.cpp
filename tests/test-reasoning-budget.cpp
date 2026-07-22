@@ -147,6 +147,145 @@ static llama_token get_forced_token(struct llama_sampler * sampler, llama_token 
     return finite_token;
 }
 
+static std::vector<llama_token_data> make_candidates(llama_token max_token, llama_token top_token = LLAMA_TOKEN_NULL) {
+    std::vector<llama_token_data> cur;
+    const size_t n_vocab = (size_t) max_token + 1;
+    for (size_t i = 0; i < n_vocab; i++) {
+        float logit = logf((float) (i + 1));
+        if (top_token != LLAMA_TOKEN_NULL && (llama_token) i == top_token) {
+            logit = 1000.0f;
+        }
+        cur.emplace_back(llama_token_data{(llama_token) i, logit, 0.0f});
+    }
+    return cur;
+}
+
+static size_t count_finite_logits(const std::vector<llama_token_data> & cur) {
+    size_t finite = 0;
+    for (const auto & t : cur) {
+        if (std::isfinite(t.logit)) {
+            finite++;
+        }
+    }
+    return finite;
+}
+
+static float logit_for_token(const std::vector<llama_token_data> & cur, llama_token token) {
+    for (const auto & t : cur) {
+        if (t.id == token) {
+            return t.logit;
+        }
+    }
+    return -INFINITY;
+}
+
+static void test_reasoning_min_tokens_force_and_suppress() {
+    const std::vector<llama_token> start = {100};
+    const std::vector<llama_token> end = {101};
+    const std::vector<llama_token> forced = {102, 101};
+    const std::vector<llama_token> min_forced = {150};
+
+    {
+        auto * sampler = common_reasoning_budget_init(nullptr, start, end, forced, 10, 3, min_forced, 8);
+
+        llama_sampler_accept(sampler, 100); // COUNTING, min_remaining=3
+        auto cur = make_candidates(150, 101);
+        llama_token_data_array cur_p = { cur.data(), cur.size(), -1, false };
+        llama_sampler_apply(sampler, &cur_p);
+        GGML_ASSERT(count_finite_logits(cur) == 1);
+        GGML_ASSERT(logit_for_token(cur, 150) != -INFINITY);
+
+        llama_sampler_accept(sampler, 150); // continuation counts toward min
+        llama_sampler_accept(sampler, 50);
+        llama_sampler_accept(sampler, 51); // min reached
+
+        cur = make_candidates(150, 101);
+        cur_p = { cur.data(), cur.size(), -1, false };
+        llama_sampler_apply(sampler, &cur_p);
+        GGML_ASSERT(count_finite_logits(cur) == cur.size() && "end should be allowed after min is reached");
+
+        llama_sampler_accept(sampler, 101);
+        GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_DONE);
+
+        llama_sampler_free(sampler);
+    }
+
+    {
+        auto * sampler = common_reasoning_budget_init(nullptr, start, end, forced, 10, 3, min_forced, 8);
+
+        llama_sampler_accept(sampler, 100);
+        auto cur = make_candidates(150, 50);
+        llama_token_data_array cur_p = { cur.data(), cur.size(), -1, false };
+        llama_sampler_apply(sampler, &cur_p);
+        GGML_ASSERT(count_finite_logits(cur) == cur.size() - 1);
+        GGML_ASSERT(logit_for_token(cur, 101) == -INFINITY && "end token should be suppressed below min");
+
+        llama_sampler_free(sampler);
+    }
+
+    fprintf(stderr, "  Test 'reasoning min force and suppress' passed\n");
+}
+
+static void test_reasoning_min_tokens_partial_end_and_limit() {
+    const std::vector<llama_token> start = {100};
+    const std::vector<llama_token> end = {101, 102};
+    const std::vector<llama_token> forced = {103, 102};
+    const std::vector<llama_token> min_forced = {150};
+
+    {
+        auto * sampler = common_reasoning_budget_init(nullptr, start, end, forced, 10, 3, min_forced, 8);
+
+        llama_sampler_accept(sampler, 100);
+        llama_sampler_accept(sampler, 101); // partial end tag
+        GGML_ASSERT(get_forced_token(sampler, 150) == 150);
+
+        llama_sampler_free(sampler);
+    }
+
+    {
+        auto * sampler = common_reasoning_budget_init(nullptr, start, end, forced, 10, 10, min_forced, 1);
+
+        llama_sampler_accept(sampler, 100);
+        auto cur = make_candidates(150, 101);
+        llama_token_data_array cur_p = { cur.data(), cur.size(), -1, false };
+        llama_sampler_apply(sampler, &cur_p);
+        GGML_ASSERT(count_finite_logits(cur) == 1);
+        GGML_ASSERT(logit_for_token(cur, 150) != -INFINITY);
+        llama_sampler_accept(sampler, 150);
+
+        cur = make_candidates(150, 101);
+        cur_p = { cur.data(), cur.size(), -1, false };
+        llama_sampler_apply(sampler, &cur_p);
+        GGML_ASSERT(count_finite_logits(cur) == cur.size() && "end should be allowed after injection limit");
+
+        llama_sampler_free(sampler);
+    }
+
+    fprintf(stderr, "  Test 'reasoning min partial end and limit' passed\n");
+}
+
+static void test_reasoning_min_tokens_disabled_regression() {
+    const std::vector<llama_token> start = {100};
+    const std::vector<llama_token> end = {101};
+    const std::vector<llama_token> forced = {102, 101};
+    const std::vector<llama_token> min_forced = {150};
+
+    auto * sampler = common_reasoning_budget_init(nullptr, start, end, forced, 10, -1, min_forced, 8);
+
+    llama_sampler_accept(sampler, 100);
+    auto cur = make_candidates(150, 101);
+    llama_token_data_array cur_p = { cur.data(), cur.size(), -1, false };
+    llama_sampler_apply(sampler, &cur_p);
+    GGML_ASSERT(count_finite_logits(cur) == cur.size());
+
+    llama_sampler_accept(sampler, 101);
+    GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_DONE);
+
+    llama_sampler_free(sampler);
+
+    fprintf(stderr, "  Test 'reasoning min disabled regression' passed\n");
+}
+
 static void test_reasoning_budget_clone_mid_counting() {
     const std::vector<llama_token> start = {100};
     const std::vector<llama_token> end = {101};
@@ -383,8 +522,11 @@ int main(void) {
     test_reasoning_budget_clone_mid_counting();
     test_reasoning_budget_clone_mid_forcing();
     test_reasoning_budget_force_manual();
+    test_reasoning_min_tokens_force_and_suppress();
+    test_reasoning_min_tokens_partial_end_and_limit();
+    test_reasoning_min_tokens_disabled_regression();
 
-    printf("OK (9 tests passed)\n");
+    printf("OK (12 tests passed)\n");
 
     printf("Testing UTF-8 boundary detection... ");
     test_utf8_boundary_detection();

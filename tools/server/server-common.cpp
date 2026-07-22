@@ -58,6 +58,30 @@ json format_error_response(const std::string & message, const enum error_type ty
     };
 }
 
+bool server_reasoning_effort_parse(const std::string & value, server_reasoning_effort & effort) {
+    if (value == "none") {
+        effort = SERVER_REASONING_EFFORT_NONE;
+        return true;
+    }
+    if (value == "minimal") {
+        effort = SERVER_REASONING_EFFORT_MINIMAL;
+        return true;
+    }
+    if (value == "low") {
+        effort = SERVER_REASONING_EFFORT_LOW;
+        return true;
+    }
+    if (value == "medium") {
+        effort = SERVER_REASONING_EFFORT_MEDIUM;
+        return true;
+    }
+    if (value == "high") {
+        effort = SERVER_REASONING_EFFORT_HIGH;
+        return true;
+    }
+    return false;
+}
+
 //
 // random string / id
 //
@@ -1071,9 +1095,39 @@ json oaicompat_chat_params_parse(
 
     // merge the template args provided from command line with the args provided in the user request
     auto chat_template_kwargs_object = json_value(body, "chat_template_kwargs", json::object());
+    const bool request_has_enable_thinking_kwarg = chat_template_kwargs_object.contains("enable_thinking");
+    const bool request_has_reasoning_effort_kwarg = chat_template_kwargs_object.contains("reasoning_effort");
     inputs.chat_template_kwargs = opt.chat_template_kwargs;
     for (const auto & item : chat_template_kwargs_object.items()) {
         inputs.chat_template_kwargs[item.key()] = item.value().dump();
+    }
+
+    bool has_reasoning_effort = false;
+    server_reasoning_effort reasoning_effort = SERVER_REASONING_EFFORT_MEDIUM;
+    std::string reasoning_effort_value;
+    if (request_has_reasoning_effort_kwarg) {
+        const auto & value = chat_template_kwargs_object.at("reasoning_effort");
+        if (value.is_string()) {
+            reasoning_effort_value = value.get<std::string>();
+        } else {
+            SRV_WRN("%s\n", "invalid type for \"chat_template_kwargs.reasoning_effort\" ignored");
+        }
+    } else {
+        reasoning_effort_value = json_value(body, "reasoning_effort", std::string());
+    }
+    if (!reasoning_effort_value.empty()) {
+        if (server_reasoning_effort_parse(reasoning_effort_value, reasoning_effort)) {
+            has_reasoning_effort = true;
+            if (!request_has_reasoning_effort_kwarg) {
+                inputs.chat_template_kwargs["reasoning_effort"] = json(reasoning_effort_value).dump();
+            }
+        } else {
+            SRV_WRN("invalid reasoning effort '%s' ignored\n", reasoning_effort_value.c_str());
+        }
+    }
+    if (has_reasoning_effort && reasoning_effort == SERVER_REASONING_EFFORT_NONE && !request_has_enable_thinking_kwarg) {
+        inputs.enable_thinking = false;
+        inputs.chat_template_kwargs["enable_thinking"] = json(false).dump();
     }
 
     // parse the "enable_thinking" kwarg to override the default value
@@ -1117,9 +1171,20 @@ json oaicompat_chat_params_parse(
 
     // Reasoning budget: pass parameters through to sampling layer
     {
-        int reasoning_budget = json_value(body, "reasoning_budget_tokens",
-                               json_value(body, "thinking_budget_tokens", -1));
-        if (reasoning_budget == -1) {
+        const bool has_reasoning_budget = body.contains("reasoning_budget_tokens") && !body.at("reasoning_budget_tokens").is_null();
+        const bool has_thinking_budget  = body.contains("thinking_budget_tokens") && !body.at("thinking_budget_tokens").is_null();
+        int reasoning_budget = -1;
+        if (has_reasoning_budget) {
+            reasoning_budget = json_value(body, "reasoning_budget_tokens", -1);
+        } else if (has_thinking_budget) {
+            reasoning_budget = json_value(body, "thinking_budget_tokens", -1);
+        } else if (has_reasoning_effort && reasoning_effort == SERVER_REASONING_EFFORT_MINIMAL) {
+            reasoning_budget = SERVER_REASONING_EFFORT_MINIMAL_BUDGET_TOKENS;
+        } else if (has_reasoning_effort && reasoning_effort == SERVER_REASONING_EFFORT_LOW) {
+            reasoning_budget = SERVER_REASONING_EFFORT_LOW_BUDGET_TOKENS;
+        } else if (has_reasoning_effort && reasoning_effort == SERVER_REASONING_EFFORT_HIGH) {
+            reasoning_budget = -1;
+        } else {
             reasoning_budget = opt.reasoning_budget;
         }
 

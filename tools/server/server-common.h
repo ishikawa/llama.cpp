@@ -31,6 +31,19 @@ using json = nlohmann::ordered_json;
 
 using raw_buffer = std::vector<uint8_t>;
 
+static constexpr int SERVER_REASONING_EFFORT_MINIMAL_BUDGET_TOKENS = 256;
+static constexpr int SERVER_REASONING_EFFORT_LOW_BUDGET_TOKENS     = 2048;
+
+enum server_reasoning_effort {
+    SERVER_REASONING_EFFORT_NONE,
+    SERVER_REASONING_EFFORT_MINIMAL,
+    SERVER_REASONING_EFFORT_LOW,
+    SERVER_REASONING_EFFORT_MEDIUM,
+    SERVER_REASONING_EFFORT_HIGH,
+};
+
+bool server_reasoning_effort_parse(const std::string & value, server_reasoning_effort & effort);
+
 template <typename T>
 static T json_value(const json & body, const std::string & key, const T & default_value) {
     // Fallback null to default value

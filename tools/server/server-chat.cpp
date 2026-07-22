@@ -16,6 +16,32 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
     chatcmpl_body.erase("input");
     std::vector<json> chatcmpl_messages;
 
+    if (response_body.contains("reasoning") && response_body.at("reasoning").is_object()) {
+        const json & reasoning = response_body.at("reasoning");
+        if (reasoning.contains("effort") && !reasoning.at("effort").is_null()) {
+            if (reasoning.at("effort").is_string()) {
+                const std::string effort_value = reasoning.at("effort").get<std::string>();
+                server_reasoning_effort effort;
+                if (server_reasoning_effort_parse(effort_value, effort)) {
+                    if (!chatcmpl_body.contains("reasoning_effort")) {
+                        chatcmpl_body["reasoning_effort"] = effort_value;
+                    }
+                    if (!chatcmpl_body.contains("chat_template_kwargs")) {
+                        chatcmpl_body["chat_template_kwargs"] = json::object();
+                    }
+                    if (chatcmpl_body.at("chat_template_kwargs").is_object() &&
+                        !chatcmpl_body.at("chat_template_kwargs").contains("reasoning_effort")) {
+                        chatcmpl_body["chat_template_kwargs"]["reasoning_effort"] = effort_value;
+                    }
+                } else {
+                    SRV_WRN("invalid reasoning effort '%s' ignored\n", effort_value.c_str());
+                }
+            } else {
+                SRV_WRN("%s\n", "invalid type for \"reasoning.effort\" ignored");
+            }
+        }
+    }
+
     if (response_body.contains("instructions")) {
         chatcmpl_messages.push_back({
             {"role",    "system"},

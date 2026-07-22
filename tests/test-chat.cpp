@@ -109,6 +109,15 @@ static void assert_contains(const std::string & haystack, const std::string & ne
     }
 }
 
+static void assert_not_contains(const std::string & haystack, const std::string & needle) {
+    if (haystack.find(needle) != std::string::npos) {
+        LOG_ERR("Expected not to contain: %s\n", needle.c_str());
+        LOG_ERR("Actual: %s\n", haystack.c_str());
+        common_log_flush(common_log_main());
+        throw std::runtime_error("Test failed");
+    }
+}
+
 static void assert_ends_with(const std::string & str, const std::string & suffix) {
     if (str.size() < suffix.size() ||
         str.compare(str.size() - suffix.size(), suffix.size(), suffix) != 0) {
@@ -1897,6 +1906,57 @@ static void test_convert_responses_to_chatcmpl() {
         json result = server_chat_convert_responses_to_chatcmpl(input);
 
         assert_equals(false, result.contains("tools"));
+    }
+
+    // Test Responses reasoning effort conversion
+    for (const auto & effort : { "none", "minimal", "low", "medium", "high" }) {
+        json input = {
+            {"input", "Hello"},
+            {"model", "test-model"},
+            {"reasoning", {
+                {"effort", effort},
+            }},
+        };
+
+        json result = server_chat_convert_responses_to_chatcmpl(input);
+
+        assert_equals(std::string(effort), result.at("reasoning_effort").get<std::string>());
+        assert_equals(std::string(effort), result.at("chat_template_kwargs").at("reasoning_effort").get<std::string>());
+    }
+
+    // Test Responses reasoning effort preserves explicit template kwarg
+    {
+        json input = {
+            {"input", "Hello"},
+            {"model", "test-model"},
+            {"reasoning", {
+                {"effort", "low"},
+            }},
+            {"chat_template_kwargs", {
+                {"reasoning_effort", "high"},
+            }},
+        };
+
+        json result = server_chat_convert_responses_to_chatcmpl(input);
+
+        assert_equals(std::string("low"), result.at("reasoning_effort").get<std::string>());
+        assert_equals(std::string("high"), result.at("chat_template_kwargs").at("reasoning_effort").get<std::string>());
+    }
+
+    // Test invalid Responses reasoning effort is ignored
+    {
+        json input = {
+            {"input", "Hello"},
+            {"model", "test-model"},
+            {"reasoning", {
+                {"effort", "invalid"},
+            }},
+        };
+
+        json result = server_chat_convert_responses_to_chatcmpl(input);
+
+        assert_equals(false, result.contains("reasoning_effort"));
+        assert_equals(false, result.contains("chat_template_kwargs"));
     }
 }
 
@@ -5983,6 +6043,123 @@ static void test_reasoning_budget_message_per_request() {
     }
 }
 
+static json parse_reasoning_effort_chat_params(json body, int reasoning_budget = 1234) {
+    auto tmpls = read_templates("models/templates/Qwen-Qwen3-0.6B.jinja");
+
+    server_chat_params opt;
+    opt.tmpls            = std::move(tmpls);
+    opt.use_jinja        = true;
+    opt.enable_thinking  = true;
+    opt.reasoning_budget = reasoning_budget;
+    opt.reasoning_format = COMMON_REASONING_FORMAT_NONE;
+
+    if (!body.contains("messages")) {
+        body["messages"] = json::array({json{{"role", "user"}, {"content", "hello"}}});
+    }
+
+    std::vector<raw_buffer> out_files;
+    return oaicompat_chat_params_parse(body, opt, out_files);
+}
+
+static void assert_reasoning_budget(const json & llama_params, int expected) {
+    if (!llama_params.contains("reasoning_budget_tokens")) {
+        throw std::runtime_error("reasoning_budget_tokens missing from llama_params");
+    }
+    assert_equals(expected, llama_params.at("reasoning_budget_tokens").get<int>());
+}
+
+static void test_reasoning_effort_chat_params() {
+    LOG_DBG("%s\n", __func__);
+
+    {
+        json llama_params = parse_reasoning_effort_chat_params({{"reasoning_effort", "none"}});
+        assert_reasoning_budget(llama_params, 1234);
+        assert_contains(llama_params.at("prompt").get<std::string>(), "<think>\n\n</think>\n\n");
+    }
+    {
+        json llama_params = parse_reasoning_effort_chat_params({{"reasoning_effort", "minimal"}});
+        assert_reasoning_budget(llama_params, SERVER_REASONING_EFFORT_MINIMAL_BUDGET_TOKENS);
+    }
+    {
+        json llama_params = parse_reasoning_effort_chat_params({{"reasoning_effort", "low"}});
+        assert_reasoning_budget(llama_params, SERVER_REASONING_EFFORT_LOW_BUDGET_TOKENS);
+    }
+    {
+        json llama_params = parse_reasoning_effort_chat_params({{"reasoning_effort", "medium"}});
+        assert_reasoning_budget(llama_params, 1234);
+    }
+    {
+        json llama_params = parse_reasoning_effort_chat_params({{"reasoning_effort", "high"}});
+        assert_reasoning_budget(llama_params, -1);
+    }
+    {
+        json llama_params = parse_reasoning_effort_chat_params({{"reasoning_effort", "invalid"}});
+        assert_reasoning_budget(llama_params, 1234);
+    }
+    {
+        json llama_params = parse_reasoning_effort_chat_params({
+            {"reasoning_effort", "low"},
+            {"reasoning_budget_tokens", 99},
+        });
+        assert_reasoning_budget(llama_params, 99);
+    }
+    {
+        json llama_params = parse_reasoning_effort_chat_params({
+            {"reasoning_effort", "none"},
+            {"chat_template_kwargs", {
+                {"enable_thinking", true},
+            }},
+        });
+        assert_reasoning_budget(llama_params, 1234);
+        assert_not_contains(llama_params.at("prompt").get<std::string>(), "<think>\n\n</think>\n\n");
+    }
+    {
+        json llama_params = parse_reasoning_effort_chat_params({
+            {"reasoning_effort", "low"},
+            {"chat_template_kwargs", {
+                {"reasoning_effort", "high"},
+            }},
+        });
+        assert_reasoning_budget(llama_params, -1);
+    }
+}
+
+static void test_reasoning_effort_responses_params() {
+    LOG_DBG("%s\n", __func__);
+
+    const std::vector<std::pair<std::string, int>> cases = {
+        {"none", 1234},
+        {"minimal", SERVER_REASONING_EFFORT_MINIMAL_BUDGET_TOKENS},
+        {"low", SERVER_REASONING_EFFORT_LOW_BUDGET_TOKENS},
+        {"medium", 1234},
+        {"high", -1},
+    };
+
+    for (const auto & c : cases) {
+        json responses_body = {
+            {"input", "hello"},
+            {"reasoning", {
+                {"effort", c.first},
+            }},
+        };
+        json chat_body = server_chat_convert_responses_to_chatcmpl(responses_body);
+        json llama_params = parse_reasoning_effort_chat_params(chat_body);
+        assert_reasoning_budget(llama_params, c.second);
+    }
+
+    {
+        json responses_body = {
+            {"input", "hello"},
+            {"reasoning", {
+                {"effort", "invalid"},
+            }},
+        };
+        json chat_body = server_chat_convert_responses_to_chatcmpl(responses_body);
+        json llama_params = parse_reasoning_effort_chat_params(chat_body);
+        assert_reasoning_budget(llama_params, 1234);
+    }
+}
+
 static void test_msg_diffs_compute() {
     LOG_DBG("%s\n", __func__);
     {
@@ -6142,6 +6319,8 @@ int main(int argc, char ** argv) {
         test_template_generation_prompt();
         test_reasoning_budget_tokens_per_request();
         test_reasoning_budget_message_per_request();
+        test_reasoning_effort_chat_params();
+        test_reasoning_effort_responses_params();
         test_template_output_peg_parsers(detailed_debug);
         std::cout << "\n[chat] All tests passed!" << '\n';
     }

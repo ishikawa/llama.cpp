@@ -7385,43 +7385,39 @@ kernel void kernel_flash_attn_ext_vec(
             }
 
             {
-                device const k4_t * pk4 = (device const k4_t *) (kc + ic*args.nb11);
-                pk4 += tx;
+                if (is_same<kd4_t, k4_t>::value && is_same<q4_t, k4_t>::value) {
+                    device      const half * pk = (device const half *) (kc + ic*args.nb11);
+                    threadgroup const half * pq = (threadgroup const half *) sq4;
 
-                FOR_UNROLL (short cc = 0; cc < C; ++cc) {
-                    qk_t mqk[NHG];
+                    FOR_UNROLL (short cc = 0; cc < C/8; ++cc) {
+                        simdgroup_float8x8 mqk = make_filled_simdgroup_matrix<float, 8>(0.0f);
 
-                    FOR_UNROLL (short h = 0; h < NHG; ++h) {
-                        mqk[h] = 0.0f;
+                        simdgroup_half8x8 mk[2];
+                        simdgroup_half8x8 mq[2];
+
+                        #pragma unroll (MIN(DK/16, 16))
+                        for (short ii = 0; ii < DK/16; ++ii) {
+                            simdgroup_barrier(mem_flags::mem_none);
+
+                            simdgroup_load(mq[0], pq + 0*8 + 16*ii, PK);
+                            simdgroup_load(mq[1], pq + 1*8 + 16*ii, PK);
+
+                            simdgroup_load(mk[0], pk + 8*cc*NS10 + 0*8 + 16*ii, NS10, 0, true);
+                            simdgroup_load(mk[1], pk + 8*cc*NS10 + 1*8 + 16*ii, NS10, 0, true);
+
+                            simdgroup_barrier(mem_flags::mem_none);
+
+                            simdgroup_multiply_accumulate(mqk, mq[0], mk[0], mqk);
+                            simdgroup_multiply_accumulate(mqk, mq[1], mk[1], mqk);
+                        }
+
+                        simdgroup_store(mqk, ss + 8*cc, C, 0, false);
                     }
 
-                    if (is_same<kd4_t, k4_t>::value) {
-                        FOR_UNROLL (short ii = 0; ii < DK4/NL; ++ii) {
-                            const k4_t mk = pk4[cc*NS10/4 + ii*NL];
-
-                            FOR_UNROLL (short h = 0; h < NHG; ++h) {
-                                mqk[h] += dot((float4) mk, (float4) sq4[h*PK4 + ii*NL + tx]);
-                            }
-                        }
-                    } else {
-                        device const kd4_t * pk = (device const kd4_t *) (kc + ((ic + cc)*args.nb11));
-
-                        FOR_UNROLL (short ii = 0; ii < DK4/NL; ++ii) {
-                            const short i = ii*NL + tx;
-
-                            k4_t mk;
-                            deq_k_t4(pk + i/nl_k, i%nl_k, mk);
-
-                            FOR_UNROLL (short h = 0; h < NHG; ++h) {
-                                mqk[h] += dot((float4) mk, (float4) sq4[h*PK4 + i]);
-                            }
-                        }
-                    }
+                    simdgroup_barrier(mem_flags::mem_threadgroup);
 
                     FOR_UNROLL (short h = 0; h < NHG; ++h) {
-                        mqk[h] = simd_sum(mqk[h]);
-
-                        qk_t s = mqk[h]*args.scale;
+                        qk_t s = ss[h*C + tiisg]*args.scale;
 
                         if (FC_flash_attn_ext_vec_has_scap) {
                             s = args.logit_softcap*precise::tanh(s);
@@ -7433,8 +7429,60 @@ kernel void kernel_flash_attn_ext_vec(
                             s += (qk_t) mh[h];
                         }
 
-                        if (tiisg == cc) {
-                            ss[h*C + cc] = active[h] ? s : (qk_t) -MAXHALF;
+                        ss[h*C + tiisg] = active[h] ? s : (qk_t) -MAXHALF;
+                    }
+                } else {
+                    device const k4_t * pk4 = (device const k4_t *) (kc + ic*args.nb11);
+                    pk4 += tx;
+
+                    FOR_UNROLL (short cc = 0; cc < C; ++cc) {
+                        qk_t mqk[NHG];
+
+                        FOR_UNROLL (short h = 0; h < NHG; ++h) {
+                            mqk[h] = 0.0f;
+                        }
+
+                        if (is_same<kd4_t, k4_t>::value) {
+                            FOR_UNROLL (short ii = 0; ii < DK4/NL; ++ii) {
+                                const k4_t mk = pk4[cc*NS10/4 + ii*NL];
+
+                                FOR_UNROLL (short h = 0; h < NHG; ++h) {
+                                    mqk[h] += dot((float4) mk, (float4) sq4[h*PK4 + ii*NL + tx]);
+                                }
+                            }
+                        } else {
+                            device const kd4_t * pk = (device const kd4_t *) (kc + ((ic + cc)*args.nb11));
+
+                            FOR_UNROLL (short ii = 0; ii < DK4/NL; ++ii) {
+                                const short i = ii*NL + tx;
+
+                                k4_t mk;
+                                deq_k_t4(pk + i/nl_k, i%nl_k, mk);
+
+                                FOR_UNROLL (short h = 0; h < NHG; ++h) {
+                                    mqk[h] += dot((float4) mk, (float4) sq4[h*PK4 + i]);
+                                }
+                            }
+                        }
+
+                        FOR_UNROLL (short h = 0; h < NHG; ++h) {
+                            mqk[h] = simd_sum(mqk[h]);
+
+                            qk_t s = mqk[h]*args.scale;
+
+                            if (FC_flash_attn_ext_vec_has_scap) {
+                                s = args.logit_softcap*precise::tanh(s);
+                            }
+
+                            if (FC_flash_attn_ext_vec_has_bias) {
+                                s += (qk_t) mh[h]*slope[h];
+                            } else {
+                                s += (qk_t) mh[h];
+                            }
+
+                            if (tiisg == cc) {
+                                ss[h*C + cc] = active[h] ? s : (qk_t) -MAXHALF;
+                            }
                         }
                     }
                 }

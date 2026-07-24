@@ -356,7 +356,7 @@ void server_response_reader::post_task(server_task && task, bool front) {
     GGML_ASSERT(!task.is_parent() && "not supported, use post_tasks() instead");
     task.index = 0;
     id_tasks.insert(task.id);
-    states.push_back(task.create_state());
+    states.push_back(task.create_state(vocab));
     queue_results.add_waiting_task_id(task.id);
     queue_tasks.post(std::move(task), front);
 }
@@ -368,11 +368,11 @@ void server_response_reader::post_tasks(std::vector<server_task> && tasks, bool 
     size_t index = 0;
     for (auto & task : tasks) {
         task.index = index++;
-        states.push_back(task.create_state());
+        states.push_back(task.create_state(vocab));
         // for child tasks
         for (auto & child_task : task.child_tasks) {
             child_task.index = index++;
-            states.push_back(child_task.create_state());
+            states.push_back(child_task.create_state(vocab));
         }
     }
     GGML_ASSERT(states.size() == id_tasks.size());

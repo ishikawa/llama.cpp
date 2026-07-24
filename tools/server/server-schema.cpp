@@ -376,6 +376,21 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
             }
         }));
 
+    add((new field_nested("reasoning"))
+        ->add_subfield((new field_str("summary"))
+            ->set_desc("When set to \"auto\", \"concise\", or \"detailed\" (OpenAI Responses API), "
+                       "the reasoning output item's 'summary' array is populated with the raw thinking text")
+            ->set_handler([&](field_eval_context & ctx, const json & data) {
+                static const std::vector<std::string> valid_reasoning_summary = {"auto", "concise", "detailed"};
+                const std::string summary_value = data.at("summary").get<std::string>();
+                if (std::find(valid_reasoning_summary.begin(), valid_reasoning_summary.end(), summary_value) != valid_reasoning_summary.end()) {
+                    ctx.params.oaicompat_reasoning_summary = true;
+                } else {
+                    SRV_WRN("invalid reasoning.summary '%s' ignored\n", summary_value.c_str());
+                }
+            }))
+        ->set_desc("Reasoning options (OpenAI Responses API)"));
+
     add((new field_bool("reasoning_control", params.sampling.reasoning_control))
         ->set_desc("Create the budget sampler on demand so reasoning can be ended at runtime"));
 

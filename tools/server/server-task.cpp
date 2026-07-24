@@ -561,9 +561,16 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp() {
     std::vector<json> output;
 
     if (msg.reasoning_content != "") {
+        json summary = json::array();
+        if (generation_params.oaicompat_reasoning_summary) {
+            summary.push_back(json {
+                {"type", "summary_text"},
+                {"text", msg.reasoning_content},
+            });
+        }
         output.push_back(json {
             {"id",      "rs_" + random_string()},
-            {"summary", json::array()},
+            {"summary", summary},
             {"type",    "reasoning"},
             {"content", json::array({ json {
                 {"text", msg.reasoning_content},
@@ -613,7 +620,8 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp() {
             {"input_tokens",  n_prompt_tokens},
             {"output_tokens", n_decoded},
             {"total_tokens",  n_decoded + n_prompt_tokens},
-            {"input_tokens_details", json { {"cached_tokens", n_prompt_tokens_cache} }},
+            {"input_tokens_details",  json { {"cached_tokens",   n_prompt_tokens_cache} }},
+            {"output_tokens_details", json { {"reasoning_tokens", n_reasoning_tokens} }},
         }},
     };
 
@@ -625,9 +633,27 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp_stream() {
     std::vector<json> output;
 
     if (oaicompat_msg.reasoning_content != "") {
+        json summary = json::array();
+        if (generation_params.oaicompat_reasoning_summary) {
+            summary.push_back(json {
+                {"type", "summary_text"},
+                {"text", oaicompat_msg.reasoning_content},
+            });
+
+            server_sent_events.push_back(json {
+                {"event", "response.reasoning_summary_text.done"},
+                {"data", json {
+                    {"type",         "response.reasoning_summary_text.done"},
+                    {"item_id",      oai_resp_reasoning_id},
+                    {"summary_index", 0},
+                    {"text",         oaicompat_msg.reasoning_content},
+                }}
+            });
+        }
+
         const json output_item = json {
             {"id",      oai_resp_reasoning_id},
-            {"summary", json::array()},
+            {"summary", summary},
             {"type",    "reasoning"},
             {"content", json::array({ json {
                 {"text", oaicompat_msg.reasoning_content},
@@ -724,7 +750,8 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp_stream() {
                     {"input_tokens",  n_prompt_tokens},
                     {"output_tokens", n_decoded},
                     {"total_tokens",  n_decoded + n_prompt_tokens},
-                    {"input_tokens_details", json { {"cached_tokens", n_prompt_tokens_cache} }},
+                    {"input_tokens_details",  json { {"cached_tokens",   n_prompt_tokens_cache} }},
+                    {"output_tokens_details", json { {"reasoning_tokens", n_reasoning_tokens} }},
                 }}
             }},
         }}
@@ -1254,6 +1281,18 @@ json server_task_result_cmpl_partial::to_json_oaicompat_resp() {
                     {"item_id", oai_resp_reasoning_id},
                 }},
             });
+
+            if (oaicompat_reasoning_summary) {
+                events.push_back(json {
+                    {"event", "response.reasoning_summary_text.delta"},
+                    {"data", json {
+                        {"type",         "response.reasoning_summary_text.delta"},
+                        {"delta",        diff.reasoning_content_delta},
+                        {"item_id",      oai_resp_reasoning_id},
+                        {"summary_index", 0},
+                    }},
+                });
+            }
         }
 
         if (!diff.content_delta.empty()) {

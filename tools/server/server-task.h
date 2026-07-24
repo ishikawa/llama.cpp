@@ -84,6 +84,11 @@ struct task_params {
     std::string        oaicompat_model;
     std::string        oaicompat_cmpl_id;
 
+    // OpenAI Responses API: when true, the request asked for `reasoning.summary`
+    // (any of "auto" / "concise" / "detailed"), so the reasoning output item's
+    // `summary` array should be populated
+    bool               oaicompat_reasoning_summary = false;
+
     // realtime control (SERVER_TASK_TYPE_CONTROL)
     std::string        control_action;
     std::string        control_cmpl_id;
@@ -122,6 +127,9 @@ struct task_result_state {
     const std::string oai_resp_reasoning_id;
     const std::string oai_resp_message_id;
     std::string oai_resp_fc_id; // function call ID for current args delta
+
+    // vocab used to compute usage.output_tokens_details.reasoning_tokens (may be null)
+    const llama_vocab * vocab = nullptr;
 
     task_result_state(const common_chat_parser_params & chat_parser_params);
 
@@ -246,8 +254,10 @@ struct server_task {
 
     // the task will be moved into queue, then onto slots
     // however, the state must be kept by caller (e.g., HTTP thread)
-    task_result_state create_state() const {
-        return task_result_state(params.chat_parser_params);
+    task_result_state create_state(const llama_vocab * vocab = nullptr) const {
+        task_result_state state(params.chat_parser_params);
+        state.vocab = vocab;
+        return state;
     }
 
     bool is_parent() const {
@@ -376,6 +386,10 @@ struct server_task_result_cmpl_final : server_task_result {
     std::string oai_resp_reasoning_id;
     std::string oai_resp_message_id;
 
+    // number of tokens in oaicompat_msg.reasoning_content, to be populated by update()
+    // (0 when there is no reasoning content, or when no vocab was available to tokenize it)
+    int32_t n_reasoning_tokens = 0;
+
     virtual bool is_stop() override {
         return true; // in stream mode, final responses are considered stop
     }
@@ -389,6 +403,10 @@ struct server_task_result_cmpl_final : server_task_result {
         oai_resp_id = state.oai_resp_id;
         oai_resp_reasoning_id = state.oai_resp_reasoning_id;
         oai_resp_message_id = state.oai_resp_message_id;
+
+        if (!oaicompat_msg.reasoning_content.empty() && state.vocab != nullptr) {
+            n_reasoning_tokens = (int32_t) common_tokenize(state.vocab, oaicompat_msg.reasoning_content, false, true).size();
+        }
     }
 
     json to_json_non_oaicompat();
@@ -435,6 +453,9 @@ struct server_task_result_cmpl_partial : server_task_result {
     std::string        oaicompat_cmpl_id;
     std::vector<common_chat_msg_diff> oaicompat_msg_diffs; // to be populated by update()
     bool is_updated = false;
+
+    // see task_params::oaicompat_reasoning_summary
+    bool oaicompat_reasoning_summary = false;
 
     // Streaming state copied from task_result_state for this chunk
     bool thinking_block_started = false;

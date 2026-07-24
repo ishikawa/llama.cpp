@@ -177,9 +177,13 @@ struct server_response_reader {
     // only used by streaming completions
     std::vector<task_result_state> states;
 
+    // vocab passed down to task_result_state so results can compute
+    // usage.output_tokens_details.reasoning_tokens (may be null)
+    const llama_vocab * vocab = nullptr;
+
     // should_stop function will be called each polling_interval_seconds
-    server_response_reader(server_queue & queue_tasks, server_response & queue_results, int polling_interval_seconds)
-        : queue_tasks(queue_tasks), queue_results(queue_results), polling_interval_seconds(polling_interval_seconds) {}
+    server_response_reader(server_queue & queue_tasks, server_response & queue_results, int polling_interval_seconds, const llama_vocab * vocab = nullptr)
+        : queue_tasks(queue_tasks), queue_results(queue_results), polling_interval_seconds(polling_interval_seconds), vocab(vocab) {}
     ~server_response_reader() {
         stop();
     }

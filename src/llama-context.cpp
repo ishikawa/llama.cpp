@@ -1768,6 +1768,13 @@ int llama_context::decode(const llama_batch & batch_inp) {
     n_queued_tokens += n_tokens_all;
 
     // TODO: this clear of the buffer can easily be forgotten - need something better
+    // embeddings extracted via LLAMA_POOLING_TYPE_{MEAN,CLS,LAST,RANK} are copied into
+    // embd_seq asynchronously (see ggml_backend_tensor_get_async); a caller that issues
+    // back-to-back decode() calls without reading the output in between (e.g. mtmd image
+    // chunking) can otherwise free this buffer while the backend is still writing to it
+    if (!embd_seq.empty()) {
+        synchronize();
+    }
     embd_seq.clear();
     output_swaps.clear();
 

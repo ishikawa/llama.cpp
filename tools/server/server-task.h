@@ -388,6 +388,10 @@ struct server_task_result_cmpl_final : server_task_result {
 
     // number of tokens in oaicompat_msg.reasoning_content, to be populated by update()
     // (0 when there is no reasoning content, or when no vocab was available to tokenize it)
+    // this is an approximation from re-tokenizing the parsed reasoning text, not the
+    // actual count of tokens generated as reasoning: the chat parser strips delimiters
+    // (e.g. <think>/</think>) before this string is built, so re-tokenizing it can drift
+    // slightly from the token count produced during generation
     int32_t n_reasoning_tokens = 0;
 
     virtual bool is_stop() override {

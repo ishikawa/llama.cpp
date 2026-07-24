@@ -660,6 +660,7 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp_stream() {
                 {"type", "reasoning_text"},
             }})},
             {"encrypted_content", ""},
+            {"status",            "completed"},
         };
 
         server_sent_events.push_back(json {

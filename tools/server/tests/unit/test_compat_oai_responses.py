@@ -142,6 +142,7 @@ def test_responses_reasoning_summary(stream):
         assert res.status_code == 200
         reasoning_items = [item for item in res.body["output"] if item["type"] == "reasoning"]
         assert len(reasoning_items) == 1, f'Expected exactly one reasoning item, got {res.body["output"]}'
+        assert reasoning_items[0]["status"] == "completed"
         summary = reasoning_items[0]["summary"]
         assert len(summary) == 1, f'Expected one summary part, got {summary}'
         assert summary[0]["type"] == "summary_text"
@@ -164,6 +165,7 @@ def test_responses_reasoning_summary(stream):
 
         reasoning_items = [item for item in response["output"] if item["type"] == "reasoning"]
         assert len(reasoning_items) == 1
+        assert reasoning_items[0]["status"] == "completed"
         assert len(reasoning_items[0]["summary"]) == 1
         assert reasoning_items[0]["summary"][0]["type"] == "summary_text"
         assert response["usage"]["output_tokens_details"]["reasoning_tokens"] > 0
@@ -192,5 +194,6 @@ def test_responses_reasoning_summary_not_requested():
     assert res.status_code == 200
     reasoning_items = [item for item in res.body["output"] if item["type"] == "reasoning"]
     assert len(reasoning_items) == 1
+    assert reasoning_items[0]["status"] == "completed"
     assert reasoning_items[0]["summary"] == []
     assert res.body["usage"]["output_tokens_details"]["reasoning_tokens"] > 0

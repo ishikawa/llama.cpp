@@ -3925,7 +3925,7 @@ private:
     }
 
     server_response_reader get_response_reader() {
-        return server_response_reader(queue_tasks, queue_results, HTTP_POLLING_SECONDS);
+        return server_response_reader(queue_tasks, queue_results, HTTP_POLLING_SECONDS, vocab);
     }
 };
 

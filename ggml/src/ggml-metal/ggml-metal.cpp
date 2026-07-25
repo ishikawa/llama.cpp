@@ -565,6 +565,19 @@ static void ggml_backend_metal_set_n_cb(ggml_backend_t backend, int n_cb) {
     ggml_metal_set_n_cb(ctx, n_cb);
 }
 
+// number of command buffers used to encode a graph, overridable with GGML_METAL_N_CB
+// (values above GGML_METAL_MAX_COMMAND_BUFFERS are clamped by ggml_metal_set_n_cb)
+static int ggml_backend_metal_n_cb_default(void) {
+    const char * val = getenv("GGML_METAL_N_CB");
+    if (val == NULL) {
+        return 1;
+    }
+
+    const int n_cb = atoi(val);
+
+    return n_cb < 1 ? 1 : n_cb;
+}
+
 static ggml_backend_i ggml_backend_metal_i = {
     /* .get_name                = */ ggml_backend_metal_name,
     /* .free                    = */ ggml_backend_metal_free,
@@ -608,7 +621,7 @@ ggml_backend_t ggml_backend_metal_init(void) {
         /* .context   = */ ctx,
     };
 
-    ggml_backend_metal_set_n_cb(backend, 1);
+    ggml_backend_metal_set_n_cb(backend, ggml_backend_metal_n_cb_default());
 
     return backend;
 }
@@ -702,7 +715,7 @@ static ggml_backend_t ggml_backend_metal_device_init_backend(ggml_backend_dev_t 
         /* .context   = */ ctx,
     };
 
-    ggml_backend_metal_set_n_cb(backend, 1);
+    ggml_backend_metal_set_n_cb(backend, ggml_backend_metal_n_cb_default());
 
     return backend;
 

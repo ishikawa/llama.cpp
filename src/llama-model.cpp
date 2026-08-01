@@ -2738,7 +2738,8 @@ llama_model_base::llama_model_base(const struct llama_model_params & params) : l
     TENSOR_DUPLICATED     (llama_model_loader::TENSOR_DUPLICATED),
     TENSOR_NOT_REQUIRED   (llama_model_loader::TENSOR_NOT_REQUIRED),
     TENSOR_SKIP           (llama_model_loader::TENSOR_SKIP),
-    TENSOR_SKIP_IF_VIRTUAL(llama_model_loader::TENSOR_SKIP_IF_VIRTUAL) {}
+    TENSOR_SKIP_IF_VIRTUAL(llama_model_loader::TENSOR_SKIP_IF_VIRTUAL),
+    TENSOR_SKIP_REPACK    (llama_model_loader::TENSOR_SKIP_REPACK) {}
 
 ggml_tensor * llama_model_base::create_tensor(const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     GGML_ASSERT(ml != nullptr);

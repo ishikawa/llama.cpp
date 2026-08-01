@@ -12,6 +12,7 @@
 #include <cstring>
 #include <future>
 #include <regex>
+#include <unordered_set>
 
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
@@ -1051,6 +1052,33 @@ static ggml_backend_buffer_type_t select_weight_buft(const llama_hparams & hpara
     return nullptr;
 }
 
+static const std::unordered_set<ggml_backend_buffer_type_t> & get_cpu_extra_bufts() {
+    static const std::unordered_set<ggml_backend_buffer_type_t> bufts = [] {
+        std::unordered_set<ggml_backend_buffer_type_t> result;
+
+        auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        if (!cpu_dev) {
+            throw std::runtime_error(format("%s: no CPU backend found", "get_cpu_extra_bufts"));
+        }
+
+        auto * cpu_reg = ggml_backend_dev_backend_reg(cpu_dev);
+        auto ggml_backend_dev_get_extra_bufts_fn = (ggml_backend_dev_get_extra_bufts_t)
+            ggml_backend_reg_get_proc_address(cpu_reg, "ggml_backend_dev_get_extra_bufts");
+
+        if (ggml_backend_dev_get_extra_bufts_fn) {
+            ggml_backend_buffer_type_t * extra_bufts = ggml_backend_dev_get_extra_bufts_fn(cpu_dev);
+            while (extra_bufts && *extra_bufts) {
+                result.insert(*extra_bufts);
+                ++extra_bufts;
+            }
+        }
+
+        return result;
+    }();
+
+    return bufts;
+}
+
 struct ggml_tensor * llama_model_loader::create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
@@ -1190,7 +1218,19 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         }
 
         if (!buft) {
-            buft = select_weight_buft(hparams, t_meta, op, buft_list);
+            buft_list_t buft_list_skip_repack;
+            const buft_list_t * buft_list_select = buft_list;
+            if (flags & TENSOR_SKIP_REPACK) {
+                const auto & extra_bufts = get_cpu_extra_bufts();
+                for (const auto & cur : *buft_list) {
+                    if (extra_bufts.find(cur.second) == extra_bufts.end()) {
+                        buft_list_skip_repack.emplace_back(cur);
+                    }
+                }
+                buft_list_select = &buft_list_skip_repack;
+            }
+
+            buft = select_weight_buft(hparams, t_meta, op, buft_list_select);
             if (!buft) {
                 throw std::runtime_error(format("failed to find a compatible buffer type for tensor %s", tn.str().c_str()));
             }

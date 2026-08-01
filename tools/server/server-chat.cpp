@@ -40,6 +40,7 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
                 SRV_WRN("%s\n", "invalid type for \"reasoning.effort\" ignored");
             }
         }
+        chatcmpl_body.erase("reasoning");
     }
 
     if (response_body.contains("instructions")) {

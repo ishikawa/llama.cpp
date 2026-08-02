@@ -1724,6 +1724,9 @@ bool llama_model::use_mmap() const {
 }
 
 void llama_model::set_file_paths(std::vector<std::string> paths) {
+    // FILE*-based loading has no file name; keep only usable paths so the
+    // prefetcher is not created just to fail on open("")
+    paths.erase(std::remove(paths.begin(), paths.end(), std::string()), paths.end());
     pimpl->file_paths = std::move(paths);
 }
 

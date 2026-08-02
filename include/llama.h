@@ -370,7 +370,6 @@ extern "C" {
         float    yarn_attn_factor; // YaRN magnitude scaling factor
         float    yarn_beta_fast;   // YaRN low correction dim
         float    yarn_beta_slow;   // YaRN high correction dim
-        float    prefetch_gibps;   // paced model file prefetch rate, 0 = disabled
         uint32_t yarn_orig_ctx;    // YaRN original context size
         float    defrag_thold;     // [DEPRECATED] defragment the KV cache if holes/size > thold, <= 0 disabled (default)
 
@@ -407,6 +406,9 @@ extern "C" {
         // a source/target/parent context
         // can be utilized in various ways, for example by sharing results or llama_memory between 2 contexts
         struct llama_context * ctx_other;
+
+        // appended at the end so prior field offsets stay stable
+        float prefetch_gibps; // paced model file prefetch rate, 0 = disabled
     };
 
     struct llama_model_tensor_override {

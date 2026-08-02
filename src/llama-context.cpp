@@ -60,7 +60,12 @@ public:
     }
 
     void stop() {
-        stop_flag.store(true, std::memory_order_relaxed);
+        {
+            // hold the lock while setting the flag so a waiter cannot miss the notify
+            // between its predicate check and parking on the condition variable
+            std::lock_guard<std::mutex> lock(mutex);
+            stop_flag.store(true, std::memory_order_relaxed);
+        }
         cv.notify_all();
         if (worker.joinable()) {
             worker.join();
@@ -583,9 +588,15 @@ llama_context::llama_context(
         }
     }
 
+#if defined(_WIN32)
+    if (cparams.prefetch_gibps > 0.0f) {
+        LLAMA_LOG_WARN("%s: prefetch_gibps is not supported on Windows and will be ignored\n", __func__);
+    }
+#else
     if (cparams.prefetch_gibps > 0.0f && model.use_mmap() && !model.file_paths().empty()) {
         prefetcher = std::make_unique<llama_paced_prefetcher>(model.file_paths(), cparams.prefetch_gibps);
     }
+#endif
 }
 
 llama_context::~llama_context() {
@@ -1990,12 +2001,19 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         ggml_status status;
 
+        // stops the prefetcher even if process_ubatch throws
+        struct prefetch_stop_guard {
+            llama_paced_prefetcher * p;
+            ~prefetch_stop_guard() { if (p) { p->stop(); } }
+        } prefetch_stop { prefetcher.get() };
+
         if (prefetcher) {
             prefetcher->start(ubatch.n_tokens);
         }
 
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
 
+        prefetch_stop.p = nullptr;
         if (prefetcher) {
             prefetcher->stop();
         }
@@ -3630,7 +3648,6 @@ llama_context_params llama_context_default_params() {
         /*.yarn_attn_factor            =*/ -1.0f,
         /*.yarn_beta_fast              =*/ -1.0f,
         /*.yarn_beta_slow              =*/ -1.0f,
-        /*.prefetch_gibps              =*/ 0.0f,
         /*.yarn_orig_ctx               =*/ 0,
         /*.defrag_thold                =*/ -1.0f,
         /*.cb_eval                     =*/ nullptr,
@@ -3648,6 +3665,7 @@ llama_context_params llama_context_default_params() {
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
+        /*.prefetch_gibps              =*/ 0.0f,
     };
 
     return result;

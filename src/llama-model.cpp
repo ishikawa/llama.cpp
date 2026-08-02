@@ -35,6 +35,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
@@ -1015,6 +1016,8 @@ struct llama_model::impl {
     // model memory mapped files
     llama_mmaps mappings;
 
+    std::vector<std::string> file_paths;
+
     // objects representing data potentially being locked in memory
     llama_mlocks mlock_bufs;
     llama_mlocks mlock_mmaps;
@@ -1710,6 +1713,18 @@ uint32_t llama_model::n_gpu_layers() const {
 
 llama_split_mode llama_model::split_mode() const {
     return params.split_mode;
+}
+
+const std::vector<std::string> & llama_model::file_paths() const {
+    return pimpl->file_paths;
+}
+
+bool llama_model::use_mmap() const {
+    return !pimpl->mappings.empty();
+}
+
+void llama_model::set_file_paths(std::vector<std::string> paths) {
+    pimpl->file_paths = std::move(paths);
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() const {

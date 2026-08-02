@@ -493,6 +493,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_dsv4_hc_post(ctx, idx);
             } break;
+        case GGML_OP_LIGHTNING_INDEXER:
+            {
+                n_fuse = ggml_metal_op_lightning_indexer(ctx, idx);
+            } break;
         default:
             {
                 GGML_LOG_ERROR("%s: error: node %3d, op = %8s not implemented\n", __func__, idx, ggml_op_name(node->op));
@@ -3258,8 +3262,14 @@ int ggml_metal_op_bin(ggml_metal_op_t ctx, int idx) {
     GGML_TENSOR_LOCALS( int32_t, ne,  op,         ne);
     GGML_TENSOR_LOCALS(uint64_t, nb,  op,         nb);
 
-    GGML_ASSERT(op->src[0]->type == GGML_TYPE_F32);
-    GGML_ASSERT(op->src[1]->type == GGML_TYPE_F32);
+    if (op->op == GGML_OP_ADD) {
+        GGML_ASSERT(op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16);
+        GGML_ASSERT(op->src[1]->type == op->src[0]->type);
+        GGML_ASSERT(op->type        == op->src[0]->type);
+    } else {
+        GGML_ASSERT(op->src[0]->type == GGML_TYPE_F32);
+        GGML_ASSERT(op->src[1]->type == GGML_TYPE_F32);
+    }
 
     GGML_ASSERT(ggml_is_contiguous_rows(op->src[0]));
     GGML_ASSERT(ggml_is_contiguous_rows(op->src[1]));
@@ -5142,6 +5152,69 @@ int ggml_metal_op_dsv4_hc_post(ggml_metal_op_t ctx, int idx) {
     const int64_t n   = (nr + nth - 1) / nth;
 
     ggml_metal_encoder_dispatch_threadgroups(enc, n, 1, 1, nth, 1, 1);
+
+    return 1;
+}
+
+int ggml_metal_op_lightning_indexer(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    const ggml_tensor * q = op->src[0];
+    const ggml_tensor * k = op->src[1];
+    const ggml_tensor * w = op->src[2];
+    const ggml_tensor * m = op->src[3];
+
+    GGML_ASSERT(q->type    == GGML_TYPE_F32);
+    GGML_ASSERT(w->type    == GGML_TYPE_F32);
+    GGML_ASSERT(m->type    == GGML_TYPE_F16);
+    GGML_ASSERT(op->type   == GGML_TYPE_F32);
+    GGML_ASSERT(k->type    == GGML_TYPE_F32 || k->type == GGML_TYPE_F16);
+
+    GGML_TENSOR_LOCALS(uint64_t, nbq, q,  nb);
+    GGML_TENSOR_LOCALS(uint64_t, nbk, k,  nb);
+    GGML_TENSOR_LOCALS(uint64_t, nbw, w,  nb);
+    GGML_TENSOR_LOCALS(uint64_t, nbm, m,  nb);
+    GGML_TENSOR_LOCALS(uint64_t, nb,  op, nb);
+
+    const int64_t n_embd   = q->ne[0];
+    const int64_t n_head   = q->ne[1];
+    const int64_t n_tokens = q->ne[2];
+    const int64_t n_stream = q->ne[3];
+    const int64_t n_kv     = k->ne[2];
+    const int64_t nem3     = m->ne[3];
+
+    ggml_metal_kargs_lightning_indexer args = {
+        /*.n_embd =*/ n_embd,
+        /*.n_head =*/ n_head,
+        /*.n_kv   =*/ n_kv,
+        /*.nem3   =*/ nem3,
+        /*.nbq1   =*/ nbq1,
+        /*.nbq2   =*/ nbq2,
+        /*.nbq3   =*/ nbq3,
+        /*.nbk2   =*/ nbk2,
+        /*.nbk3   =*/ nbk3,
+        /*.nbw1   =*/ nbw1,
+        /*.nbw3   =*/ nbw3,
+        /*.nbm1   =*/ nbm1,
+        /*.nbm3   =*/ nbm3,
+        /*.nb1    =*/ nb1,
+        /*.nb3    =*/ nb3,
+    };
+
+    auto pipeline = ggml_metal_library_get_pipeline_lightning_indexer(lib, k->type);
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes  (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer (enc, ggml_metal_get_buffer_id(q),  1);
+    ggml_metal_encoder_set_buffer (enc, ggml_metal_get_buffer_id(k),  2);
+    ggml_metal_encoder_set_buffer (enc, ggml_metal_get_buffer_id(w),  3);
+    ggml_metal_encoder_set_buffer (enc, ggml_metal_get_buffer_id(m),  4);
+    ggml_metal_encoder_set_buffer (enc, ggml_metal_get_buffer_id(op), 5);
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, n_kv, n_tokens, n_stream, 32, 1, 1);
 
     return 1;
 }

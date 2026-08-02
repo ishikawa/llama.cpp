@@ -1267,4 +1267,22 @@ typedef struct {
     uint64_t nbd2;
 } ggml_metal_kargs_dsv4_hc_post;
 
+typedef struct {
+    int64_t  n_embd;
+    int64_t  n_head;
+    int64_t  n_kv;
+    int64_t  nem3;
+    uint64_t nbq1;
+    uint64_t nbq2;
+    uint64_t nbq3;
+    uint64_t nbk2;
+    uint64_t nbk3;
+    uint64_t nbw1;
+    uint64_t nbw3;
+    uint64_t nbm1;
+    uint64_t nbm3;
+    uint64_t nb1;
+    uint64_t nb3;
+} ggml_metal_kargs_lightning_indexer;
+
 #endif // GGML_METAL_IMPL

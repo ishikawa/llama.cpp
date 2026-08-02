@@ -1177,6 +1177,9 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 }
             }
         case GGML_OP_ADD:
+            return ggml_is_contiguous_rows(op->src[0]) && ggml_is_contiguous_rows(op->src[1]) &&
+                op->src[0]->type == op->src[1]->type && op->src[0]->type == op->type &&
+                (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16);
         case GGML_OP_SUB:
         case GGML_OP_MUL:
         case GGML_OP_DIV:
@@ -1407,6 +1410,9 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_DSV4_HC_PRE:
         case GGML_OP_DSV4_HC_POST:
             return op->src[0]->type == GGML_TYPE_F32;
+        case GGML_OP_LIGHTNING_INDEXER:
+            return has_simdgroup_reduction &&
+                (op->src[1]->type == GGML_TYPE_F32 || op->src[1]->type == GGML_TYPE_F16);
         default:
             return false;
     }

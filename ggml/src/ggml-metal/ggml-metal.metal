@@ -1418,6 +1418,8 @@ typedef decltype(kernel_bin_fuse_impl<float, float, float>) kernel_bin_fuse_t;
 
 template [[host_name("kernel_bin_fuse_f32_f32_f32")]]   kernel kernel_bin_fuse_t kernel_bin_fuse_impl<float,  float,  float>;
 template [[host_name("kernel_bin_fuse_f32_f32_f32_4")]] kernel kernel_bin_fuse_t kernel_bin_fuse_impl<float4, float4, float4>;
+template [[host_name("kernel_bin_fuse_f16_f16_f16")]]   kernel kernel_bin_fuse_t kernel_bin_fuse_impl<half,   half,   half>;
+template [[host_name("kernel_bin_fuse_f16_f16_f16_4")]] kernel kernel_bin_fuse_t kernel_bin_fuse_impl<half4,  half4,  half4>;
 
 kernel void kernel_add_id(
         constant ggml_metal_kargs_add_id & args,
@@ -11848,3 +11850,50 @@ kernel void kernel_dsv4_hc_post(
 
     *(device float *) (dst + i0*args.nbd0 + idst*args.nbd1 + it*args.nbd2) = sum;
 }
+
+// one simdgroup computes one (ik, it, is) output element: the simdgroup collaborates on the
+// n_embd-wide dot product for each head, reduced with simd_sum, and accumulates the ReLU-weighted score
+template<typename T_K>
+kernel void kernel_lightning_indexer(
+        constant ggml_metal_kargs_lightning_indexer & args,
+        device const char * q,
+        device const char * k,
+        device const char * w,
+        device const char * m,
+        device       char * dst,
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]]) {
+    const int64_t ik = tgpig.x;
+    const int64_t it = tgpig.y;
+    const int64_t is = tgpig.z;
+
+    device const char  * q_base = q + it*args.nbq2 + is*args.nbq3;
+    device const T_K   * k_row  = (device const T_K   *) (k + ik*args.nbk2 + is*args.nbk3);
+    device const float * w_row  = (device const float *) (w + it*args.nbw1 + is*args.nbw3);
+    device const half  * m_row  = (device const half  *) (m + it*args.nbm1 + (is % args.nem3)*args.nbm3);
+
+    float score = 0.0f;
+
+    for (int64_t h = 0; h < args.n_head; ++h) {
+        device const float * q_row = (device const float *) (q_base + h*args.nbq1);
+
+        float partial = 0.0f;
+        for (int64_t i0 = tiisg; i0 < args.n_embd; i0 += 32) {
+            partial += q_row[i0] * (float) k_row[i0];
+        }
+
+        const float qk = simd_sum(partial);
+
+        score += fmax(qk, 0.0f) * w_row[h];
+    }
+
+    if (tiisg == 0) {
+        device float * dst_row = (device float *) (dst + it*args.nb1 + is*args.nb3);
+        dst_row[ik] = score + (float) m_row[ik];
+    }
+}
+
+typedef decltype(kernel_lightning_indexer<float>) kernel_lightning_indexer_t;
+
+template [[host_name("kernel_lightning_indexer_f32")]] kernel kernel_lightning_indexer_t kernel_lightning_indexer<float>;
+template [[host_name("kernel_lightning_indexer_f16")]] kernel kernel_lightning_indexer_t kernel_lightning_indexer<half>;

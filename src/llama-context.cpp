@@ -12,16 +12,126 @@
 #include "llama-ext.h"
 #include "llama.h"
 
+#include <atomic>
+#include <cerrno>
 #include <cinttypes>
 #include <cmath>
+#include <condition_variable>
 #include <cstring>
+#include <chrono>
 #include <limits>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <utility>
+#include <vector>
+
+#if !defined(_WIN32)
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 //
 // llama_context
 //
+
+class llama_paced_prefetcher {
+public:
+    llama_paced_prefetcher(std::vector<std::string> file_paths, float gibps) :
+        file_paths(std::move(file_paths)),
+        bytes_per_sec((double) gibps*1024.0*1024.0*1024.0),
+        buffer(chunk_size) {
+    }
+
+    ~llama_paced_prefetcher() {
+        stop();
+    }
+
+    void start(uint32_t n_tokens) {
+        stop();
+
+        if (n_tokens < 32 || file_paths.empty() || bytes_per_sec <= 0.0) {
+            return;
+        }
+
+        stop_flag.store(false, std::memory_order_relaxed);
+        worker = std::thread(&llama_paced_prefetcher::run, this);
+    }
+
+    void stop() {
+        stop_flag.store(true, std::memory_order_relaxed);
+        cv.notify_all();
+        if (worker.joinable()) {
+            worker.join();
+        }
+    }
+
+private:
+    using steady_clock_t = std::chrono::steady_clock;
+
+    static constexpr size_t chunk_size = 64ull*1024ull*1024ull;
+
+    std::vector<std::string> file_paths;
+    double bytes_per_sec;
+    std::vector<uint8_t> buffer;
+    std::atomic<bool> stop_flag{false};
+    std::thread worker;
+    std::mutex mutex;
+    std::condition_variable cv;
+
+    void wait_until(steady_clock_t::time_point deadline) {
+        std::unique_lock<std::mutex> lock(mutex);
+        cv.wait_until(lock, deadline, [this] {
+            return stop_flag.load(std::memory_order_relaxed);
+        });
+    }
+
+    void run() {
+#if defined(_WIN32)
+        return;
+#else
+        const auto t0 = steady_clock_t::now();
+        uint64_t n_read_total = 0;
+
+        for (const auto & path : file_paths) {
+            if (stop_flag.load(std::memory_order_relaxed)) {
+                return;
+            }
+
+            const int fd = open(path.c_str(), O_RDONLY);
+            if (fd < 0) {
+                LLAMA_LOG_WARN("%s: failed to open %s: %s\n", __func__, path.c_str(), std::strerror(errno));
+                continue;
+            }
+
+            off_t offset = 0;
+            while (!stop_flag.load(std::memory_order_relaxed)) {
+                // Use pread so this does not fault through the mmap address range.
+                const ssize_t n_read = pread(fd, buffer.data(), buffer.size(), offset);
+                if (n_read == 0) {
+                    break;
+                }
+                if (n_read < 0) {
+                    if (errno == EINTR) {
+                        continue;
+                    }
+                    LLAMA_LOG_WARN("%s: failed to read %s: %s\n", __func__, path.c_str(), std::strerror(errno));
+                    break;
+                }
+
+                offset += n_read;
+                n_read_total += n_read;
+
+                const auto deadline = t0 + std::chrono::duration_cast<steady_clock_t::duration>(std::chrono::duration<double>(n_read_total / bytes_per_sec));
+                wait_until(deadline);
+            }
+
+            close(fd);
+        }
+#endif
+    }
+};
 
 static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     switch (ctx_type) {
@@ -118,6 +228,7 @@ llama_context::llama_context(
     cparams.embeddings_nextn_masked = false;
     cparams.offload_kqv             = params.offload_kqv;
     cparams.no_perf                 = params.no_perf;
+    cparams.prefetch_gibps          = params.prefetch_gibps;
     cparams.warmup                  = false;
 
     cparams.embeddings_layer_inp.resize(hparams.n_layer(), false);
@@ -471,9 +582,17 @@ llama_context::llama_context(
             sampling.token_ids_full_vocab[i] = i;
         }
     }
+
+    if (cparams.prefetch_gibps > 0.0f && model.use_mmap() && !model.file_paths().empty()) {
+        prefetcher = std::make_unique<llama_paced_prefetcher>(model.file_paths(), cparams.prefetch_gibps);
+    }
 }
 
 llama_context::~llama_context() {
+    if (prefetcher) {
+        prefetcher->stop();
+    }
+
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
 
@@ -1871,7 +1990,15 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         ggml_status status;
 
+        if (prefetcher) {
+            prefetcher->start(ubatch.n_tokens);
+        }
+
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+
+        if (prefetcher) {
+            prefetcher->stop();
+        }
 
         if (!res) {
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
@@ -3503,6 +3630,7 @@ llama_context_params llama_context_default_params() {
         /*.yarn_attn_factor            =*/ -1.0f,
         /*.yarn_beta_fast              =*/ -1.0f,
         /*.yarn_beta_slow              =*/ -1.0f,
+        /*.prefetch_gibps              =*/ 0.0f,
         /*.yarn_orig_ctx               =*/ 0,
         /*.defrag_thold                =*/ -1.0f,
         /*.cb_eval                     =*/ nullptr,

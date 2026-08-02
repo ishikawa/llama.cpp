@@ -6,6 +6,15 @@
 
 void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
 
+    // DFlash/DSpark graphs always emit t_embd / t_h_nextn at plain n_embd width (see
+    // build_hc_head() and build_dspark_markov_head() below, which broadcast the confidence
+    // signal to res->t_embd's shape to reuse llama_get_embeddings_nextn). Some DSpark GGUFs
+    // carry an "embedding_length_out" KV reused from the DeepSeek-V4 target-model hyper-
+    // connection convention (n_embd * hc_mult); that value does not describe any tensor this
+    // model actually outputs, so ignore it here rather than let the generic embeddings/nextn
+    // extraction in llama-context.cpp read past the end of the real output tensor.
+    hparams.n_embd_out_impl = 0;
+
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
 
     if (!ml.get_arr(LLM_KV_TARGET_LAYERS, target_layer_ids, false)) {

@@ -134,6 +134,12 @@ void llama_model_deepseek4::load_arch_tensors(llama_model_loader &) {
             // expert_used_count KV override (the routed layers can run with fewer experts,
             // the hash layers cannot)
             const ggml_tensor * tid2eid_meta = ml->get_tensor_meta(tn(LLM_TENSOR_FFN_GATE_TID2EID, "weight", i).str().c_str());
+            if (tid2eid_meta == nullptr) {
+                // metadata-only load paths (llama_model_init_from_user) have no weights map;
+                // fall back to n_expert_used, which then must not be overridden
+                LLAMA_LOG_WARN("%s: cannot read the width of %s, assuming expert_used_count (%lld) is not overridden\n",
+                        __func__, tn(LLM_TENSOR_FFN_GATE_TID2EID, "weight", i).str().c_str(), (long long) n_expert_used);
+            }
             const int64_t n_hash_used = tid2eid_meta ? tid2eid_meta->ne[0] : n_expert_used;
             layer.ffn_gate_tid2eid = create_tensor(tn(LLM_TENSOR_FFN_GATE_TID2EID, "weight", i), {n_hash_used, n_vocab}, 0);
         } else {
@@ -1148,13 +1154,13 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
         const auto & layer = model.layers[il];
         ggml_tensor * selected_experts = nullptr;
         ggml_tensor * exp_probs_b = layer.ffn_exp_probs_b;
-        uint32_t n_expert_used_layer = hparams.n_expert_used;
+        int64_t n_expert_used_layer = hparams.n_expert_used;
         if ((uint32_t) il < hparams.dsv4_hash_layer_count) {
             selected_experts = ggml_get_rows(ctx0, layer.ffn_gate_tid2eid, res->t_inp_tokens);
             exp_probs_b = nullptr;
             // hash layers always use the table's expert count, even when
             // expert_used_count is overridden for the routed layers
-            n_expert_used_layer = (uint32_t) layer.ffn_gate_tid2eid->ne[0];
+            n_expert_used_layer = layer.ffn_gate_tid2eid->ne[0];
         }
 
         ggml_tensor * moe_out = build_moe_ffn(cur,

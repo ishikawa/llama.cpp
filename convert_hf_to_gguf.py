@@ -161,6 +161,14 @@ def parse_args() -> argparse.Namespace:
             "layer count to populate its GGUF."
         ),
     )
+    parser.add_argument(
+        "--target-gguf", type=Path, default=None,
+        help="path to a target GGUF to copy tokenizer metadata from when the draft source has no tokenizer files",
+    )
+    parser.add_argument(
+        "--dspark-dflash", action="store_true",
+        help="export a DeepSeek-V4 DSpark MTP head as a standalone dflash draft GGUF",
+    )
 
     args = parser.parse_args()
     if not args.print_supported_models and args.model is None:
@@ -267,6 +275,12 @@ def main() -> None:
             if args.mtp:
                 model_class.mtp_only = True
 
+        if args.dspark_dflash:
+            if not model_class.supports_dspark_dflash_export:
+                logger.error("--dspark-dflash is not supported for %s", model_architecture)
+                sys.exit(1)
+            model_class.dspark_dflash_only = True
+
         model_instance = model_class(dir_model, output_type, fname_out,
                                      is_big_endian=args.bigendian, use_temp_file=args.use_temp_file,
                                      eager=args.no_lazy,
@@ -277,6 +291,7 @@ def main() -> None:
                                      remote_hf_model_id=hf_repo_id, disable_mistral_community_chat_template=disable_mistral_community_chat_template,
                                      sentence_transformers_dense_modules=args.sentence_transformers_dense_modules,
                                      target_model_dir=Path(args.target_model_dir) if args.target_model_dir else None,
+                                     target_gguf=args.target_gguf,
                                      fuse_gate_up_exps=args.fuse_gate_up_exps,
                                      fp8_as_q8=args.fp8_as_q8,
                                      )

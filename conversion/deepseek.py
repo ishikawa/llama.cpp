@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import tempfile
 from pathlib import Path
 
 from typing import Any, Callable, Iterable, TYPE_CHECKING
@@ -476,12 +478,15 @@ class DeepseekV32Model(DeepseekV2Model):
 class DeepseekV4Model(TextModel):
     model_arch = gguf.MODEL_ARCH.DEEPSEEK4
     supports_mtp_export = True
+    supports_dspark_dflash_export = True
     _skipped_mtp_tensors = 0
     _dsv4_main_layers: int | None = None
     _dsv4_nextn_layers: int = 0
 
     def __init__(self, *args, **kwargs):
         type(self)._skipped_mtp_tensors = 0
+        if type(self).dspark_dflash_only:
+            self.model_arch = gguf.MODEL_ARCH.DFLASH
         super().__init__(*args, **kwargs)
 
         with open(self.dir_model / "config.json", "r", encoding="utf-8") as f:
@@ -489,8 +494,11 @@ class DeepseekV4Model(TextModel):
         for key, value in raw_hparams.items():
             self.hparams.setdefault(key, value)
 
-        self.block_count = self.hparams["num_hidden_layers"]
-        if self.mtp_only:
+        if self.dspark_dflash_only:
+            self.block_count = self._find_dspark_stage_count()
+        else:
+            self.block_count = self.hparams["num_hidden_layers"]
+        if self.mtp_only and not self.dspark_dflash_only:
             self.block_count += self.hparams.get("num_nextn_predict_layers", 0)
         self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
 
@@ -503,16 +511,180 @@ class DeepseekV4Model(TextModel):
         if type(self)._skipped_mtp_tensors:
             logger.info("Skipping %d DeepSeek-V4 MTP tensor(s) for conversion v0", type(self)._skipped_mtp_tensors)
 
-        # add a default chat template; if the model has a built-in template, it will be overridden later
-        template_path = Path(__file__).parent.parent / "models" / "templates" / "deepseek-ai-DeepSeek-V4.jinja"
-        if template_path.is_file():
-            with open(template_path, "r", encoding="utf-8") as f:
-                self.gguf_writer.add_chat_template(f.read())
+        if not self.dspark_dflash_only:
+            # add a default chat template; if the model has a built-in template, it will be overridden later
+            template_path = Path(__file__).parent.parent / "models" / "templates" / "deepseek-ai-DeepSeek-V4.jinja"
+            if template_path.is_file():
+                with open(template_path, "r", encoding="utf-8") as f:
+                    self.gguf_writer.add_chat_template(f.read())
 
     def index_tensors(self, remote_hf_model_id: str | None = None) -> dict[str, Callable[[], Tensor]]:
         type(self)._dsv4_main_layers = self.hparams["num_hidden_layers"]
+        if self.dspark_dflash_only:
+            type(self)._dsv4_nextn_layers = self._find_dspark_stage_count()
+            return {}
         type(self)._dsv4_nextn_layers = self.hparams.get("num_nextn_predict_layers", 0)
         return super().index_tensors(remote_hf_model_id=remote_hf_model_id)
+
+    def _find_dspark_stage_count(self) -> int:
+        index_path = self.dir_model / "model.safetensors.index.json"
+        with open(index_path, "r", encoding="utf-8") as f:
+            weight_map = json.load(f)["weight_map"]
+
+        stages = set()
+        for name in weight_map:
+            match = re.match(r"mtp\.(\d+)\.", name)
+            if match is not None:
+                stages.add(int(match.group(1)))
+
+        if not stages:
+            raise ValueError("DeepSeek-V4 DSpark dflash export requires mtp.* tensors")
+        expected = set(range(max(stages) + 1))
+        if stages != expected:
+            raise ValueError(f"DeepSeek-V4 DSpark stages must be contiguous, got {sorted(stages)}")
+        return len(stages)
+
+    def _load_safetensors_catalog(self) -> dict[str, tuple[Path, dict[str, Any]]]:
+        index_path = self.dir_model / "model.safetensors.index.json"
+        with open(index_path, "r", encoding="utf-8") as f:
+            weight_map = json.load(f)["weight_map"]
+
+        mtp_weight_map = {name: shard for name, shard in weight_map.items() if name.startswith("mtp.")}
+
+        headers: dict[str, dict[str, Any]] = {}
+        for shard in sorted(set(mtp_weight_map.values())):
+            shard_path = self.dir_model / shard
+            with open(shard_path, "rb") as f:
+                header_len = int.from_bytes(f.read(8), "little")
+                header = json.loads(f.read(header_len))
+            headers[shard] = header
+
+        catalog: dict[str, tuple[Path, dict[str, Any]]] = {}
+        for name, shard in mtp_weight_map.items():
+            catalog[name] = (self.dir_model / shard, headers[shard][name])
+        return catalog
+
+    @staticmethod
+    def _read_safetensors_raw(path: Path, meta: dict[str, Any]) -> np.ndarray:
+        dtype = meta["dtype"]
+        dtype_map = {
+            "F32": np.dtype("<f4"),
+            "BF16": np.dtype("<u2"),
+            "F8_E4M3": np.dtype("u1"),
+            "F8_E8M0": np.dtype("u1"),
+            "I8": np.dtype("u1"),
+        }
+        if dtype not in dtype_map:
+            raise ValueError(f"Unsupported safetensors dtype {dtype!r}")
+
+        with open(path, "rb") as f:
+            header_len = int.from_bytes(f.read(8), "little")
+        begin, end = meta["data_offsets"]
+        offset = 8 + header_len + begin
+        shape = tuple(meta["shape"])
+        expected = int(np.prod(shape, dtype=np.int64)) * dtype_map[dtype].itemsize
+        if end - begin != expected:
+            raise ValueError(f"Tensor byte size mismatch for {path.name}: {end - begin} != {expected}")
+        return np.memmap(path, mode="r", dtype=dtype_map[dtype], offset=offset, shape=shape)
+
+    @staticmethod
+    def _bf16_to_f32(data: np.ndarray) -> np.ndarray:
+        bits = data.astype(np.uint32) << np.uint32(16)
+        return bits.view(np.float32)
+
+    @staticmethod
+    def _f8_e8m0_to_f32(data: np.ndarray) -> np.ndarray:
+        return np.exp2(data.astype(np.float32) - 127.0)
+
+    @staticmethod
+    def _mxfp4_e8m0_to_f32_half(data: np.ndarray) -> np.ndarray:
+        bits = np.where(data < 2, np.uint32(0x00200000) << data.astype(np.uint32), (data.astype(np.uint32) - np.uint32(1)) << np.uint32(23))
+        return bits.view(np.float32)
+
+    @staticmethod
+    def _f8_e4m3_to_f32(data: np.ndarray) -> np.ndarray:
+        bits = data.astype(np.uint8)
+        sign = np.where((bits & 0x80) != 0, -1.0, 1.0).astype(np.float32)
+        exp = ((bits >> 3) & 0x0f).astype(np.int32)
+        mant = (bits & 0x07).astype(np.float32)
+        value = np.where(exp == 0, mant * np.float32(2.0 ** -9), (1.0 + mant / 8.0) * np.exp2(exp.astype(np.float32) - 7.0))
+        return sign * np.where((bits & 0x7f) == 0x7f, 0.0, value)
+
+    def _read_dspark_tensor(self, catalog: dict[str, tuple[Path, dict[str, Any]]], name: str, *, keep_f32: bool = False) -> np.ndarray:
+        path, meta = catalog[name]
+        data = self._read_safetensors_raw(path, meta)
+        dtype = meta["dtype"]
+        if dtype == "F32":
+            return np.asarray(data, dtype=np.float32)
+        if dtype == "BF16":
+            data_f32 = self._bf16_to_f32(np.asarray(data))
+            return data_f32 if keep_f32 else data_f32.astype(np.float16)
+        if dtype == "F8_E4M3":
+            scale_name = name.removesuffix(".weight") + ".scale"
+            scale = self._read_safetensors_raw(*catalog[scale_name])
+            return self._dequant_dspark_fp8(np.asarray(data), np.asarray(scale)).astype(np.float16)
+        raise ValueError(f"Unsupported DSpark tensor dtype {dtype!r} for {name}")
+
+    def _dequant_dspark_fp8(self, weight: np.ndarray, scale: np.ndarray) -> np.ndarray:
+        out_features, in_features = weight.shape
+        scale_f = self._f8_e8m0_to_f32(scale)
+        scale_f = np.repeat(scale_f, 128, axis=0)[:out_features]
+        scale_f = np.repeat(scale_f, 128, axis=1)[:, :in_features]
+        out = np.empty(weight.shape, dtype=np.float16)
+        for row in range(0, out_features, 256):
+            row_end = min(row + 256, out_features)
+            out[row:row_end] = (self._f8_e4m3_to_f32(weight[row:row_end]) * scale_f[row:row_end]).astype(np.float16)
+        return out
+
+    def _dequant_dspark_expert(self, weight: np.ndarray, scale: np.ndarray) -> np.ndarray:
+        packed = np.asarray(weight, dtype=np.uint8)
+        scale_u8 = np.asarray(scale, dtype=np.uint8)
+        out_features, packed_cols = packed.shape
+        logical_cols = packed_cols * 2
+        if logical_cols % 32 != 0:
+            raise ValueError(f"MXFP4 source row has {logical_cols} values, expected a multiple of 32")
+        n_blocks = logical_cols // 32
+        if tuple(scale_u8.shape) != (out_features, n_blocks):
+            raise ValueError(f"MXFP4 scale shape {tuple(scale_u8.shape)} does not match {(out_features, n_blocks)}")
+
+        src = packed.reshape(out_features, n_blocks, 16)
+        vals = np.stack((src & 0x0f, src >> 4), axis=-1).reshape(out_features, n_blocks, 32)
+        kvalues = np.array((0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12), dtype=np.float32)
+        data = kvalues[vals]
+        data *= self._mxfp4_e8m0_to_f32_half(scale_u8)[:, :, None]
+        return data.reshape(out_features, logical_cols).astype(np.float16)
+
+    def _add_dspark_tensor(self, catalog: dict[str, tuple[Path, dict[str, Any]]], src_name: str, tensor_key: gguf.MODEL_TENSOR, bid: int | None = None, suffix: str = ".weight", *, keep_f32: bool = False) -> None:
+        new_name = self.format_tensor_name(tensor_key, bid, suffix)
+        data = self._read_dspark_tensor(catalog, src_name, keep_f32=keep_f32)
+        self.gguf_writer.add_tensor(new_name, data)
+        logger.info(f"{new_name}: wrote DSpark tensor from {src_name}, shape = {{{', '.join(str(n) for n in reversed(data.shape))}}}")
+
+    def _add_dspark_experts(self, catalog: dict[str, tuple[Path, dict[str, Any]]], bid: int, proj: str, tensor_key: gguf.MODEL_TENSOR) -> None:
+        n_experts = self.hparams["n_routed_experts"]
+        first_meta = catalog[f"mtp.{bid}.ffn.experts.0.{proj}.weight"][1]
+        out_features, packed_cols = first_meta["shape"]
+        shape = (n_experts, out_features, packed_cols * 2)
+        tmp = tempfile.NamedTemporaryFile(prefix="dspark-experts-", suffix=".f16", delete=False)
+        tmp_path = tmp.name
+        tmp.close()
+        try:
+            data = np.memmap(tmp_path, mode="w+", dtype=np.float16, shape=shape)
+            for eid in range(n_experts):
+                w_name = f"mtp.{bid}.ffn.experts.{eid}.{proj}.weight"
+                s_name = f"mtp.{bid}.ffn.experts.{eid}.{proj}.scale"
+                weight = self._read_safetensors_raw(*catalog[w_name])
+                scale = self._read_safetensors_raw(*catalog[s_name])
+                data[eid] = self._dequant_dspark_expert(weight, scale)
+            data.flush()
+            new_name = self.format_tensor_name(tensor_key, bid)
+            self.gguf_writer.add_tensor(new_name, data)
+            logger.info(f"{new_name}: dequantized DSpark experts to F16, shape = {{{', '.join(str(n) for n in reversed(shape))}}}")
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except FileNotFoundError:
+                pass
 
     @classmethod
     def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
@@ -586,6 +758,8 @@ class DeepseekV4Model(TextModel):
         return torch.exp2(bits - 127.0)
 
     def _collect_source_dtypes(self) -> None:
+        if self.dspark_dflash_only:
+            return
         for name, gen in self.model_tensors.items():
             dtype = gen().dtype
             if dtype == torch.bfloat16:
@@ -593,7 +767,52 @@ class DeepseekV4Model(TextModel):
             elif dtype == torch.float32:
                 self._dsv4_f32_tensors.add(name)
 
+    def set_vocab(self):
+        if not self.dspark_dflash_only:
+            return super().set_vocab()
+        if self.target_gguf is None:
+            raise ValueError("DeepSeek-V4 DSpark dflash export requires --target-gguf to copy tokenizer metadata")
+
+        reader = gguf.GGUFReader(self.target_gguf)
+        for key, field in reader.fields.items():
+            if not key.startswith("tokenizer."):
+                continue
+            if field.types[0] == gguf.GGUFValueType.ARRAY:
+                self.gguf_writer.add_key_value(key, field.contents(), field.types[0], field.types[-1])
+            else:
+                self.gguf_writer.add_key_value(key, field.contents(), field.types[0])
+
+        if self.hparams.get("dspark_noise_token_id") is not None and "tokenizer.ggml.mask_token_id" not in reader.fields:
+            self.gguf_writer.add_mask_token_id(self.hparams["dspark_noise_token_id"])
+
     def set_gguf_parameters(self):
+        if self.dspark_dflash_only:
+            super().set_gguf_parameters()
+            hparams = self.hparams
+
+            self.gguf_writer.add_rope_dimension_count(hparams["qk_rope_head_dim"])
+            self.gguf_writer.add_q_lora_rank(hparams["q_lora_rank"])
+            self.gguf_writer.add_sliding_window(hparams["sliding_window"])
+
+            self.gguf_writer.add_expert_feed_forward_length(hparams["moe_intermediate_size"])
+            self.gguf_writer.add_expert_shared_count(hparams["n_shared_experts"])
+            self.gguf_writer.add_expert_weights_scale(hparams["routed_scaling_factor"])
+            self.gguf_writer.add_expert_weights_norm(hparams["norm_topk_prob"])
+            self.gguf_writer.add_swiglu_clamp_exp([hparams["swiglu_limit"]] * self.block_count)
+            self.gguf_writer.add_swiglu_clamp_shexp([hparams["swiglu_limit"]] * self.block_count)
+
+            self.gguf_writer.add_attention_output_group_count(hparams["o_groups"])
+            self.gguf_writer.add_attention_output_lora_rank(hparams["o_lora_rank"])
+            self.gguf_writer.add_attention_compress_ratios([0] * self.block_count)
+
+            self.gguf_writer.add_hyper_connection_count(hparams["hc_mult"])
+            self.gguf_writer.add_hyper_connection_sinkhorn_iterations(hparams["hc_sinkhorn_iters"])
+            self.gguf_writer.add_hyper_connection_epsilon(hparams["hc_eps"])
+            self.gguf_writer.add_embedding_length_out(hparams["hidden_size"] * hparams["hc_mult"])
+            self.gguf_writer.add_target_layers(hparams["dspark_target_layer_ids"])
+            self.gguf_writer.add_block_size(hparams["dspark_block_size"])
+            return
+
         super().set_gguf_parameters()
         hparams = self.hparams
 
@@ -875,6 +1094,51 @@ class DeepseekV4Model(TextModel):
         self.fname_out = self.fname_out.parent / f"mtp-{fname_default}.gguf"
 
     def prepare_tensors(self):
+        if self.dspark_dflash_only:
+            catalog = self._load_safetensors_catalog()
+
+            self._add_dspark_tensor(catalog, "mtp.0.main_proj.weight", gguf.MODEL_TENSOR.FC)
+            self._add_dspark_tensor(catalog, "mtp.0.main_norm.weight", gguf.MODEL_TENSOR.ENC_OUTPUT_NORM, keep_f32=True)
+            self._add_dspark_tensor(catalog, "mtp.2.norm.weight", gguf.MODEL_TENSOR.OUTPUT_NORM, keep_f32=True)
+            self._add_dspark_tensor(catalog, "mtp.2.hc_head_fn", gguf.MODEL_TENSOR.HC_HEAD_FN, keep_f32=True)
+            self._add_dspark_tensor(catalog, "mtp.2.hc_head_base", gguf.MODEL_TENSOR.HC_HEAD_BASE, keep_f32=True)
+            self._add_dspark_tensor(catalog, "mtp.2.hc_head_scale", gguf.MODEL_TENSOR.HC_HEAD_SCALE, keep_f32=True)
+            self._add_dspark_tensor(catalog, "mtp.2.markov_head.markov_w1.weight", gguf.MODEL_TENSOR.DSPARK_MARKOV_W1)
+            self._add_dspark_tensor(catalog, "mtp.2.markov_head.markov_w2.weight", gguf.MODEL_TENSOR.DSPARK_MARKOV_W2)
+            self._add_dspark_tensor(catalog, "mtp.2.confidence_head.proj.weight", gguf.MODEL_TENSOR.DSPARK_CONF_PROJ)
+
+            layer_tensors: tuple[tuple[str, gguf.MODEL_TENSOR, str, bool], ...] = (
+                ("attn_norm.weight", gguf.MODEL_TENSOR.ATTN_NORM, ".weight", True),
+                ("attn.attn_sink", gguf.MODEL_TENSOR.ATTN_SINKS, ".weight", True),
+                ("attn.wq_a.weight", gguf.MODEL_TENSOR.ATTN_Q_A, ".weight", False),
+                ("attn.q_norm.weight", gguf.MODEL_TENSOR.ATTN_Q_A_NORM, ".weight", True),
+                ("attn.wq_b.weight", gguf.MODEL_TENSOR.ATTN_Q_B, ".weight", False),
+                ("attn.wkv.weight", gguf.MODEL_TENSOR.ATTN_KV, ".weight", False),
+                ("attn.kv_norm.weight", gguf.MODEL_TENSOR.ATTN_KV_NORM, ".weight", True),
+                ("attn.wo_a.weight", gguf.MODEL_TENSOR.ATTN_OUT_A, ".weight", False),
+                ("attn.wo_b.weight", gguf.MODEL_TENSOR.ATTN_OUT_B, ".weight", False),
+                ("hc_attn_fn", gguf.MODEL_TENSOR.HC_ATTN_FN, ".weight", True),
+                ("hc_attn_base", gguf.MODEL_TENSOR.HC_ATTN_BASE, ".weight", True),
+                ("hc_attn_scale", gguf.MODEL_TENSOR.HC_ATTN_SCALE, ".weight", True),
+                ("hc_ffn_fn", gguf.MODEL_TENSOR.HC_FFN_FN, ".weight", True),
+                ("hc_ffn_base", gguf.MODEL_TENSOR.HC_FFN_BASE, ".weight", True),
+                ("hc_ffn_scale", gguf.MODEL_TENSOR.HC_FFN_SCALE, ".weight", True),
+                ("ffn.gate.weight", gguf.MODEL_TENSOR.FFN_GATE_INP, ".weight", True),
+                ("ffn.gate.bias", gguf.MODEL_TENSOR.FFN_EXP_PROBS_B, ".bias", True),
+                ("ffn_norm.weight", gguf.MODEL_TENSOR.FFN_NORM, ".weight", True),
+                ("ffn.shared_experts.w1.weight", gguf.MODEL_TENSOR.FFN_GATE_SHEXP, ".weight", False),
+                ("ffn.shared_experts.w2.weight", gguf.MODEL_TENSOR.FFN_DOWN_SHEXP, ".weight", False),
+                ("ffn.shared_experts.w3.weight", gguf.MODEL_TENSOR.FFN_UP_SHEXP, ".weight", False),
+            )
+
+            for bid in range(self.block_count):
+                for suffix, tensor_key, gguf_suffix, keep_f32 in layer_tensors:
+                    self._add_dspark_tensor(catalog, f"mtp.{bid}.{suffix}", tensor_key, bid, gguf_suffix, keep_f32=keep_f32)
+                self._add_dspark_experts(catalog, bid, "w1", gguf.MODEL_TENSOR.FFN_GATE_EXP)
+                self._add_dspark_experts(catalog, bid, "w2", gguf.MODEL_TENSOR.FFN_DOWN_EXP)
+                self._add_dspark_experts(catalog, bid, "w3", gguf.MODEL_TENSOR.FFN_UP_EXP)
+            return
+
         super().prepare_tensors()
         self._is_mxfp4 = True
         self.ftype = gguf.LlamaFileType.MOSTLY_MXFP4_MOE

@@ -114,6 +114,8 @@ class ModelBase:
     supports_mtp_export: bool = False
     mtp_only: bool = False
     no_mtp: bool = False
+    supports_dspark_dflash_export: bool = False
+    dspark_dflash_only: bool = False
 
     def __init__(self, dir_model: Path, ftype: gguf.LlamaFileType, fname_out: Path, *, is_big_endian: bool = False,
                  use_temp_file: bool = False, eager: bool = False,
@@ -123,6 +125,7 @@ class ModelBase:
                  disable_mistral_community_chat_template: bool = False,
                  sentence_transformers_dense_modules: bool = False,
                  target_model_dir: Path | None = None,
+                 target_gguf: Path | None = None,
                  fuse_gate_up_exps: bool = False,
                  fp8_as_q8: bool = False):
         if type(self) is ModelBase or \
@@ -144,6 +147,7 @@ class ModelBase:
         self.remote_hf_model_id = remote_hf_model_id
         self.sentence_transformers_dense_modules = sentence_transformers_dense_modules
         self.target_model_dir = target_model_dir
+        self.target_gguf = target_gguf
         self.fuse_gate_up_exps = fuse_gate_up_exps
         self._gate_exp_buffer: dict[int, Tensor] = {}
         self._up_exp_buffer: dict[int, Tensor] = {}

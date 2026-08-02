@@ -5035,6 +5035,8 @@ int ggml_metal_op_dsv4_hc_comb(ggml_metal_op_t ctx, int idx) {
     const int     nth = (int) std::min((int64_t) ggml_metal_pipeline_max_theads_per_threadgroup(pipeline), n_tokens);
     const int64_t n   = (n_tokens + nth - 1) / nth;
 
+    GGML_ASSERT(n <= std::numeric_limits<int>::max());
+
     ggml_metal_encoder_dispatch_threadgroups(enc, n, 1, 1, nth, 1, 1);
 
     return 1;
@@ -5085,6 +5087,8 @@ int ggml_metal_op_dsv4_hc_pre(ggml_metal_op_t ctx, int idx) {
     const int64_t nr  = n_embd * n_tokens;
     const int     nth = (int) std::min((int64_t) ggml_metal_pipeline_max_theads_per_threadgroup(pipeline), nr);
     const int64_t n   = (nr + nth - 1) / nth;
+
+    GGML_ASSERT(n <= std::numeric_limits<int>::max());
 
     ggml_metal_encoder_dispatch_threadgroups(enc, n, 1, 1, nth, 1, 1);
 
@@ -5151,6 +5155,8 @@ int ggml_metal_op_dsv4_hc_post(ggml_metal_op_t ctx, int idx) {
     const int     nth = (int) std::min((int64_t) ggml_metal_pipeline_max_theads_per_threadgroup(pipeline), nr);
     const int64_t n   = (nr + nth - 1) / nth;
 
+    GGML_ASSERT(n <= std::numeric_limits<int>::max());
+
     ggml_metal_encoder_dispatch_threadgroups(enc, n, 1, 1, nth, 1, 1);
 
     return 1;
@@ -5172,6 +5178,10 @@ int ggml_metal_op_lightning_indexer(ggml_metal_op_t ctx, int idx) {
     GGML_ASSERT(m->type    == GGML_TYPE_F16);
     GGML_ASSERT(op->type   == GGML_TYPE_F32);
     GGML_ASSERT(k->type    == GGML_TYPE_F32 || k->type == GGML_TYPE_F16);
+
+    GGML_ASSERT(q->ne[0] == k->ne[0]);
+    GGML_ASSERT(w->ne[0] == q->ne[1]);
+    GGML_ASSERT(m->ne[0] >= k->ne[2]);
 
     GGML_TENSOR_LOCALS(uint64_t, nbq, q,  nb);
     GGML_TENSOR_LOCALS(uint64_t, nbk, k,  nb);
@@ -5213,6 +5223,10 @@ int ggml_metal_op_lightning_indexer(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_set_buffer (enc, ggml_metal_get_buffer_id(w),  3);
     ggml_metal_encoder_set_buffer (enc, ggml_metal_get_buffer_id(m),  4);
     ggml_metal_encoder_set_buffer (enc, ggml_metal_get_buffer_id(op), 5);
+
+    GGML_ASSERT(n_kv     <= std::numeric_limits<int>::max());
+    GGML_ASSERT(n_tokens <= std::numeric_limits<int>::max());
+    GGML_ASSERT(n_stream <= std::numeric_limits<int>::max());
 
     ggml_metal_encoder_dispatch_threadgroups(enc, n_kv, n_tokens, n_stream, 32, 1, 1);
 

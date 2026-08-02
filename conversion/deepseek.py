@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import json
-import os
 import re
-import tempfile
 from pathlib import Path
 
 from typing import Any, Callable, Iterable, TYPE_CHECKING
@@ -597,11 +595,6 @@ class DeepseekV4Model(TextModel):
         return np.exp2(data.astype(np.float32) - 127.0)
 
     @staticmethod
-    def _mxfp4_e8m0_to_f32_half(data: np.ndarray) -> np.ndarray:
-        bits = np.where(data < 2, np.uint32(0x00200000) << data.astype(np.uint32), (data.astype(np.uint32) - np.uint32(1)) << np.uint32(23))
-        return bits.view(np.float32)
-
-    @staticmethod
     def _f8_e4m3_to_f32(data: np.ndarray) -> np.ndarray:
         bits = data.astype(np.uint8)
         sign = np.where((bits & 0x80) != 0, -1.0, 1.0).astype(np.float32)
@@ -622,7 +615,8 @@ class DeepseekV4Model(TextModel):
         if dtype == "F8_E4M3":
             scale_name = name.removesuffix(".weight") + ".scale"
             scale = self._read_safetensors_raw(*catalog[scale_name])
-            return self._dequant_dspark_fp8(np.asarray(data), np.asarray(scale)).astype(np.float16)
+            data_f32 = self._dequant_dspark_fp8(np.asarray(data), np.asarray(scale))
+            return data_f32 if keep_f32 else data_f32.astype(np.float16)
         raise ValueError(f"Unsupported DSpark tensor dtype {dtype!r} for {name}")
 
     def _dequant_dspark_fp8(self, weight: np.ndarray, scale: np.ndarray) -> np.ndarray:
@@ -630,61 +624,45 @@ class DeepseekV4Model(TextModel):
         scale_f = self._f8_e8m0_to_f32(scale)
         scale_f = np.repeat(scale_f, 128, axis=0)[:out_features]
         scale_f = np.repeat(scale_f, 128, axis=1)[:, :in_features]
-        out = np.empty(weight.shape, dtype=np.float16)
+        out = np.empty(weight.shape, dtype=np.float32)
         for row in range(0, out_features, 256):
             row_end = min(row + 256, out_features)
-            out[row:row_end] = (self._f8_e4m3_to_f32(weight[row:row_end]) * scale_f[row:row_end]).astype(np.float16)
+            out[row:row_end] = self._f8_e4m3_to_f32(weight[row:row_end]) * scale_f[row:row_end]
         return out
 
-    def _dequant_dspark_expert(self, weight: np.ndarray, scale: np.ndarray) -> np.ndarray:
-        packed = np.asarray(weight, dtype=np.uint8)
-        scale_u8 = np.asarray(scale, dtype=np.uint8)
-        out_features, packed_cols = packed.shape
-        logical_cols = packed_cols * 2
-        if logical_cols % 32 != 0:
-            raise ValueError(f"MXFP4 source row has {logical_cols} values, expected a multiple of 32")
-        n_blocks = logical_cols // 32
-        if tuple(scale_u8.shape) != (out_features, n_blocks):
-            raise ValueError(f"MXFP4 scale shape {tuple(scale_u8.shape)} does not match {(out_features, n_blocks)}")
-
-        src = packed.reshape(out_features, n_blocks, 16)
-        vals = np.stack((src & 0x0f, src >> 4), axis=-1).reshape(out_features, n_blocks, 32)
-        kvalues = np.array((0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12), dtype=np.float32)
-        data = kvalues[vals]
-        data *= self._mxfp4_e8m0_to_f32_half(scale_u8)[:, :, None]
-        return data.reshape(out_features, logical_cols).astype(np.float16)
-
-    def _add_dspark_tensor(self, catalog: dict[str, tuple[Path, dict[str, Any]]], src_name: str, tensor_key: gguf.MODEL_TENSOR, bid: int | None = None, suffix: str = ".weight", *, keep_f32: bool = False) -> None:
+    def _add_dspark_tensor(self, catalog: dict[str, tuple[Path, dict[str, Any]]], src_name: str, tensor_key: gguf.MODEL_TENSOR, bid: int | None = None, suffix: str = ".weight", *, keep_f32: bool = False, quant: gguf.GGMLQuantizationType | None = None) -> None:
         new_name = self.format_tensor_name(tensor_key, bid, suffix)
-        data = self._read_dspark_tensor(catalog, src_name, keep_f32=keep_f32)
-        self.gguf_writer.add_tensor(new_name, data)
-        logger.info(f"{new_name}: wrote DSpark tensor from {src_name}, shape = {{{', '.join(str(n) for n in reversed(data.shape))}}}")
+        # a quantized write needs the un-truncated F32 dequant, not the F16 default
+        data = self._read_dspark_tensor(catalog, src_name, keep_f32=keep_f32 or quant is not None)
+        logical_shape = data.shape
+        if quant is not None:
+            data = gguf.quants.quantize(data, quant)
+        self.gguf_writer.add_tensor(new_name, data, raw_dtype=quant)
+        quant_note = f", quantized to {quant.name}" if quant is not None else ""
+        logger.info(f"{new_name}: wrote DSpark tensor from {src_name}{quant_note}, shape = {{{', '.join(str(n) for n in reversed(logical_shape))}}}")
 
     def _add_dspark_experts(self, catalog: dict[str, tuple[Path, dict[str, Any]]], bid: int, proj: str, tensor_key: gguf.MODEL_TENSOR) -> None:
+        # Bit-preserving repack: the HF weight is already fp4-per-value + one e8m0 scale per
+        # 32-value block (verified to line up 1:1 with ggml's MXFP4 block layout, see
+        # `_pack_mxfp4_blocks`), so this reuses that repacker directly instead of
+        # dequantizing to float and requantizing.
         n_experts = self.hparams["n_routed_experts"]
-        first_meta = catalog[f"mtp.{bid}.ffn.experts.0.{proj}.weight"][1]
-        out_features, packed_cols = first_meta["shape"]
-        shape = (n_experts, out_features, packed_cols * 2)
-        tmp = tempfile.NamedTemporaryFile(prefix="dspark-experts-", suffix=".f16", delete=False)
-        tmp_path = tmp.name
-        tmp.close()
-        try:
-            data = np.memmap(tmp_path, mode="w+", dtype=np.float16, shape=shape)
-            for eid in range(n_experts):
-                w_name = f"mtp.{bid}.ffn.experts.{eid}.{proj}.weight"
-                s_name = f"mtp.{bid}.ffn.experts.{eid}.{proj}.scale"
-                weight = self._read_safetensors_raw(*catalog[w_name])
-                scale = self._read_safetensors_raw(*catalog[s_name])
-                data[eid] = self._dequant_dspark_expert(weight, scale)
-            data.flush()
-            new_name = self.format_tensor_name(tensor_key, bid)
-            self.gguf_writer.add_tensor(new_name, data)
-            logger.info(f"{new_name}: dequantized DSpark experts to F16, shape = {{{', '.join(str(n) for n in reversed(shape))}}}")
-        finally:
-            try:
-                os.unlink(tmp_path)
-            except FileNotFoundError:
-                pass
+        data: np.ndarray | None = None
+        for eid in range(n_experts):
+            w_name = f"mtp.{bid}.ffn.experts.{eid}.{proj}.weight"
+            s_name = f"mtp.{bid}.ffn.experts.{eid}.{proj}.scale"
+            weight = torch.from_numpy(np.asarray(self._read_safetensors_raw(*catalog[w_name]), dtype=np.uint8))
+            scale = torch.from_numpy(np.asarray(self._read_safetensors_raw(*catalog[s_name]), dtype=np.uint8))
+            packed = self._pack_mxfp4_blocks(weight, scale)
+            if data is None:
+                data = np.empty((n_experts, *packed.shape), dtype=packed.dtype)
+            data[eid] = packed
+
+        assert data is not None
+        new_name = self.format_tensor_name(tensor_key, bid)
+        shape = gguf.quant_shape_from_byte_shape(data.shape, gguf.GGMLQuantizationType.MXFP4)
+        self.gguf_writer.add_tensor(new_name, data, raw_dtype=gguf.GGMLQuantizationType.MXFP4)
+        logger.info(f"{new_name}: repacked DSpark experts to MXFP4, shape = {{{', '.join(str(n) for n in reversed(shape))}}}")
 
     @classmethod
     def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
@@ -808,7 +786,9 @@ class DeepseekV4Model(TextModel):
             self.gguf_writer.add_hyper_connection_count(hparams["hc_mult"])
             self.gguf_writer.add_hyper_connection_sinkhorn_iterations(hparams["hc_sinkhorn_iters"])
             self.gguf_writer.add_hyper_connection_epsilon(hparams["hc_eps"])
-            self.gguf_writer.add_embedding_length_out(hparams["hidden_size"] * hparams["hc_mult"])
+            # NOTE: unlike the DeepSeek-V4 target model, DFlash/DSpark graphs never emit a
+            # hc_mult-wide output tensor (see dflash.cpp's load_arch_hparams, which now ignores
+            # this KV if present); don't write it so the value can't be misread as tensor width.
             self.gguf_writer.add_target_layers(hparams["dspark_target_layer_ids"])
             self.gguf_writer.add_block_size(hparams["dspark_block_size"])
             return
@@ -1097,7 +1077,9 @@ class DeepseekV4Model(TextModel):
         if self.dspark_dflash_only:
             catalog = self._load_safetensors_catalog()
 
-            self._add_dspark_tensor(catalog, "mtp.0.main_proj.weight", gguf.MODEL_TENSOR.FC)
+            q8_0 = gguf.GGMLQuantizationType.Q8_0
+
+            self._add_dspark_tensor(catalog, "mtp.0.main_proj.weight", gguf.MODEL_TENSOR.FC, quant=q8_0)
             self._add_dspark_tensor(catalog, "mtp.0.main_norm.weight", gguf.MODEL_TENSOR.ENC_OUTPUT_NORM, keep_f32=True)
             self._add_dspark_tensor(catalog, "mtp.2.norm.weight", gguf.MODEL_TENSOR.OUTPUT_NORM, keep_f32=True)
             self._add_dspark_tensor(catalog, "mtp.2.hc_head_fn", gguf.MODEL_TENSOR.HC_HEAD_FN, keep_f32=True)
@@ -1107,33 +1089,36 @@ class DeepseekV4Model(TextModel):
             self._add_dspark_tensor(catalog, "mtp.2.markov_head.markov_w2.weight", gguf.MODEL_TENSOR.DSPARK_MARKOV_W2)
             self._add_dspark_tensor(catalog, "mtp.2.confidence_head.proj.weight", gguf.MODEL_TENSOR.DSPARK_CONF_PROJ)
 
-            layer_tensors: tuple[tuple[str, gguf.MODEL_TENSOR, str, bool], ...] = (
-                ("attn_norm.weight", gguf.MODEL_TENSOR.ATTN_NORM, ".weight", True),
-                ("attn.attn_sink", gguf.MODEL_TENSOR.ATTN_SINKS, ".weight", True),
-                ("attn.wq_a.weight", gguf.MODEL_TENSOR.ATTN_Q_A, ".weight", False),
-                ("attn.q_norm.weight", gguf.MODEL_TENSOR.ATTN_Q_A_NORM, ".weight", True),
-                ("attn.wq_b.weight", gguf.MODEL_TENSOR.ATTN_Q_B, ".weight", False),
-                ("attn.wkv.weight", gguf.MODEL_TENSOR.ATTN_KV, ".weight", False),
-                ("attn.kv_norm.weight", gguf.MODEL_TENSOR.ATTN_KV_NORM, ".weight", True),
-                ("attn.wo_a.weight", gguf.MODEL_TENSOR.ATTN_OUT_A, ".weight", False),
-                ("attn.wo_b.weight", gguf.MODEL_TENSOR.ATTN_OUT_B, ".weight", False),
-                ("hc_attn_fn", gguf.MODEL_TENSOR.HC_ATTN_FN, ".weight", True),
-                ("hc_attn_base", gguf.MODEL_TENSOR.HC_ATTN_BASE, ".weight", True),
-                ("hc_attn_scale", gguf.MODEL_TENSOR.HC_ATTN_SCALE, ".weight", True),
-                ("hc_ffn_fn", gguf.MODEL_TENSOR.HC_FFN_FN, ".weight", True),
-                ("hc_ffn_base", gguf.MODEL_TENSOR.HC_FFN_BASE, ".weight", True),
-                ("hc_ffn_scale", gguf.MODEL_TENSOR.HC_FFN_SCALE, ".weight", True),
-                ("ffn.gate.weight", gguf.MODEL_TENSOR.FFN_GATE_INP, ".weight", True),
-                ("ffn.gate.bias", gguf.MODEL_TENSOR.FFN_EXP_PROBS_B, ".bias", True),
-                ("ffn_norm.weight", gguf.MODEL_TENSOR.FFN_NORM, ".weight", True),
-                ("ffn.shared_experts.w1.weight", gguf.MODEL_TENSOR.FFN_GATE_SHEXP, ".weight", False),
-                ("ffn.shared_experts.w2.weight", gguf.MODEL_TENSOR.FFN_DOWN_SHEXP, ".weight", False),
-                ("ffn.shared_experts.w3.weight", gguf.MODEL_TENSOR.FFN_UP_SHEXP, ".weight", False),
+            # (suffix, gguf tensor, gguf suffix, keep_f32, quant): the FP8+scale dense matrices
+            # (attention projections, shared experts) are size-dominant and get requantized to
+            # Q8_0; norm/gate/bias/hc tensors are small and stay at their current F32/F16 precision.
+            layer_tensors: tuple[tuple[str, gguf.MODEL_TENSOR, str, bool, gguf.GGMLQuantizationType | None], ...] = (
+                ("attn_norm.weight", gguf.MODEL_TENSOR.ATTN_NORM, ".weight", True, None),
+                ("attn.attn_sink", gguf.MODEL_TENSOR.ATTN_SINKS, ".weight", True, None),
+                ("attn.wq_a.weight", gguf.MODEL_TENSOR.ATTN_Q_A, ".weight", False, q8_0),
+                ("attn.q_norm.weight", gguf.MODEL_TENSOR.ATTN_Q_A_NORM, ".weight", True, None),
+                ("attn.wq_b.weight", gguf.MODEL_TENSOR.ATTN_Q_B, ".weight", False, q8_0),
+                ("attn.wkv.weight", gguf.MODEL_TENSOR.ATTN_KV, ".weight", False, q8_0),
+                ("attn.kv_norm.weight", gguf.MODEL_TENSOR.ATTN_KV_NORM, ".weight", True, None),
+                ("attn.wo_a.weight", gguf.MODEL_TENSOR.ATTN_OUT_A, ".weight", False, q8_0),
+                ("attn.wo_b.weight", gguf.MODEL_TENSOR.ATTN_OUT_B, ".weight", False, q8_0),
+                ("hc_attn_fn", gguf.MODEL_TENSOR.HC_ATTN_FN, ".weight", True, None),
+                ("hc_attn_base", gguf.MODEL_TENSOR.HC_ATTN_BASE, ".weight", True, None),
+                ("hc_attn_scale", gguf.MODEL_TENSOR.HC_ATTN_SCALE, ".weight", True, None),
+                ("hc_ffn_fn", gguf.MODEL_TENSOR.HC_FFN_FN, ".weight", True, None),
+                ("hc_ffn_base", gguf.MODEL_TENSOR.HC_FFN_BASE, ".weight", True, None),
+                ("hc_ffn_scale", gguf.MODEL_TENSOR.HC_FFN_SCALE, ".weight", True, None),
+                ("ffn.gate.weight", gguf.MODEL_TENSOR.FFN_GATE_INP, ".weight", True, None),
+                ("ffn.gate.bias", gguf.MODEL_TENSOR.FFN_EXP_PROBS_B, ".bias", True, None),
+                ("ffn_norm.weight", gguf.MODEL_TENSOR.FFN_NORM, ".weight", True, None),
+                ("ffn.shared_experts.w1.weight", gguf.MODEL_TENSOR.FFN_GATE_SHEXP, ".weight", False, q8_0),
+                ("ffn.shared_experts.w2.weight", gguf.MODEL_TENSOR.FFN_DOWN_SHEXP, ".weight", False, q8_0),
+                ("ffn.shared_experts.w3.weight", gguf.MODEL_TENSOR.FFN_UP_SHEXP, ".weight", False, q8_0),
             )
 
             for bid in range(self.block_count):
-                for suffix, tensor_key, gguf_suffix, keep_f32 in layer_tensors:
-                    self._add_dspark_tensor(catalog, f"mtp.{bid}.{suffix}", tensor_key, bid, gguf_suffix, keep_f32=keep_f32)
+                for suffix, tensor_key, gguf_suffix, keep_f32, quant in layer_tensors:
+                    self._add_dspark_tensor(catalog, f"mtp.{bid}.{suffix}", tensor_key, bid, gguf_suffix, keep_f32=keep_f32, quant=quant)
                 self._add_dspark_experts(catalog, bid, "w1", gguf.MODEL_TENSOR.FFN_GATE_EXP)
                 self._add_dspark_experts(catalog, bid, "w2", gguf.MODEL_TENSOR.FFN_DOWN_EXP)
                 self._add_dspark_experts(catalog, bid, "w3", gguf.MODEL_TENSOR.FFN_UP_EXP)

@@ -11699,3 +11699,152 @@ kernel void kernel_count_equal(
 typedef decltype(kernel_count_equal<int32_t>) kernel_count_equal_t;
 
 template [[host_name("kernel_count_equal_i32")]] kernel kernel_count_equal_t kernel_count_equal<int32_t>;
+
+static inline void dsv4_hc_comb_norm_cols(thread float * comb, float eps) {
+    constexpr short HC = 4;
+
+    for (short idst = 0; idst < HC; ++idst) {
+        float sum = eps;
+        for (short isrc = 0; isrc < HC; ++isrc) {
+            sum += comb[idst + HC*isrc];
+        }
+
+        const float inv_sum = 1.0f / sum;
+        for (short isrc = 0; isrc < HC; ++isrc) {
+            comb[idst + HC*isrc] *= inv_sum;
+        }
+    }
+}
+
+static inline void dsv4_hc_comb_norm_rows(thread float * comb, float eps) {
+    constexpr short HC = 4;
+
+    for (short isrc = 0; isrc < HC; ++isrc) {
+        float sum = eps;
+        for (short idst = 0; idst < HC; ++idst) {
+            sum += comb[idst + HC*isrc];
+        }
+
+        const float inv_sum = 1.0f / sum;
+        for (short idst = 0; idst < HC; ++idst) {
+            comb[idst + HC*isrc] *= inv_sum;
+        }
+    }
+}
+
+kernel void kernel_dsv4_hc_comb(
+        constant ggml_metal_kargs_dsv4_hc_comb & args,
+        device const char * mixes,
+        device const char * scale,
+        device const char * base,
+        device       char * dst,
+        uint gid[[thread_position_in_grid]]) {
+    constexpr short HC = 4;
+    constexpr short COMB_OFFSET = 2*HC;
+
+    if (gid >= args.n_tokens) {
+        return;
+    }
+
+    const int64_t it = gid;
+
+    const float scale_comb = *(device const float *) (scale + 2*args.nbs0);
+
+    float comb[HC*HC];
+
+    for (short isrc = 0; isrc < HC; ++isrc) {
+        float mx = -INFINITY;
+        for (short idst = 0; idst < HC; ++idst) {
+            const short idx = idst + HC*isrc;
+            const float mv = *(device const float *) (mixes + (COMB_OFFSET + idx)*args.nbm0 + it*args.nbm1);
+            const float bv = *(device const float *) (base  + (COMB_OFFSET + idx)*args.nbb0);
+            const float v = mv * scale_comb + bv;
+            comb[idx] = v;
+            mx = fmax(mx, v);
+        }
+
+        float sum = 0.0f;
+        for (short idst = 0; idst < HC; ++idst) {
+            const short idx = idst + HC*isrc;
+            const float v = exp(comb[idx] - mx);
+            comb[idx] = v;
+            sum += v;
+        }
+
+        const float inv_sum = 1.0f / sum;
+        for (short idst = 0; idst < HC; ++idst) {
+            const short idx = idst + HC*isrc;
+            comb[idx] = comb[idx] * inv_sum + args.eps;
+        }
+    }
+
+    dsv4_hc_comb_norm_cols(comb, args.eps);
+    for (int32_t i = 1; i < args.n_iter; ++i) {
+        dsv4_hc_comb_norm_rows(comb, args.eps);
+        dsv4_hc_comb_norm_cols(comb, args.eps);
+    }
+
+    device char * dst_tok = dst + it*args.nbd2;
+    for (short isrc = 0; isrc < HC; ++isrc) {
+        for (short idst = 0; idst < HC; ++idst) {
+            const short idx = idst + HC*isrc;
+            *(device float *) (dst_tok + idst*args.nbd0 + isrc*args.nbd1) = comb[idx];
+        }
+    }
+}
+
+kernel void kernel_dsv4_hc_pre(
+        constant ggml_metal_kargs_dsv4_hc_pre & args,
+        device const char * x,
+        device const char * weights,
+        device       char * dst,
+        uint gid[[thread_position_in_grid]]) {
+    const int64_t nr = args.n_embd * args.n_tokens;
+
+    if (gid >= nr) {
+        return;
+    }
+
+    const int64_t i0 = gid % args.n_embd;
+    const int64_t it = gid / args.n_embd;
+
+    float sum = 0.0f;
+    for (int64_t ih = 0; ih < args.hc; ++ih) {
+        const float xv = *(device const float *) (x       + i0*args.nbx0 + ih*args.nbx1 + it*args.nbx2);
+        const float wv = *(device const float *) (weights + ih*args.nbw0 + it*args.nbw1);
+        sum += xv * wv;
+    }
+
+    *(device float *) (dst + i0*args.nbd0 + it*args.nbd1) = sum;
+}
+
+kernel void kernel_dsv4_hc_post(
+        constant ggml_metal_kargs_dsv4_hc_post & args,
+        device const char * x,
+        device const char * residual,
+        device const char * post,
+        device const char * comb,
+        device       char * dst,
+        uint gid[[thread_position_in_grid]]) {
+    const int64_t nr = args.n_embd * args.hc * args.n_tokens;
+
+    if (gid >= nr) {
+        return;
+    }
+
+    const int64_t i0   = gid % args.n_embd;
+    const int64_t idst = (gid / args.n_embd) % args.hc;
+    const int64_t it   = gid / (args.n_embd * args.hc);
+
+    const float xv = *(device const float *) (x    + i0*args.nbx0   + it*args.nbx1);
+    const float pv = *(device const float *) (post + idst*args.nbp0 + it*args.nbp1);
+
+    float sum = xv * pv;
+    for (int64_t isrc = 0; isrc < args.hc; ++isrc) {
+        const float rv = *(device const float *) (residual + i0*args.nbr0   + isrc*args.nbr1 + it*args.nbr2);
+        const float cv = *(device const float *) (comb     + idst*args.nbc0 + isrc*args.nbc1 + it*args.nbc2);
+        sum += rv * cv;
+    }
+
+    *(device float *) (dst + i0*args.nbd0 + idst*args.nbd1 + it*args.nbd2) = sum;
+}

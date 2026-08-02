@@ -1222,4 +1222,49 @@ typedef struct {
     int64_t  np;
 } ggml_metal_kargs_opt_step_sgd;
 
+typedef struct {
+    int64_t  n_tokens;
+    uint64_t nbm0;
+    uint64_t nbm1;
+    uint64_t nbs0;
+    uint64_t nbb0;
+    uint64_t nbd0;
+    uint64_t nbd1;
+    uint64_t nbd2;
+    float    eps;
+    int32_t  n_iter;
+} ggml_metal_kargs_dsv4_hc_comb;
+
+typedef struct {
+    int64_t  n_embd;
+    int64_t  hc;
+    int64_t  n_tokens;
+    uint64_t nbx0;
+    uint64_t nbx1;
+    uint64_t nbx2;
+    uint64_t nbw0;
+    uint64_t nbw1;
+    uint64_t nbd0;
+    uint64_t nbd1;
+} ggml_metal_kargs_dsv4_hc_pre;
+
+typedef struct {
+    int64_t  n_embd;
+    int64_t  hc;
+    int64_t  n_tokens;
+    uint64_t nbx0;
+    uint64_t nbx1;
+    uint64_t nbr0;
+    uint64_t nbr1;
+    uint64_t nbr2;
+    uint64_t nbp0;
+    uint64_t nbp1;
+    uint64_t nbc0;
+    uint64_t nbc1;
+    uint64_t nbc2;
+    uint64_t nbd0;
+    uint64_t nbd1;
+    uint64_t nbd2;
+} ggml_metal_kargs_dsv4_hc_post;
+
 #endif // GGML_METAL_IMPL

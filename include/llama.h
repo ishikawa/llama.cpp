@@ -406,6 +406,9 @@ extern "C" {
         // a source/target/parent context
         // can be utilized in various ways, for example by sharing results or llama_memory between 2 contexts
         struct llama_context * ctx_other;
+
+        // appended at the end so prior field offsets stay stable
+        float prefetch_gibps; // paced model file prefetch rate, 0 = disabled
     };
 
     struct llama_model_tensor_override {

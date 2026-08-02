@@ -27,6 +27,7 @@
 #include <algorithm>
 #include <cinttypes>
 #include <climits>
+#include <cmath>
 #include <cstdarg>
 #include <filesystem>
 #include <fstream>
@@ -2569,6 +2570,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.load_mode = value ? LLAMA_LOAD_MODE_DIRECT_IO : LLAMA_LOAD_MODE_NONE;
         }
     ).set_env("LLAMA_ARG_DIO"));
+    add_opt(common_arg(
+        {"--prefetch-gibps"}, "N",
+        "when mmap is used, read the model file sequentially via pread at this rate (GiB/s) during prompt processing, to warm the page cache faster than the page-fault path. 0 disables it (default). No effect if mmap is disabled.",
+        [](common_params & params, const std::string & value) {
+            params.prefetch_gibps = std::stof(value);
+            // non-finite values would defeat the pacing (inf reads at full speed and
+            // self-evicts the page cache), so reject anything but a finite rate >= 0
+            if (!std::isfinite(params.prefetch_gibps) || params.prefetch_gibps < 0.0f) {
+                throw std::invalid_argument("invalid value");
+            }
+        }
+    ).set_env("LLAMA_ARG_PREFETCH_GIBPS"));
     add_opt(common_arg(
         {"-lm", "--load-mode"}, "MODE",
         "model loading mode (default: mmap)\n"

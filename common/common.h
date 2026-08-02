@@ -468,6 +468,7 @@ struct common_params {
     float   yarn_attn_factor      = -1.0f; // YaRN magnitude scaling factor
     float   yarn_beta_fast        = -1.0f; // YaRN low correction dim
     float   yarn_beta_slow        = -1.0f; // YaRN high correction dim
+    float   prefetch_gibps        =  0.0f; // paced model file prefetch rate
     int32_t yarn_orig_ctx         =     0; // YaRN original context length
 
     // offload params

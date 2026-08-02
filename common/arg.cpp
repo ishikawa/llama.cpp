@@ -2570,6 +2570,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_DIO"));
     add_opt(common_arg(
+        {"--prefetch-gibps"}, "N",
+        "when mmap is used, read the model file sequentially via pread at this rate (GiB/s) during prompt processing, to warm the page cache faster than the page-fault path. 0 disables it (default). No effect if mmap is disabled.",
+        [](common_params & params, const std::string & value) {
+            params.prefetch_gibps = std::stof(value);
+            if (params.prefetch_gibps < 0.0f) {
+                throw std::invalid_argument("invalid value");
+            }
+        }
+    ).set_env("LLAMA_ARG_PREFETCH_GIBPS"));
+    add_opt(common_arg(
         {"-lm", "--load-mode"}, "MODE",
         "model loading mode (default: mmap)\n"
         "- none: no special loading mode\n"

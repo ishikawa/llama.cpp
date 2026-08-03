@@ -112,6 +112,13 @@
 #define OP_FLASH_ATTN_EXT_VEC_NQPSG 1
 #define OP_FLASH_ATTN_EXT_VEC_NCPSG 32
 
+#define OP_LIGHTNING_INDEXER_DK    128
+#define OP_LIGHTNING_INDEXER_NH     64
+#define OP_LIGHTNING_INDEXER_NHPTG   8
+#define OP_LIGHTNING_INDEXER_NKPSG   8
+#define OP_LIGHTNING_INDEXER_NSG     8
+#define OP_LIGHTNING_INDEXER_NBPTG   8
+
 #define OP_UNARY_NUM_SCALE      10
 #define OP_UNARY_NUM_FILL       11
 #define OP_UNARY_NUM_CLAMP      12
@@ -1172,6 +1179,66 @@ typedef struct {
 } ggml_metal_kargs_memset;
 
 typedef struct {
+    int32_t  n_kv;
+    int32_t  n_batch;
+    int32_t  mask_ne3;
+    uint64_t nb1;
+    uint64_t nb3;
+    uint64_t nbq1;
+    uint64_t nbq2;
+    uint64_t nbq3;
+    uint64_t nbk2;
+    uint64_t nbk3;
+    uint64_t nbw1;
+    uint64_t nbw3;
+    uint64_t nbm1;
+    uint64_t nbm3;
+} ggml_metal_kargs_lightning_indexer;
+
+typedef struct {
+    int32_t  n_tokens;
+    int32_t  n_iter;
+    uint64_t nb_m0;
+    uint64_t nb_m1;
+    uint64_t nb_s0;
+    uint64_t nb_b0;
+    uint64_t nb_d0;
+    uint64_t nb_d1;
+    uint64_t nb_d2;
+    float    eps;
+} ggml_metal_kargs_dsv4_hc_comb;
+
+typedef struct {
+    int32_t  n_embd;
+    int32_t  n_tokens;
+    uint64_t nb_x0;
+    uint64_t nb_x1;
+    uint64_t nb_x2;
+    uint64_t nb_w0;
+    uint64_t nb_w1;
+    uint64_t nb_d0;
+    uint64_t nb_d1;
+} ggml_metal_kargs_dsv4_hc_pre;
+
+typedef struct {
+    int32_t  n_embd;
+    int32_t  n_tokens;
+    uint64_t nb_x0;
+    uint64_t nb_x1;
+    uint64_t nb_r0;
+    uint64_t nb_r1;
+    uint64_t nb_r2;
+    uint64_t nb_p0;
+    uint64_t nb_p1;
+    uint64_t nb_c0;
+    uint64_t nb_c1;
+    uint64_t nb_c2;
+    uint64_t nb_d0;
+    uint64_t nb_d1;
+    uint64_t nb_d2;
+} ggml_metal_kargs_dsv4_hc_post;
+
+typedef struct {
     int32_t  ne00;
     int32_t  ne01;
     int32_t  ne02;
@@ -1223,66 +1290,7 @@ typedef struct {
 } ggml_metal_kargs_opt_step_sgd;
 
 typedef struct {
-    int64_t  n_tokens;
-    uint64_t nbm0;
-    uint64_t nbm1;
-    uint64_t nbs0;
-    uint64_t nbb0;
-    uint64_t nbd0;
-    uint64_t nbd1;
-    uint64_t nbd2;
-    float    eps;
-    int32_t  n_iter;
-} ggml_metal_kargs_dsv4_hc_comb;
-
-typedef struct {
-    int64_t  n_embd;
-    int64_t  hc;
-    int64_t  n_tokens;
-    uint64_t nbx0;
-    uint64_t nbx1;
-    uint64_t nbx2;
-    uint64_t nbw0;
-    uint64_t nbw1;
-    uint64_t nbd0;
-    uint64_t nbd1;
-} ggml_metal_kargs_dsv4_hc_pre;
-
-typedef struct {
-    int64_t  n_embd;
-    int64_t  hc;
-    int64_t  n_tokens;
-    uint64_t nbx0;
-    uint64_t nbx1;
-    uint64_t nbr0;
-    uint64_t nbr1;
-    uint64_t nbr2;
-    uint64_t nbp0;
-    uint64_t nbp1;
-    uint64_t nbc0;
-    uint64_t nbc1;
-    uint64_t nbc2;
-    uint64_t nbd0;
-    uint64_t nbd1;
-    uint64_t nbd2;
-} ggml_metal_kargs_dsv4_hc_post;
-
-typedef struct {
-    int64_t  n_embd;
-    int64_t  n_head;
-    int64_t  n_kv;
-    int64_t  nem3;
-    uint64_t nbq1;
-    uint64_t nbq2;
-    uint64_t nbq3;
-    uint64_t nbk2;
-    uint64_t nbk3;
-    uint64_t nbw1;
-    uint64_t nbw3;
-    uint64_t nbm1;
-    uint64_t nbm3;
-    uint64_t nb1;
-    uint64_t nb3;
-} ggml_metal_kargs_lightning_indexer;
+    int64_t ne;
+} ggml_metal_kargs_silu_back;
 
 #endif // GGML_METAL_IMPL

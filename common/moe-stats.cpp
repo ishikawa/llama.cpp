@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -116,9 +117,13 @@ public:
             return;
         }
 
-        std::ofstream out(output_path, std::ios::out | std::ios::trunc);
+        // write to a temp file and rename so a crash mid-dump cannot destroy the
+        // previously accumulated stats file
+        const std::string tmp_path = output_path + ".tmp";
+
+        std::ofstream out(tmp_path, std::ios::out | std::ios::trunc);
         if (!out) {
-            LOG_ERR("%s: failed to open '%s'\n", __func__, output_path.c_str());
+            LOG_ERR("%s: failed to open '%s'\n", __func__, tmp_path.c_str());
             return;
         }
 
@@ -153,8 +158,14 @@ public:
         out << "  }\n";
         out << "}\n";
 
+        out.close();
         if (!out) {
-            LOG_ERR("%s: failed to write '%s'\n", __func__, output_path.c_str());
+            LOG_ERR("%s: failed to write '%s'\n", __func__, tmp_path.c_str());
+            return;
+        }
+
+        if (std::rename(tmp_path.c_str(), output_path.c_str()) != 0) {
+            LOG_ERR("%s: failed to rename '%s' to '%s'\n", __func__, tmp_path.c_str(), output_path.c_str());
         }
     }
 

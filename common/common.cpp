@@ -6,6 +6,7 @@
 #include "fit.h"
 #include "log.h"
 #include "llama.h"
+#include "moe-stats.h"
 #include "sampling.h"
 #include "speculative.h"
 #include "unicode.h"
@@ -1344,6 +1345,8 @@ std::vector<llama_adapter_lora_ptr> & common_init_result::lora() {
 }
 
 common_init_result_ptr common_init_from_params(common_params & params, bool model_only) {
+    common_moe_stats_maybe_init(params);
+
     common_init_result_ptr res(new common_init_result(params, model_only));
 
     llama_model * model = res->model();

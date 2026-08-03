@@ -4491,6 +4491,38 @@ struct test_mul_mat_id : public test_case {
     }
 };
 
+// GGML_OP_MUL_MAT_ID with duplicate expert ids within a row (hash-routing remap after expert pruning)
+struct test_mul_mat_id_dup_ids : public test_mul_mat_id {
+    test_mul_mat_id_dup_ids(ggml_type type_a, ggml_type type_b,
+            int n_mats, int n_used, bool b, int64_t m, int64_t n, int64_t k)
+        : test_mul_mat_id(type_a, type_b, n_mats, n_used, b, m, n, k) {}
+
+    std::string vars() override {
+        return test_mul_mat_id::vars() + ",dup_ids=1";
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::random_device rd;
+        std::default_random_engine rng(rd());
+        std::uniform_int_distribution<int32_t> dist(0, n_mats - 1);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32) {
+                if (ggml_is_view_op(t->op)) { continue; }
+                // independent draws: rows contain duplicate ids with high probability
+                for (int64_t r = 0; r < ggml_nrows(t); r++) {
+                    std::vector<int32_t> data(t->ne[0]);
+                    for (int i = 0; i < t->ne[0]; i++) {
+                        data[i] = dist(rng);
+                    }
+                    ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(int32_t));
+                }
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_MUL_MAT_ID + GGML_OP_ADD or GGML_OP_MUL
 struct test_mul_mat_id_fusion : public test_case {
     const ggml_type type_a;
@@ -8834,6 +8866,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 1, 5120, {128, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 8192, 512, 5120, {128, 1}, {1, 1}));
 #endif
+
+    // hash-routing after expert pruning: rows may contain duplicate expert ids (DSv4 tid2eid remap)
+    for (int n_mats : {8, 112, 128}) {
+        for (int n_tok : {5, 79}) {
+            test_cases.emplace_back(new test_mul_mat_id_dup_ids(GGML_TYPE_F16, GGML_TYPE_F32, n_mats, 6, false, 64, n_tok, 64));
+        }
+    }
+    test_cases.emplace_back(new test_mul_mat_id_dup_ids(GGML_TYPE_IQ3_XXS, GGML_TYPE_F32, 112, 6, false, 2048, 79, 4096));
 
     for (ggml_type type_a : all_types) {
         for (int i = 1; i < 10; ++i) {

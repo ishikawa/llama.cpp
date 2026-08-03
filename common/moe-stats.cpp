@@ -23,6 +23,7 @@
 #if !defined(_WIN32)
 #include <cerrno>
 #include <fcntl.h>
+#include <poll.h>
 #include <signal.h>
 #include <unistd.h>
 #endif
@@ -424,7 +425,7 @@ static void common_moe_stats_sigusr1_handler(int) {
     }
 }
 
-static void common_moe_stats_install_sigusr1() {
+static void common_moe_stats_install_sigusr1(int interval_s) {
     if (pipe(common_moe_stats_signal_pipe) != 0) {
         LOG_WRN("%s: failed to create signal pipe: %s\n", __func__, std::strerror(errno));
         return;
@@ -440,13 +441,27 @@ static void common_moe_stats_install_sigusr1() {
         return;
     }
 
-    std::thread([] {
+    std::thread([interval_s] {
         uint8_t buf[64];
+        const int timeout_ms = interval_s > 0 ? interval_s * 1000 : -1;
         for (;;) {
+            struct pollfd pfd = { common_moe_stats_signal_pipe[0], POLLIN, 0 };
+            const int pr = poll(&pfd, 1, timeout_ms);
+            if (pr < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                break;
+            }
+            if (pr == 0) {
+                // periodic dump (LLAMA_MOE_STATS_INTERVAL elapsed with no signal)
+                common_moe_stats_get_collector().dump();
+                continue;
+            }
             const ssize_t n = read(common_moe_stats_signal_pipe[0], buf, sizeof(buf));
             if (n > 0) {
                 common_moe_stats_get_collector().dump();
-            } else if (n < 0 && errno == EINTR) {
+            } else if (n < 0 && (errno == EINTR || errno == EAGAIN)) {
                 continue;
             } else {
                 break;
@@ -468,7 +483,17 @@ static void common_moe_stats_install_dump_handlers() {
     std::atexit(common_moe_stats_dump_atexit);
 
 #if defined(SIGUSR1) && !defined(_WIN32)
-    common_moe_stats_install_sigusr1();
+    // LLAMA_MOE_STATS_INTERVAL=<seconds> enables periodic dumps so a force-killed
+    // process loses at most one interval of accumulated stats
+    int interval_s = 0;
+    if (const char * env = std::getenv("LLAMA_MOE_STATS_INTERVAL")) {
+        interval_s = std::atoi(env);
+        if (interval_s <= 0) {
+            LOG_WRN("%s: ignoring invalid LLAMA_MOE_STATS_INTERVAL '%s'\n", __func__, env);
+            interval_s = 0;
+        }
+    }
+    common_moe_stats_install_sigusr1(interval_s);
 #endif
 }
 

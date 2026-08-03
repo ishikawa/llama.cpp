@@ -2352,9 +2352,13 @@ size_t ggml_metal_op_mul_mat_id_extra_ids(const ggml_tensor * op) {
     assert(op->op == GGML_OP_MUL_MAT_ID);
 
     const int64_t ne02 = op->src[0]->ne[2]; // n_expert
+    const int64_t ne20 = op->src[2]->ne[0]; // n_expert_used
     const int64_t ne21 = op->src[2]->ne[1]; // n_token
 
-    return ggml_type_size(GGML_TYPE_I32)*ne02*ne21;
+    // per-expert capacity is ne20*ne21: rows of ids can reference the same expert in multiple
+    // slots (e.g. hash-routing tables remapped after expert pruning), and each occurrence
+    // produces its own output row
+    return ggml_type_size(GGML_TYPE_I32)*ne02*ne20*ne21;
 }
 
 int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {

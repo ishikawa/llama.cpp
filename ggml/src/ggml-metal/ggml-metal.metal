@@ -10802,7 +10802,9 @@ kernel void kernel_mul_mm_id_map0(
 
     uint32_t n_all = 0;
 
-    device int32_t * ids_i32 = (device int32_t *) hids + ide*args.ne21;
+    // a row of ids can reference the same expert multiple times (e.g. hash-routing tables remapped
+    // after expert pruning), so each expert needs capacity for up to ne20*ne21 entries
+    device int32_t * ids_i32 = (device int32_t *) hids + ide*(args.ne20*args.ne21);
 
     for (int i21 = 0; i21 < args.ne21; i21 += ntg) { // n_tokens
         if (i21 + tpitg < args.ne21) {
@@ -10825,15 +10827,14 @@ kernel void kernel_mul_mm_id_map0(
 
             threadgroup const uint16_t * sids = (threadgroup const uint16_t *) shmem + t*ne20;
 
-            short sel = 0;
+            // emit one entry per matching slot - duplicate ids within a row must each produce
+            // their own output row
             #pragma unroll(ne20)
             for (short i20 = 0; i20 < ne20; i20++) {
-                sel += (sids[i20] == ide)*(i20 + 1);
+                if (sids[i20] == ide) {
+                    ids_i32[n_all++] = (i21 + t)*ne20 + i20;
+                }
             }
-
-            ids_i32[n_all] = (i21 + t)*ne20 + sel - 1;
-
-            n_all += sel > 0;
         }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -10865,6 +10866,7 @@ kernel void kernel_mul_mm_id(
         device       char * dst,
         threadgroup  char * shmem [[threadgroup(0)]],
         uint3  tgpig[[threadgroup_position_in_grid]],
+        uint3   tgpg[[threadgroups_per_grid]],
         ushort tiitg[[thread_index_in_threadgroup]],
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
@@ -10884,41 +10886,60 @@ kernel void kernel_mul_mm_id(
 
     const int im = tgpig.z; // expert
     const int r0 = tgpig.y*NR0;
-    const int r1 = tgpig.x*NR1;
 
     device const uint32_t * tpe_u32 = (device const uint32_t *) (htpe);
-    device const int32_t  * ids_i32 = (device const int32_t  *) (hids);
+    // per-expert capacity is ne20*ne21 entries - rows of ids can reference the same expert in
+    // multiple slots (e.g. hash-routing tables remapped after expert pruning)
+    device const int32_t  * ids_i32 = (device const int32_t  *) (hids) + im*(args.ne20*args.ne21);
 
     const int32_t neh1 = tpe_u32[im];
 
-    if (r1 >= neh1) {
-        return;
-    }
-
     // if this block is of 64x32 shape or smaller
     const short nr0 = (args.ne0 - r0 < NR0) ? (args.ne0 - r0) : NR0;
-    const short nr1 = (    neh1 - r1 < NR1) ? (    neh1 - r1) : NR1;
 
     // a thread shouldn't load data outside of the matrix
     const short lr0 = ((short)tiitg/NL0) < nr0 ? ((short)tiitg/NL0) : nr0 - 1; // 0 .. 63
-    const short lr1 = ((short)tiitg/NL1) < nr1 ? ((short)tiitg/NL1) : nr1 - 1; // 0 .. 31
 
     const short il0 = (tiitg % NL0);
 
+    const short offset1 = il0/nl;
+
+    const short iy = 8*(tiitg % NL1);
+
+#ifndef GGML_METAL_HAS_TENSOR
+    S0_8x8 ma[4];
+    S1_8x8 mb[2];
+
+    simdgroup_float8x8 mc[8];
+#else
+    auto tA = tensor<threadgroup S0, dextents<int32_t, 2>, tensor_inline>(sa, dextents<int32_t, 2>(NK,  NR0));
+    auto tB = tensor<threadgroup S1, dextents<int32_t, 2>, tensor_inline>(sb, dextents<int32_t, 2>(NR1, NK ));
+
+    mpp::tensor_ops::matmul2d<
+        mpp::tensor_ops::matmul2d_descriptor(NR1, NR0, NK, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
+        execution_simdgroups<4>> mm;
+#endif
+
+    // grid-stride loop: the grid is sized for ne21 rows per expert, but an expert can have up to
+    // ne20*ne21 rows when ids contain duplicates - the loop condition is uniform per threadgroup,
+    // so the barriers inside remain valid
+    for (int r1 = tgpig.x*NR1; r1 < neh1; r1 += (int)(tgpg.x*NR1)) {
+
+    const short nr1 = (neh1 - r1 < NR1) ? (neh1 - r1) : NR1;
+
+    const short lr1 = ((short)tiitg/NL1) < nr1 ? ((short)tiitg/NL1) : nr1 - 1; // 0 .. 31
+
     short il = il0;
 
-    const int id = ids_i32[im*args.ne21 + r1 + lr1];
+    const int id = ids_i32[r1 + lr1];
 
     const short i11 = (id % args.ne20) % args.ne11;
     const short i12 = (id / args.ne20);
     const short i13 = 0;
 
     const uint64_t offset0 = im*args.nb02 + i13*args.nb03;
-    const short    offset1 = il0/nl;
 
     device const block_q * x = (device const block_q *)(src0 + args.nb01*(r0 + lr0) + offset0) + offset1;
-
-    const short iy = 8*(tiitg % NL1);
 
     device const T1 * y = (device const T1 *)(src1
         + args.nb13*i13
@@ -10927,22 +10948,10 @@ kernel void kernel_mul_mm_id(
         + args.nb10*iy);
 
 #ifndef GGML_METAL_HAS_TENSOR
-    S0_8x8 ma[4];
-    S1_8x8 mb[2];
-
-    simdgroup_float8x8 mc[8];
-
     for (short i = 0; i < 8; i++){
         mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
     }
 #else
-    auto tA = tensor<threadgroup S0, dextents<int32_t, 2>, tensor_inline>(sa, dextents<int32_t, 2>(NK,  NR0));
-    auto tB = tensor<threadgroup S1, dextents<int32_t, 2>, tensor_inline>(sb, dextents<int32_t, 2>(NR1, NK ));
-
-    mpp::tensor_ops::matmul2d<
-        mpp::tensor_ops::matmul2d_descriptor(NR1, NR0, NK, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
-        execution_simdgroups<4>> mm;
-
     auto cT = mm.get_destination_cooperative_tensor<decltype(tA), decltype(tB), float>();
 #endif
 
@@ -11137,7 +11146,7 @@ kernel void kernel_mul_mm_id(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     for (short j = sgitg; j < nr1; j += 4) {
-        const int id = ids_i32[im*args.ne21 + r1 + j];
+        const int id = ids_i32[r1 + j];
 
         const short ide = id % args.ne20;
         const short idt = id / args.ne20;
@@ -11158,6 +11167,8 @@ kernel void kernel_mul_mm_id(
             *(D + i) = *(C + i);
         }
     }
+
+    } // grid-stride loop over r1
 }
 
 //

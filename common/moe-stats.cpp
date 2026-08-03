@@ -6,6 +6,7 @@
 #include "log.h"
 
 #include <algorithm>
+#include <climits>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -23,6 +24,7 @@
 #if !defined(_WIN32)
 #include <cerrno>
 #include <fcntl.h>
+#include <poll.h>
 #include <signal.h>
 #include <unistd.h>
 #endif
@@ -424,7 +426,7 @@ static void common_moe_stats_sigusr1_handler(int) {
     }
 }
 
-static void common_moe_stats_install_sigusr1() {
+static void common_moe_stats_install_sigusr1(int interval_s) {
     if (pipe(common_moe_stats_signal_pipe) != 0) {
         LOG_WRN("%s: failed to create signal pipe: %s\n", __func__, std::strerror(errno));
         return;
@@ -440,13 +442,28 @@ static void common_moe_stats_install_sigusr1() {
         return;
     }
 
-    std::thread([] {
+    std::thread([interval_s] {
         uint8_t buf[64];
+        const int timeout_ms = interval_s > 0 ? interval_s * 1000 : -1;
         for (;;) {
+            struct pollfd pfd = { common_moe_stats_signal_pipe[0], POLLIN, 0 };
+            const int pr = poll(&pfd, 1, timeout_ms);
+            if (pr < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                LOG_WRN("common_moe_stats: dump thread exiting on poll error: %s (SIGUSR1/interval dumps disabled)\n", std::strerror(errno));
+                break;
+            }
+            if (pr == 0) {
+                // periodic dump (LLAMA_MOE_STATS_INTERVAL elapsed with no signal)
+                common_moe_stats_get_collector().dump();
+                continue;
+            }
             const ssize_t n = read(common_moe_stats_signal_pipe[0], buf, sizeof(buf));
             if (n > 0) {
                 common_moe_stats_get_collector().dump();
-            } else if (n < 0 && errno == EINTR) {
+            } else if (n < 0 && (errno == EINTR || errno == EAGAIN)) {
                 continue;
             } else {
                 break;
@@ -468,7 +485,22 @@ static void common_moe_stats_install_dump_handlers() {
     std::atexit(common_moe_stats_dump_atexit);
 
 #if defined(SIGUSR1) && !defined(_WIN32)
-    common_moe_stats_install_sigusr1();
+    // LLAMA_MOE_STATS_INTERVAL=<seconds> enables periodic dumps so a force-killed
+    // process loses at most one interval of accumulated stats
+    int interval_s = 0;
+    if (const char * env = std::getenv("LLAMA_MOE_STATS_INTERVAL")) {
+        char * end = nullptr;
+        errno = 0;
+        const long parsed = std::strtol(env, &end, 10);
+        // reject trailing garbage, non-positive values, and anything that would
+        // overflow the poll() millisecond timeout (int)
+        if (errno != 0 || end == env || *end != '\0' || parsed <= 0 || parsed > INT_MAX / 1000) {
+            LOG_WRN("%s: ignoring invalid LLAMA_MOE_STATS_INTERVAL '%s' (want 1..%d seconds)\n", __func__, env, INT_MAX / 1000);
+        } else {
+            interval_s = (int) parsed;
+        }
+    }
+    common_moe_stats_install_sigusr1(interval_s);
 #endif
 }
 
@@ -481,9 +513,6 @@ void common_moe_stats_maybe_init(common_params & params) {
     auto & collector = common_moe_stats_get_collector();
     collector.configure(output_path, params.model.path);
 
-    static std::once_flag once;
-    std::call_once(once, common_moe_stats_install_dump_handlers);
-
     if (params.cb_eval == common_moe_stats_cb_eval && params.cb_eval_user_data != nullptr) {
         return;
     }
@@ -495,4 +524,9 @@ void common_moe_stats_maybe_init(common_params & params) {
 
     params.cb_eval           = common_moe_stats_cb_eval;
     params.cb_eval_user_data = new common_moe_stats_cb_data(collector);
+
+    // install the dump handlers only once collection is actually wired up, so a
+    // disabled run (cb_eval conflict) does not keep dumping empty stats
+    static std::once_flag once;
+    std::call_once(once, common_moe_stats_install_dump_handlers);
 }

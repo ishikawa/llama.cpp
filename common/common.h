@@ -787,6 +787,14 @@ void string_replace_all(std::string & s, const std::string & search, const std::
 
 std::string regex_escape(const std::string & s);
 
+struct common_utf8_sanitize_result {
+    size_t valid_end    = 0;
+    size_t replacements = 0;
+    bool   incomplete   = false;
+};
+
+common_utf8_sanitize_result common_utf8_sanitize(std::string & text, size_t offset, bool is_final);
+
 template<class T>
 static std::vector<T> string_split(const std::string & str, char delim) {
     static_assert(!std::is_same<T, std::string>::value, "Please use the specialized version for std::string");

@@ -18,6 +18,7 @@
 #include <exception>
 #include <fstream>
 #include <functional>
+#include <initializer_list>
 #include <iostream>
 #include <nlohmann/json.hpp>
 #include <set>
@@ -126,6 +127,15 @@ static void assert_ends_with(const std::string & str, const std::string & suffix
         common_log_flush(common_log_main());
         throw std::runtime_error("Test failed");
     }
+}
+
+static std::string make_bytes(std::initializer_list<unsigned char> data) {
+    std::string out;
+    out.reserve(data.size());
+    for (unsigned char c : data) {
+        out.push_back(static_cast<char>(c));
+    }
+    return out;
 }
 
 static std::string read_file(const std::string & path) {
@@ -7037,6 +7047,83 @@ static void test_msg_diffs_compute() {
     }
 }
 
+static void test_utf8_sanitize() {
+    const std::string repl = make_bytes({ 0xef, 0xbf, 0xbd });
+    const std::string jp   = make_bytes({ 0xe6, 0x97, 0xa5, 0xe6, 0x9c, 0xac, 0xe8, 0xaa, 0x9e });
+    const std::string en   = make_bytes({ 0xe5, 0xbb, 0xb6 });
+
+    {
+        std::string text = "sent ";
+        text += make_bytes({ 0xe9, 0x81 });
+        text += en;
+
+        const auto result = common_utf8_sanitize(text, 5, false);
+
+        assert_equals(std::string("sent ") + repl + en, text);
+        assert_equals(text.size(), result.valid_end);
+        assert_equals((size_t) 1, result.replacements);
+        assert_equals(false, result.incomplete);
+    }
+
+    {
+        std::string text = "ASCII ";
+        text += jp;
+        text += " ok";
+
+        const std::string expected = text;
+        const auto result = common_utf8_sanitize(text, 0, false);
+
+        assert_equals(expected, text);
+        assert_equals(text.size(), result.valid_end);
+        assert_equals((size_t) 0, result.replacements);
+        assert_equals(false, result.incomplete);
+    }
+
+    {
+        std::string text = "before ";
+        text += make_bytes({ 0xe9, 0x81 });
+        text += en;
+        text += " after";
+
+        common_utf8_sanitize(text, 0, false);
+
+        common_chat_parser_params params;
+        params.format = COMMON_CHAT_FORMAT_CONTENT_ONLY;
+        const common_chat_msg msg = common_chat_parse(text, false, params);
+
+        assert_equals(std::string("before ") + repl + en + " after", msg.content);
+    }
+
+    {
+        std::string text = make_bytes({ 0xc0, 0x80, 0x20, 0xed, 0xa0, 0x80, 0x20, 0x80 });
+        const auto result = common_utf8_sanitize(text, 0, false);
+
+        assert_equals(repl + repl + " " + repl + repl + repl + " " + repl, text);
+        assert_equals(text.size(), result.valid_end);
+        assert_equals((size_t) 6, result.replacements);
+        assert_equals(false, result.incomplete);
+    }
+
+    {
+        std::string text = "x";
+        text += make_bytes({ 0xe9, 0x81 });
+
+        const auto partial = common_utf8_sanitize(text, 0, false);
+
+        assert_equals(std::string("x") + make_bytes({ 0xe9, 0x81 }), text);
+        assert_equals((size_t) 1, partial.valid_end);
+        assert_equals((size_t) 0, partial.replacements);
+        assert_equals(true, partial.incomplete);
+
+        const auto final = common_utf8_sanitize(text, 0, true);
+
+        assert_equals(std::string("x") + repl, text);
+        assert_equals(text.size(), final.valid_end);
+        assert_equals((size_t) 1, final.replacements);
+        assert_equals(false, final.incomplete);
+    }
+}
+
 int main(int argc, char ** argv) {
     bool detailed_debug    = false;
     bool only_run_filtered = false;
@@ -7109,6 +7196,7 @@ int main(int argc, char ** argv) {
     } else
 #endif
     {
+        test_utf8_sanitize();
         test_msg_diffs_compute();
         test_msgs_oaicompat_json_conversion();
         test_msg_token_delimiters_split();

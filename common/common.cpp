@@ -526,6 +526,205 @@ std::string regex_escape(const std::string & s) {
     return std::regex_replace(s, special_chars, "\\$&");
 }
 
+static bool utf8_is_cont(unsigned char c) {
+    return c >= 0x80 && c <= 0xbf;
+}
+
+static bool utf8_in_range(unsigned char c, unsigned char lo, unsigned char hi) {
+    return c >= lo && c <= hi;
+}
+
+static std::string utf8_hex_dump(const std::string & text, size_t pos, size_t len) {
+    static const char * hex = "0123456789ABCDEF";
+    const size_t max_len = 16;
+    const size_t n = std::min(len, max_len);
+    std::string out;
+
+    for (size_t i = 0; i < n && pos + i < text.size(); ++i) {
+        const unsigned char c = static_cast<unsigned char>(text[pos + i]);
+        if (!out.empty()) {
+            out.push_back(' ');
+        }
+        out.push_back(hex[(c >> 4) & 0x0f]);
+        out.push_back(hex[c & 0x0f]);
+    }
+    if (len > max_len) {
+        out += " ...";
+    }
+
+    return out;
+}
+
+static void utf8_replace_subpart(std::string & text, size_t pos, size_t len, size_t & replacements) {
+    static const std::string replacement = "\xef\xbf\xbd";
+    const std::string dump = utf8_hex_dump(text, pos, len);
+
+    LOG_WRN("%s: invalid UTF-8 at byte %zu, replacing: %s\n", __func__, pos, dump.c_str());
+    text.replace(pos, len, replacement);
+    replacements++;
+}
+
+common_utf8_sanitize_result common_utf8_sanitize(std::string & text, size_t offset, bool is_final) {
+    common_utf8_sanitize_result result;
+    size_t pos = std::min(offset, text.size());
+
+    while (pos < text.size()) {
+        const unsigned char c0 = static_cast<unsigned char>(text[pos]);
+
+        if (c0 <= 0x7f) {
+            pos++;
+            continue;
+        }
+
+        if (c0 >= 0x80 && c0 <= 0xbf) {
+            utf8_replace_subpart(text, pos, 1, result.replacements);
+            pos += 3;
+            continue;
+        }
+
+        if (c0 >= 0xc2 && c0 <= 0xdf) {
+            if (pos + 1 >= text.size()) {
+                if (!is_final) {
+                    result.valid_end = pos;
+                    result.incomplete = true;
+                    return result;
+                }
+                utf8_replace_subpart(text, pos, text.size() - pos, result.replacements);
+                pos += 3;
+                continue;
+            }
+
+            if (!utf8_is_cont(static_cast<unsigned char>(text[pos + 1]))) {
+                utf8_replace_subpart(text, pos, 1, result.replacements);
+                pos += 3;
+                continue;
+            }
+
+            pos += 2;
+            continue;
+        }
+
+        if (c0 >= 0xe0 && c0 <= 0xef) {
+            unsigned char lo1 = 0x80;
+            unsigned char hi1 = 0xbf;
+
+            if (c0 == 0xe0) {
+                lo1 = 0xa0;
+            } else if (c0 == 0xed) {
+                hi1 = 0x9f;
+            }
+
+            if (pos + 1 >= text.size()) {
+                if (!is_final) {
+                    result.valid_end = pos;
+                    result.incomplete = true;
+                    return result;
+                }
+                utf8_replace_subpart(text, pos, text.size() - pos, result.replacements);
+                pos += 3;
+                continue;
+            }
+
+            if (!utf8_in_range(static_cast<unsigned char>(text[pos + 1]), lo1, hi1)) {
+                utf8_replace_subpart(text, pos, 1, result.replacements);
+                pos += 3;
+                continue;
+            }
+
+            if (pos + 2 >= text.size()) {
+                if (!is_final) {
+                    result.valid_end = pos;
+                    result.incomplete = true;
+                    return result;
+                }
+                utf8_replace_subpart(text, pos, text.size() - pos, result.replacements);
+                pos += 3;
+                continue;
+            }
+
+            if (!utf8_is_cont(static_cast<unsigned char>(text[pos + 2]))) {
+                utf8_replace_subpart(text, pos, 2, result.replacements);
+                pos += 3;
+                continue;
+            }
+
+            pos += 3;
+            continue;
+        }
+
+        if (c0 >= 0xf0 && c0 <= 0xf4) {
+            unsigned char lo1 = 0x80;
+            unsigned char hi1 = 0xbf;
+
+            if (c0 == 0xf0) {
+                lo1 = 0x90;
+            } else if (c0 == 0xf4) {
+                hi1 = 0x8f;
+            }
+
+            if (pos + 1 >= text.size()) {
+                if (!is_final) {
+                    result.valid_end = pos;
+                    result.incomplete = true;
+                    return result;
+                }
+                utf8_replace_subpart(text, pos, text.size() - pos, result.replacements);
+                pos += 3;
+                continue;
+            }
+
+            if (!utf8_in_range(static_cast<unsigned char>(text[pos + 1]), lo1, hi1)) {
+                utf8_replace_subpart(text, pos, 1, result.replacements);
+                pos += 3;
+                continue;
+            }
+
+            if (pos + 2 >= text.size()) {
+                if (!is_final) {
+                    result.valid_end = pos;
+                    result.incomplete = true;
+                    return result;
+                }
+                utf8_replace_subpart(text, pos, text.size() - pos, result.replacements);
+                pos += 3;
+                continue;
+            }
+
+            if (!utf8_is_cont(static_cast<unsigned char>(text[pos + 2]))) {
+                utf8_replace_subpart(text, pos, 2, result.replacements);
+                pos += 3;
+                continue;
+            }
+
+            if (pos + 3 >= text.size()) {
+                if (!is_final) {
+                    result.valid_end = pos;
+                    result.incomplete = true;
+                    return result;
+                }
+                utf8_replace_subpart(text, pos, text.size() - pos, result.replacements);
+                pos += 3;
+                continue;
+            }
+
+            if (!utf8_is_cont(static_cast<unsigned char>(text[pos + 3]))) {
+                utf8_replace_subpart(text, pos, 3, result.replacements);
+                pos += 3;
+                continue;
+            }
+
+            pos += 4;
+            continue;
+        }
+
+        utf8_replace_subpart(text, pos, 1, result.replacements);
+        pos += 3;
+    }
+
+    result.valid_end = text.size();
+    return result;
+}
+
 std::string string_join(const std::vector<std::string> & values, const std::string & separator) {
     std::ostringstream result;
     for (size_t i = 0; i < values.size(); ++i) {

@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <memory>
 #include <numeric>
 #include <random>
 #include <unordered_map>
@@ -2634,6 +2635,293 @@ struct llama_sampler * llama_sampler_init_grammar_lazy_patterns(
                const llama_token * trigger_tokens,
                             size_t num_trigger_tokens) {
     return llama_sampler_init_grammar_impl(vocab, grammar_str, grammar_root, /* lazy= */ true, nullptr, 0, trigger_tokens, num_trigger_tokens, trigger_patterns, num_trigger_patterns);
+}
+
+// UTF-8 constrain
+
+struct llama_sampler_utf8_state {
+    uint8_t needed = 0;
+    uint8_t lo     = 0x80;
+    uint8_t hi     = 0xbf;
+};
+
+struct llama_sampler_utf8_vocab {
+    std::vector<std::string> pieces;
+    std::vector<uint8_t>     eog;
+    std::vector<uint8_t>     special;
+    std::vector<uint8_t>     invalid_clean;
+    std::vector<llama_token> invalid_clean_ids;
+};
+
+struct llama_sampler_utf8_constrain {
+    const struct llama_vocab * vocab;
+    std::shared_ptr<const llama_sampler_utf8_vocab> data;
+    llama_sampler_utf8_state state;
+    size_t n_interventions;
+    size_t n_accept;
+};
+
+static bool llama_sampler_utf8_state_clean(const llama_sampler_utf8_state & state) {
+    return state.needed == 0;
+}
+
+static bool llama_sampler_utf8_advance(llama_sampler_utf8_state & state, uint8_t c) {
+    if (state.needed != 0) {
+        if (c < state.lo || c > state.hi) {
+            return false;
+        }
+        state.needed--;
+        state.lo = 0x80;
+        state.hi = 0xbf;
+        return true;
+    }
+
+    if (c <= 0x7f) {
+        return true;
+    }
+
+    if (c >= 0x80 && c <= 0xbf) {
+        return false;
+    }
+
+    if (c >= 0xc2 && c <= 0xdf) {
+        state.needed = 1;
+        state.lo = 0x80;
+        state.hi = 0xbf;
+        return true;
+    }
+
+    if (c >= 0xe0 && c <= 0xef) {
+        state.needed = 2;
+        state.lo = c == 0xe0 ? 0xa0 : 0x80;
+        state.hi = c == 0xed ? 0x9f : 0xbf;
+        return true;
+    }
+
+    if (c >= 0xf0 && c <= 0xf4) {
+        state.needed = 3;
+        state.lo = c == 0xf0 ? 0x90 : 0x80;
+        state.hi = c == 0xf4 ? 0x8f : 0xbf;
+        return true;
+    }
+
+    return false;
+}
+
+static bool llama_sampler_utf8_advance_piece(llama_sampler_utf8_state & state, const std::string & piece) {
+    for (unsigned char c : piece) {
+        if (!llama_sampler_utf8_advance(state, c)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static bool llama_sampler_utf8_is_special(enum llama_token_attr attr) {
+    return attr & (LLAMA_TOKEN_ATTR_UNKNOWN | LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_USER_DEFINED);
+}
+
+static std::shared_ptr<const llama_sampler_utf8_vocab> llama_sampler_utf8_vocab_init(const struct llama_vocab * vocab) {
+    const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+
+    auto data = std::make_shared<llama_sampler_utf8_vocab>();
+    data->pieces.resize(n_vocab);
+    data->eog.resize(n_vocab);
+    data->special.resize(n_vocab);
+    data->invalid_clean.resize(n_vocab);
+
+    for (llama_token id = 0; id < n_vocab; ++id) {
+        data->pieces[id]  = vocab->token_to_piece(id);
+        data->eog[id]     = llama_vocab_is_eog(vocab, id);
+        data->special[id] = llama_sampler_utf8_is_special(llama_vocab_get_attr(vocab, id));
+
+        if (data->eog[id] || data->special[id]) {
+            continue;
+        }
+
+        llama_sampler_utf8_state state;
+        if (!llama_sampler_utf8_advance_piece(state, data->pieces[id])) {
+            data->invalid_clean[id] = true;
+            data->invalid_clean_ids.push_back(id);
+        }
+    }
+
+    return data;
+}
+
+static const char * llama_sampler_utf8_constrain_name(const struct llama_sampler * /*smpl*/) {
+    return "utf8-constrain";
+}
+
+static bool llama_sampler_utf8_constrain_accepts(const llama_sampler_utf8_constrain * ctx, llama_token token, const llama_sampler_utf8_state & state) {
+    if (token < 0 || token >= (llama_token) ctx->data->pieces.size()) {
+        return false;
+    }
+
+    if (ctx->data->eog[token]) {
+        return true;
+    }
+
+    if (llama_sampler_utf8_state_clean(state) && ctx->data->special[token]) {
+        return true;
+    }
+
+    llama_sampler_utf8_state tmp = state;
+    return llama_sampler_utf8_advance_piece(tmp, ctx->data->pieces[token]);
+}
+
+static llama_token llama_sampler_utf8_constrain_best(const llama_token_data_array * cur_p) {
+    if (cur_p->size == 0) {
+        return LLAMA_TOKEN_NULL;
+    }
+
+    if (cur_p->sorted) {
+        return cur_p->data[0].id;
+    }
+
+    size_t best = 0;
+    for (size_t i = 1; i < cur_p->size; ++i) {
+        if (cur_p->data[i].logit > cur_p->data[best].logit) {
+            best = i;
+        }
+    }
+
+    return cur_p->data[best].id;
+}
+
+static void llama_sampler_utf8_constrain_accept(struct llama_sampler * smpl, llama_token token) {
+    auto * ctx = (llama_sampler_utf8_constrain *) smpl->ctx;
+    if (token < 0 || token >= (llama_token) ctx->data->pieces.size() || ctx->data->eog[token]) {
+        ctx->n_accept++;
+        return;
+    }
+
+    if (llama_sampler_utf8_state_clean(ctx->state) && ctx->data->special[token]) {
+        ctx->n_accept++;
+        return;
+    }
+
+    if (!llama_sampler_utf8_advance_piece(ctx->state, ctx->data->pieces[token])) {
+        ctx->state = {};
+    }
+
+    ctx->n_accept++;
+}
+
+static void llama_sampler_utf8_constrain_apply(struct llama_sampler * smpl, llama_token_data_array * cur_p) {
+    auto * ctx = (llama_sampler_utf8_constrain *) smpl->ctx;
+
+    if (cur_p->size == 0) {
+        return;
+    }
+
+    const llama_token best_id = llama_sampler_utf8_constrain_best(cur_p);
+    bool masked_best = false;
+
+    if (llama_sampler_utf8_state_clean(ctx->state)) {
+        if (cur_p->size == ctx->data->pieces.size() && !cur_p->sorted) {
+            for (const llama_token id : ctx->data->invalid_clean_ids) {
+                if (cur_p->data[id].logit == -INFINITY) {
+                    continue;
+                }
+                if (id == best_id) {
+                    masked_best = true;
+                }
+                cur_p->data[id].logit = -INFINITY;
+            }
+        } else {
+            for (size_t i = 0; i < cur_p->size; ++i) {
+                const llama_token id = cur_p->data[i].id;
+                if (id < 0 || id >= (llama_token) ctx->data->invalid_clean.size() || !ctx->data->invalid_clean[id]) {
+                    continue;
+                }
+                if (cur_p->data[i].logit != -INFINITY && id == best_id) {
+                    masked_best = true;
+                }
+                cur_p->data[i].logit = -INFINITY;
+            }
+        }
+    } else {
+        for (size_t i = 0; i < cur_p->size; ++i) {
+            const llama_token id = cur_p->data[i].id;
+            if (llama_sampler_utf8_constrain_accepts(ctx, id, ctx->state)) {
+                continue;
+            }
+            if (cur_p->data[i].logit != -INFINITY && id == best_id) {
+                masked_best = true;
+            }
+            cur_p->data[i].logit = -INFINITY;
+        }
+    }
+
+    if (masked_best) {
+        ctx->n_interventions++;
+        LLAMA_LOG_WARN("%s: intervention at token position %zu, masked token id %d\n", __func__, ctx->n_accept, best_id);
+    }
+
+    cur_p->selected = -1;
+    cur_p->sorted = false;
+}
+
+static void llama_sampler_utf8_constrain_reset(struct llama_sampler * smpl) {
+    auto * ctx = (llama_sampler_utf8_constrain *) smpl->ctx;
+    ctx->state = {};
+    ctx->n_interventions = 0;
+    ctx->n_accept = 0;
+}
+
+static struct llama_sampler * llama_sampler_utf8_constrain_clone(const struct llama_sampler * smpl) {
+    const auto * ctx = (const llama_sampler_utf8_constrain *) smpl->ctx;
+    return llama_sampler_init(
+        /* .iface = */ smpl->iface,
+        /* .ctx   = */ new llama_sampler_utf8_constrain {
+            /* .vocab           = */ ctx->vocab,
+            /* .data            = */ ctx->data,
+            /* .state           = */ ctx->state,
+            /* .n_interventions = */ ctx->n_interventions,
+            /* .n_accept        = */ ctx->n_accept,
+        }
+    );
+}
+
+static void llama_sampler_utf8_constrain_free(struct llama_sampler * smpl) {
+    delete (llama_sampler_utf8_constrain *) smpl->ctx;
+}
+
+static struct llama_sampler_i llama_sampler_utf8_constrain_i = {
+    /* .name              = */ llama_sampler_utf8_constrain_name,
+    /* .accept            = */ llama_sampler_utf8_constrain_accept,
+    /* .apply             = */ llama_sampler_utf8_constrain_apply,
+    /* .reset             = */ llama_sampler_utf8_constrain_reset,
+    /* .clone             = */ llama_sampler_utf8_constrain_clone,
+    /* .free              = */ llama_sampler_utf8_constrain_free,
+    /* .backend_init      = */ nullptr,
+    /* .backend_accept    = */ nullptr,
+    /* .backend_apply     = */ nullptr,
+    /* .backend_set_input = */ nullptr,
+};
+
+struct llama_sampler * llama_sampler_init_utf8_constrain(const struct llama_vocab * vocab) {
+    return llama_sampler_init(
+        /* .iface = */ &llama_sampler_utf8_constrain_i,
+        /* .ctx   = */ new llama_sampler_utf8_constrain {
+            /* .vocab           = */ vocab,
+            /* .data            = */ llama_sampler_utf8_vocab_init(vocab),
+            /* .state           = */ {},
+            /* .n_interventions = */ 0,
+            /* .n_accept        = */ 0,
+        }
+    );
+}
+
+size_t llama_sampler_utf8_constrain_n_interventions(const struct llama_sampler * smpl) {
+    if (!smpl || smpl->iface != &llama_sampler_utf8_constrain_i) {
+        return 0;
+    }
+
+    const auto * ctx = (const llama_sampler_utf8_constrain *) smpl->ctx;
+    return ctx->n_interventions;
 }
 
 // penalties

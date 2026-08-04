@@ -1810,7 +1810,7 @@ private:
         // initialize samplers
         if (task.need_sampling()) {
             try {
-                slot.smpl.reset(common_sampler_init(model_tgt, task.params.sampling));
+                slot.smpl.reset(common_sampler_init(model_tgt, task.params.sampling, params_base.utf8_constrain));
             } catch (std::exception & e) {
                 std::string err_msg = std::string("Failed to initialize samplers: ") + e.what();
                 send_error(task, err_msg, ERROR_TYPE_INVALID_REQUEST);
@@ -2146,6 +2146,10 @@ private:
 
     void send_final_response(server_slot & slot) {
         finalize_utf8_tail(slot);
+
+        if (params_base.utf8_constrain && slot.smpl) {
+            SLT_INF(slot, "UTF-8 constrain interventions = %zu\n", common_sampler_utf8_constrain_n_interventions(slot.smpl.get()));
+        }
 
         auto res = std::make_unique<server_task_result_cmpl_final>();
 

@@ -37,7 +37,7 @@ struct common_sampler;
 // llama_sampler API overloads
 
 // note: can mutate params in some cases
-struct common_sampler * common_sampler_init(const struct llama_model * model, struct common_params_sampling & params);
+struct common_sampler * common_sampler_init(const struct llama_model * model, struct common_params_sampling & params, bool utf8_constrain = false);
 
 void common_sampler_free(struct common_sampler * gsmpl);
 
@@ -89,6 +89,8 @@ uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl);
 
 // force the reasoning budget sampler (if any) to begin forcing its end sequence now.
 bool common_sampler_reasoning_budget_force(struct common_sampler * gsmpl);
+
+size_t common_sampler_utf8_constrain_n_interventions(const struct common_sampler * gsmpl);
 
 // helpers
 

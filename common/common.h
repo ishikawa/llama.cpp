@@ -626,6 +626,7 @@ struct common_params {
     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
+    bool    utf8_constrain      = false; // constrain sampled tokens to valid UTF-8
 
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT
@@ -786,6 +787,14 @@ std::string string_repeat(const std::string & str, size_t n);
 void string_replace_all(std::string & s, const std::string & search, const std::string & replace);
 
 std::string regex_escape(const std::string & s);
+
+struct common_utf8_sanitize_result {
+    size_t valid_end    = 0;
+    size_t replacements = 0;
+    bool   incomplete   = false;
+};
+
+common_utf8_sanitize_result common_utf8_sanitize(std::string & text, size_t offset, bool is_final);
 
 template<class T>
 static std::vector<T> string_split(const std::string & str, char delim) {

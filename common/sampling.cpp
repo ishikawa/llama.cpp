@@ -184,7 +184,7 @@ std::string common_params_sampling::print() const {
     return std::string(result);
 }
 
-struct common_sampler * common_sampler_init(const struct llama_model * model, struct common_params_sampling & params) {
+struct common_sampler * common_sampler_init(const struct llama_model * model, struct common_params_sampling & params, bool utf8_constrain) {
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
     llama_sampler_chain_params lparams = llama_sampler_chain_default_params();
@@ -193,6 +193,7 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
 
     llama_sampler * grmr = nullptr;
     llama_sampler * rbudget = nullptr;
+    llama_sampler * utf8 = nullptr;
     llama_sampler * chain = llama_sampler_chain_init(lparams);
 
     std::vector<llama_sampler *> samplers;
@@ -328,6 +329,11 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
         }
     }
 
+    if (utf8_constrain) {
+        utf8 = llama_sampler_init_utf8_constrain(vocab);
+        samplers.push_back(utf8);
+    }
+
     if (params.mirostat == 0) {
 
         bool use_adaptive_p = false; // see below
@@ -411,6 +417,12 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
 
     if (rbudget && params.backend_sampling) {
         LOG_WRN("%s: backend sampling is not compatible with reasoning budget, disabling\n", __func__);
+
+        params.backend_sampling = false;
+    }
+
+    if (utf8 && params.backend_sampling) {
+        LOG_WRN("%s: backend sampling is not compatible with UTF-8 constrain, disabling\n", __func__);
 
         params.backend_sampling = false;
     }
@@ -695,6 +707,19 @@ bool common_sampler_reasoning_budget_force(struct common_sampler * gsmpl) {
     }
 
     return common_reasoning_budget_force(gsmpl->rbudget);
+}
+
+size_t common_sampler_utf8_constrain_n_interventions(const struct common_sampler * gsmpl) {
+    if (!gsmpl || !gsmpl->chain) {
+        return 0;
+    }
+
+    size_t result = 0;
+    for (int i = 0; i < llama_sampler_chain_n(gsmpl->chain); ++i) {
+        result += llama_sampler_utf8_constrain_n_interventions(llama_sampler_chain_get(gsmpl->chain, i));
+    }
+
+    return result;
 }
 
 // helpers

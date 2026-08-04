@@ -1810,7 +1810,7 @@ private:
         // initialize samplers
         if (task.need_sampling()) {
             try {
-                slot.smpl.reset(common_sampler_init(model_tgt, task.params.sampling));
+                slot.smpl.reset(common_sampler_init(model_tgt, task.params.sampling, params_base.utf8_constrain));
             } catch (std::exception & e) {
                 std::string err_msg = std::string("Failed to initialize samplers: ") + e.what();
                 send_error(task, err_msg, ERROR_TYPE_INVALID_REQUEST);
@@ -1866,31 +1866,33 @@ private:
         }
         slot.has_next_token = true;
 
-        // check if there is incomplete UTF-8 character at the end
-        bool incomplete = validate_utf8(slot.generated_text) < slot.generated_text.size();
+        const common_utf8_sanitize_result utf8_result = common_utf8_sanitize(slot.generated_text, slot.n_sent_text, false);
+        size_t sendable_end = utf8_result.valid_end;
 
         // search stop word and delete it
-        if (!incomplete) {
+        if (sendable_end > slot.n_sent_text) {
             size_t pos = std::min(slot.n_sent_text, slot.generated_text.size());
 
-            const std::string str_test = slot.generated_text.substr(pos);
+            const std::string str_test = slot.generated_text.substr(pos, sendable_end - pos);
+            const size_t last_text_size = str_test.size();
             bool send_text = true;
 
-            size_t stop_pos = slot.find_stopping_strings(str_test, token_str.size(), true);
+            size_t stop_pos = slot.find_stopping_strings(str_test, last_text_size, true);
             if (stop_pos != std::string::npos) {
                 slot.generated_text.erase(
                     slot.generated_text.begin() + pos + stop_pos,
                     slot.generated_text.end());
+                sendable_end = slot.generated_text.size();
                 pos = std::min(slot.n_sent_text, slot.generated_text.size());
             } else if (slot.has_next_token && !llama_vocab_is_eog(vocab, result.tok) ) {
-                stop_pos = slot.find_stopping_strings(str_test, token_str.size(), false);
+                stop_pos = slot.find_stopping_strings(str_test, last_text_size, false);
                 send_text = stop_pos == std::string::npos;
             }
 
             // check if there is any token to predict
             if (send_text) {
                 // no send the stop word in the response
-                result.text_to_send = slot.generated_text.substr(pos, std::string::npos);
+                result.text_to_send = slot.generated_text.substr(pos, sendable_end - pos);
                 slot.n_sent_text += result.text_to_send.size();
                 // add the token to slot queue and cache
             } else {
@@ -1903,7 +1905,7 @@ private:
             }
         }
 
-        if (incomplete) {
+        if (utf8_result.incomplete) {
             slot.has_next_token = true;
         }
 
@@ -2080,7 +2082,7 @@ private:
         return true;
     }
 
-    void send_partial_response(server_slot & slot, const completion_token_output & tkn, bool is_progress, bool is_begin = false) {
+    void send_partial_response(server_slot & slot, const completion_token_output & tkn, bool is_progress, bool is_begin = false, bool include_token = true) {
         auto res = std::make_unique<server_task_result_cmpl_partial>();
 
         res->id    = slot.task->id;
@@ -2097,7 +2099,9 @@ private:
             res->is_begin = true;
         } else {
             res->content = tkn.text_to_send;
-            res->tokens  = { tkn.tok };
+            if (include_token) {
+                res->tokens = { tkn.tok };
+            }
         }
 
         res->n_decoded             = slot.n_decoded;
@@ -2124,7 +2128,29 @@ private:
         queue_results.send(std::move(res));
     }
 
+    void finalize_utf8_tail(server_slot & slot) {
+        common_utf8_sanitize(slot.generated_text, slot.n_sent_text, true);
+
+        if (!slot.task->params.stream || slot.n_sent_text >= slot.generated_text.size()) {
+            return;
+        }
+
+        completion_token_output tkn;
+        tkn.tok          = LLAMA_TOKEN_NULL;
+        tkn.prob         = 0.0f;
+        tkn.text_to_send = slot.generated_text.substr(slot.n_sent_text);
+        slot.n_sent_text = slot.generated_text.size();
+
+        send_partial_response(slot, tkn, false, false, false);
+    }
+
     void send_final_response(server_slot & slot) {
+        finalize_utf8_tail(slot);
+
+        if (params_base.utf8_constrain && slot.smpl) {
+            SLT_INF(slot, "UTF-8 constrain interventions = %zu\n", common_sampler_utf8_constrain_n_interventions(slot.smpl.get()));
+        }
+
         auto res = std::make_unique<server_task_result_cmpl_final>();
 
         res->id      = slot.task->id;

@@ -749,6 +749,8 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
             return op->ne[1];
         case GGML_OP_MUL_MAT_ID:
             return op->ne[2];
+        case GGML_OP_FLASH_ATTN_EXT:
+            return op->ne[2]; // n_tokens
         default:
             return ggml_nrows(op);
     }
@@ -758,7 +760,8 @@ static bool ggml_backend_metal_device_offload_op(ggml_backend_dev_t dev, const g
     ggml_metal_device_t ctx_dev = (ggml_metal_device_t)dev->context;
 
     return (op->op == GGML_OP_MUL_MAT ||
-            op->op == GGML_OP_MUL_MAT_ID) &&
+            op->op == GGML_OP_MUL_MAT_ID ||
+            op->op == GGML_OP_FLASH_ATTN_EXT) &&
             get_op_batch_size(op) >= ggml_metal_device_get_props(ctx_dev)->op_offload_min_batch_size;
 }
 

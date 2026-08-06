@@ -2873,6 +2873,11 @@ static ggml_backend_buffer_type_t ggml_backend_cann_device_get_host_buffer_type(
 static bool ggml_backend_cann_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_backend_cann_device_context * dev_ctx = (ggml_backend_cann_device_context *)dev->context;
 
+    // without unified memory the per-batch copy of the KV cache views outweighs the offload gain
+    if (op->op == GGML_OP_FLASH_ATTN_EXT) {
+        return false;
+    }
+
     return op->ne[1] >= dev_ctx->op_offload_min_batch_size && op->op != GGML_OP_GET_ROWS;
 }
 

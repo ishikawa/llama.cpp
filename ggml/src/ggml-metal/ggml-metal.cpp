@@ -750,7 +750,7 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
         case GGML_OP_MUL_MAT_ID:
             return op->ne[2];
         case GGML_OP_FLASH_ATTN_EXT:
-            return op->ne[2]; // n_tokens
+            return op->ne[2]; // n_tokens per stream
         default:
             return ggml_nrows(op);
     }

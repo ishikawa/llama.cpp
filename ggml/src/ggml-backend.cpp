@@ -938,6 +938,17 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
         }
     }
 
+    // compute-heavy ops without weights (e.g. FLASH_ATTN_EXT) can still be worth offloading
+    // for large batches; the backend's offload_op decides via its batch threshold
+    if (sched->op_offload && tensor->op == GGML_OP_FLASH_ATTN_EXT) {
+        for (int b = 0; b < sched->n_backends - 1; b++) {
+            if (ggml_backend_supports_op(sched->backends[b], tensor) && ggml_backend_offload_op(sched->backends[b], tensor)) {
+                SET_CAUSE(tensor, "1.off");
+                return b;
+            }
+        }
+    }
+
     return -1;
 }
 

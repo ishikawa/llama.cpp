@@ -5200,6 +5200,11 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
 static bool ggml_backend_cuda_device_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
 
+    // without unified memory the per-batch copy of the KV cache views outweighs the offload gain
+    if (op->op == GGML_OP_FLASH_ATTN_EXT) {
+        return false;
+    }
+
     return get_op_batch_size(op) >= dev_ctx->op_offload_min_batch_size;
 }
 

@@ -269,6 +269,13 @@ struct ggml_metal_device_props {
     enum ggml_metal_device_id device_id;
 
     int op_offload_min_batch_size;
+
+    // also offload glue ops (e.g. norm-scale MUL / bias ADD) at large batch, so the
+    // scheduler can merge adjacent offloaded ops into one split
+    bool op_offload_glue;
+
+    // exclude MUL_MAT_ID (MoE experts) from op offload
+    bool op_offload_no_mmid;
 };
 
 typedef struct ggml_metal_event * ggml_metal_event_t;

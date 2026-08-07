@@ -818,6 +818,10 @@ struct ggml_backend_sched {
 
     bool op_offload;
 
+    // max total size of offloaded-weight copies accumulated in a single split before
+    // forcing a new split (0 = always split, so the copy memory is reused per op)
+    size_t weight_copy_budget;
+
     int debug;
 
     // used for debugging graph reallocations [GGML_SCHED_DEBUG_REALLOC]
@@ -1278,6 +1282,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         split->i_start = 0;
         split->n_inputs = 0;
         int cur_backend_id = split->backend_id;
+        size_t split_weight_copy_size = 0;
         for (; i < graph->n_nodes; i++) {
             struct ggml_tensor * node = graph->nodes[i];
 
@@ -1289,22 +1294,37 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
             GGML_ASSERT(node_backend_id != -1); // all nodes should be assigned by now, this can happen if there is no CPU fallback
 
+            // total size of the weights on a different and incompatible backend that will need to
+            // be copied into the split's backend for this node (upper bound: MUL_MAT_ID may copy
+            // only the used experts, which is less)
+            size_t node_weight_copy_size = 0;
+            for (int j = 0; j < GGML_MAX_SRC; j++) {
+                struct ggml_tensor * src = node->src[j];
+                if (src == NULL) {
+                    continue;
+                }
+                if (src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+                    int src_backend_id = tensor_backend_id(src);
+                    if (src_backend_id != node_backend_id && !ggml_backend_sched_buffer_supported(sched, src, node_backend_id)) {
+                        node_weight_copy_size += ggml_nbytes(src);
+                    }
+                }
+            }
+
             // check if we should start a new split based on the sources of the current node
             bool need_new_split = false;
             if (node_backend_id == cur_backend_id && split->n_inputs > 0) {
-                for (int j = 0; j < GGML_MAX_SRC; j++) {
+                // check if a weight is on a different and incompatible backend
+                // by starting a new split, the memory of the previously offloaded weights can be reused
+                // within the weight copy budget, keep extending the split instead (fewer splits, more memory)
+                if (node_weight_copy_size > 0 &&
+                    split_weight_copy_size + node_weight_copy_size > sched->weight_copy_budget) {
+                    need_new_split = true;
+                }
+                for (int j = 0; j < GGML_MAX_SRC && !need_new_split; j++) {
                     struct ggml_tensor * src = node->src[j];
                     if (src == NULL) {
                         continue;
-                    }
-                    // check if a weight is on a different and incompatible backend
-                    // by starting a new split, the memory of the previously offloaded weights can be reused
-                    if (src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
-                        int src_backend_id = tensor_backend_id(src);
-                        if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
-                            need_new_split = true;
-                            break;
-                        }
                     }
                     // check if the split has too many inputs
                     // FIXME: count the number of inputs instead of only checking when full
@@ -1334,7 +1354,10 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 split->i_start = i;
                 split->n_inputs = 0;
                 cur_backend_id = node_backend_id;
+                split_weight_copy_size = 0;
             }
+
+            split_weight_copy_size += node_weight_copy_size;
 
             // find inputs that are not on the same backend
             for (int j = 0; j < GGML_MAX_SRC; j++) {
@@ -1807,6 +1830,9 @@ ggml_backend_sched_t ggml_backend_sched_new(
 
     sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
     sched->op_offload = op_offload;
+
+    const char * GGML_SCHED_WEIGHT_COPY_BUDGET_MB = getenv("GGML_SCHED_WEIGHT_COPY_BUDGET_MB");
+    sched->weight_copy_budget = GGML_SCHED_WEIGHT_COPY_BUDGET_MB ? (size_t) atoll(GGML_SCHED_WEIGHT_COPY_BUDGET_MB) * 1024*1024 : 0;
 
     ggml_backend_sched_reset(sched);
 

@@ -759,10 +759,28 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
 static bool ggml_backend_metal_device_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_metal_device_t ctx_dev = (ggml_metal_device_t)dev->context;
 
-    return (op->op == GGML_OP_MUL_MAT ||
-            op->op == GGML_OP_MUL_MAT_ID ||
-            op->op == GGML_OP_FLASH_ATTN_EXT) &&
-            get_op_batch_size(op) >= ggml_metal_device_get_props(ctx_dev)->op_offload_min_batch_size;
+    const struct ggml_metal_device_props * props = ggml_metal_device_get_props(ctx_dev);
+
+    bool allow =
+        op->op == GGML_OP_MUL_MAT ||
+        op->op == GGML_OP_MUL_MAT_ID ||
+        op->op == GGML_OP_FLASH_ATTN_EXT;
+
+    if (props->op_offload_glue) {
+        // glue ops with small weights (norm scales, biases) otherwise pin to the CPU and
+        // break up the runs of offloaded ops that the scheduler could keep in one split
+        allow = allow ||
+            op->op == GGML_OP_MUL ||
+            op->op == GGML_OP_ADD;
+    }
+
+    if (props->op_offload_no_mmid) {
+        // keep MoE expert matmuls on the CPU: their per-batch weight copies (~all used
+        // experts) dominate the diff-band prefill cost regardless of batch size
+        allow = allow && op->op != GGML_OP_MUL_MAT_ID;
+    }
+
+    return allow && get_op_batch_size(op) >= props->op_offload_min_batch_size;
 }
 
 static ggml_backend_event_t ggml_backend_metal_device_event_new(ggml_backend_dev_t dev) {

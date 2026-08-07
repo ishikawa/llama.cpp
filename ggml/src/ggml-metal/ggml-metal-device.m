@@ -881,6 +881,8 @@ ggml_metal_device_t ggml_metal_device_init(int device) {
             dev->props.device_id = ggml_metal_device_id_parse([[dev->mtl_device name] UTF8String]);
 
             dev->props.op_offload_min_batch_size  = getenv("GGML_OP_OFFLOAD_MIN_BATCH") ? atoi(getenv("GGML_OP_OFFLOAD_MIN_BATCH")) : 32;
+            dev->props.op_offload_glue            = getenv("GGML_METAL_OFFLOAD_GLUE") != NULL;
+            dev->props.op_offload_no_mmid         = getenv("GGML_METAL_OFFLOAD_NO_MMID") != NULL;
 
             dev->props.max_buffer_size            = dev->mtl_device.maxBufferLength;
             dev->props.max_theadgroup_memory_size = dev->mtl_device.maxThreadgroupMemoryLength;

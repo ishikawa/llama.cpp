@@ -94,7 +94,10 @@ set(GGML_BACKEND_DIR "" CACHE PATH "ggml: directory to load dynamic backends fro
 
 if (APPLE)
     set(GGML_METAL_DEFAULT ON)
-    set(GGML_BLAS_DEFAULT ON)
+    # my-llama: BLAS (Accelerate) は既定で無効。CPU 常駐運用では host 重みの dense matmul を
+    # BLAS が Metal への op-offload より先に取り、量子化重みの毎バッチ f32 展開で遅くなる
+    # (ishikawa/local-llm#98)。ACCEL バックエンドは起動フラグで除外できないためビルドで切る
+    set(GGML_BLAS_DEFAULT OFF)
     set(GGML_BLAS_VENDOR_DEFAULT "Apple")
 else()
     set(GGML_METAL_DEFAULT OFF)

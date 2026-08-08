@@ -6,6 +6,9 @@
 
 void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
 
+    // DFlash/DSpark t_h_nextn has n_embd columns even if target metadata has n_embd_out.
+    hparams.n_embd_out_impl = 0;
+
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
 
     if (!ml.get_arr(LLM_KV_TARGET_LAYERS, target_layer_ids, false)) {

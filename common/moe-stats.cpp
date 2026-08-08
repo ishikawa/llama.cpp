@@ -49,6 +49,8 @@ struct common_moe_stats_expert {
     double   weight_sum = 0.0;
 };
 
+static std::once_flag common_moe_stats_install_once;
+
 static std::string common_moe_stats_json_escape(const std::string & s) {
     std::string out;
     out.reserve(s.size() + 2);
@@ -80,13 +82,13 @@ static std::string common_moe_stats_json_escape(const std::string & s) {
 
 class common_moe_stats_collector {
 public:
-    void configure(const std::string & output_path, const std::string & model_path) {
+    void configure(const char * env_var, const std::string & output_path, const std::string & model_path) {
         std::lock_guard<std::mutex> lock(mutex);
 
         if (this->output_path.empty()) {
             this->output_path = output_path;
         } else if (this->output_path != output_path) {
-            LOG_WRN("%s: LLAMA_MOE_STATS changed from '%s' to '%s', keeping first path\n", __func__, this->output_path.c_str(), output_path.c_str());
+            LOG_WRN("%s: %s changed from '%s' to '%s', keeping first path\n", __func__, env_var, this->output_path.c_str(), output_path.c_str());
         }
 
         if (this->model_path.empty()) {
@@ -180,6 +182,36 @@ private:
     bool warned_multiple_models = false;
 };
 
+static std::mutex & common_moe_stats_registry_mutex() {
+    static std::mutex * mutex = new std::mutex();
+    return *mutex;
+}
+
+static std::vector<common_moe_stats_collector *> & common_moe_stats_registry() {
+    static std::vector<common_moe_stats_collector *> * registry = new std::vector<common_moe_stats_collector *>();
+    return *registry;
+}
+
+static void common_moe_stats_register_collector(common_moe_stats_collector & collector) {
+    std::lock_guard<std::mutex> lock(common_moe_stats_registry_mutex());
+    auto & registry = common_moe_stats_registry();
+    if (std::find(registry.begin(), registry.end(), &collector) == registry.end()) {
+        registry.push_back(&collector);
+    }
+}
+
+static void common_moe_stats_dump_all() {
+    std::vector<common_moe_stats_collector *> registry;
+    {
+        std::lock_guard<std::mutex> lock(common_moe_stats_registry_mutex());
+        registry = common_moe_stats_registry();
+    }
+
+    for (auto * collector : registry) {
+        collector->dump();
+    }
+}
+
 struct common_moe_stats_cb_data {
     explicit common_moe_stats_cb_data(common_moe_stats_collector & collector) : collector(collector) {}
 
@@ -191,7 +223,20 @@ struct common_moe_stats_cb_data {
 };
 
 static common_moe_stats_collector & common_moe_stats_get_collector() {
-    static common_moe_stats_collector * collector = new common_moe_stats_collector();
+    static common_moe_stats_collector * collector = []() {
+        auto * result = new common_moe_stats_collector();
+        common_moe_stats_register_collector(*result);
+        return result;
+    }();
+    return *collector;
+}
+
+static common_moe_stats_collector & common_moe_stats_get_draft_collector() {
+    static common_moe_stats_collector * collector = []() {
+        auto * result = new common_moe_stats_collector();
+        common_moe_stats_register_collector(*result);
+        return result;
+    }();
     return *collector;
 }
 
@@ -412,7 +457,7 @@ static bool common_moe_stats_cb_eval(struct ggml_tensor * t, bool ask, void * us
 }
 
 static void common_moe_stats_dump_atexit() {
-    common_moe_stats_get_collector().dump();
+    common_moe_stats_dump_all();
 }
 
 #if defined(SIGUSR1) && !defined(_WIN32)
@@ -457,12 +502,12 @@ static void common_moe_stats_install_sigusr1(int interval_s) {
             }
             if (pr == 0) {
                 // periodic dump (LLAMA_MOE_STATS_INTERVAL elapsed with no signal)
-                common_moe_stats_get_collector().dump();
+                common_moe_stats_dump_all();
                 continue;
             }
             const ssize_t n = read(common_moe_stats_signal_pipe[0], buf, sizeof(buf));
             if (n > 0) {
-                common_moe_stats_get_collector().dump();
+                common_moe_stats_dump_all();
             } else if (n < 0 && (errno == EINTR || errno == EAGAIN)) {
                 continue;
             } else {
@@ -504,29 +549,47 @@ static void common_moe_stats_install_dump_handlers() {
 #endif
 }
 
-void common_moe_stats_maybe_init(common_params & params) {
-    const char * output_path = std::getenv("LLAMA_MOE_STATS");
+static void common_moe_stats_maybe_init_impl(
+        common_params & params,
+        const char * env_var,
+        common_moe_stats_collector & (* get_collector)(),
+        bool clear_disabled) {
+    const char * output_path = std::getenv(env_var);
     if (output_path == nullptr || output_path[0] == '\0') {
+        if (clear_disabled && params.cb_eval == common_moe_stats_cb_eval) {
+            params.cb_eval           = nullptr;
+            params.cb_eval_user_data = nullptr;
+        }
         return;
     }
 
-    auto & collector = common_moe_stats_get_collector();
-    collector.configure(output_path, params.model.path);
+    auto & collector = get_collector();
 
     if (params.cb_eval == common_moe_stats_cb_eval && params.cb_eval_user_data != nullptr) {
+        auto * cb_data = (common_moe_stats_cb_data *) params.cb_eval_user_data;
+        if (&cb_data->collector == &collector) {
+            collector.configure(env_var, output_path, params.model.path);
+            return;
+        }
+    } else if (params.cb_eval != nullptr || params.cb_eval_user_data != nullptr) {
+        LOG_WRN("%s: cb_eval is already set, MoE router stats disabled for %s\n", __func__, env_var);
         return;
     }
 
-    if (params.cb_eval != nullptr || params.cb_eval_user_data != nullptr) {
-        LOG_WRN("%s: cb_eval is already set, MoE router stats disabled\n", __func__);
-        return;
-    }
+    collector.configure(env_var, output_path, params.model.path);
 
     params.cb_eval           = common_moe_stats_cb_eval;
     params.cb_eval_user_data = new common_moe_stats_cb_data(collector);
 
     // install the dump handlers only once collection is actually wired up, so a
     // disabled run (cb_eval conflict) does not keep dumping empty stats
-    static std::once_flag once;
-    std::call_once(once, common_moe_stats_install_dump_handlers);
+    std::call_once(common_moe_stats_install_once, common_moe_stats_install_dump_handlers);
+}
+
+void common_moe_stats_maybe_init(common_params & params) {
+    common_moe_stats_maybe_init_impl(params, "LLAMA_MOE_STATS", common_moe_stats_get_collector, false);
+}
+
+void common_moe_stats_maybe_init_draft(common_params & params) {
+    common_moe_stats_maybe_init_impl(params, "LLAMA_MOE_STATS_DRAFT", common_moe_stats_get_draft_collector, true);
 }

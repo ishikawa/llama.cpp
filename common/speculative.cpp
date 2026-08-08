@@ -4,6 +4,7 @@
 #include "ggml.h"
 #include "llama.h"
 #include "log.h"
+#include "moe-stats.h"
 #include "ngram-cache.h"
 #include "ngram-map.h"
 #include "ngram-mod.h"
@@ -2315,6 +2316,8 @@ common_speculative_init_result::common_speculative_init_result(
                                     params.speculative.types.end(),
                                     COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
     GGML_ASSERT(has_draft || spec_mtp);
+
+    common_moe_stats_maybe_init_draft(params);
 
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);

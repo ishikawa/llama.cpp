@@ -5,7 +5,8 @@ struct common_params;
 // MoE router statistics collection for expert pruning.
 // Target stats are enabled with LLAMA_MOE_STATS=<path>. Draft stats are enabled with
 // LLAMA_MOE_STATS_DRAFT=<path>. The two collectors are independent and draft layer
-// numbers are local to the draft model.
+// numbers are local to the draft model. The two paths must differ; if they are equal
+// (string compare) the draft collector refuses to start.
 // Hooks the eval callback to accumulate per-(layer, expert) selection counts and gate weight
 // sums, dumped as JSON atexit, on SIGUSR1, and every LLAMA_MOE_STATS_INTERVAL=<seconds>
 // when set (crash insurance for long collection runs; SIGUSR1 and interval dumps are

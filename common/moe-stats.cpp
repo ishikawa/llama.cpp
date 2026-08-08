@@ -591,5 +591,18 @@ void common_moe_stats_maybe_init(common_params & params) {
 }
 
 void common_moe_stats_maybe_init_draft(common_params & params) {
+    // the two collectors dump to <path>.tmp + rename independently, so sharing one
+    // path silently drops whichever dump lands first - refuse instead
+    const char * path     = std::getenv("LLAMA_MOE_STATS_DRAFT");
+    const char * path_tgt = std::getenv("LLAMA_MOE_STATS");
+    if (path != nullptr && path[0] != '\0' && path_tgt != nullptr && std::strcmp(path, path_tgt) == 0) {
+        LOG_ERR("%s: LLAMA_MOE_STATS_DRAFT and LLAMA_MOE_STATS point to the same path '%s', draft stats disabled\n",
+                __func__, path);
+        if (params.cb_eval == common_moe_stats_cb_eval) {
+            params.cb_eval           = nullptr;
+            params.cb_eval_user_data = nullptr;
+        }
+        return;
+    }
     common_moe_stats_maybe_init_impl(params, "LLAMA_MOE_STATS_DRAFT", common_moe_stats_get_draft_collector, true);
 }

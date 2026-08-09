@@ -9657,6 +9657,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                                             GGML_TYPE_F16, GGML_TYPE_F16));
         }
     }
+    // Deep KV reference cases. These can exceed the normal ERR threshold on Metal FA vec.
+    for (int64_t kv : { 32768, 65536 }) {
+        for (int64_t nb : { 1, 2, 4 }) {
+            test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32,
+                                                            GGML_TYPE_F16, GGML_TYPE_F16));
+        }
+    }
 
     // large-KV F16 cases (Qwen3.6-27B geometry and a llama-class control): the upstream matrix
     // stops at kv=1024, blind to long-context FA bugs (e.g. the oneDNN SDPA ordering race on BMG).
@@ -10033,7 +10040,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
-    for (int64_t kv : { 640, 2048, 4096, 16384 }) {
+    for (int64_t kv : { 640, 2048, 4096, 16384, 32768, 65536 }) {
         for (int64_t nb : { 1, 2, 3, 4, 5, 6, 7, 8 }) {
             test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32,
                                                             GGML_TYPE_F16, GGML_TYPE_F16));

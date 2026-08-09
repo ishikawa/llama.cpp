@@ -1551,10 +1551,8 @@ int llama_context::encode(const llama_batch & batch_inp) {
     // micro-batching is not possible for non-causal encoding, so we process the batch in a single shot
     GGML_ASSERT(cparams.n_ubatch >= n_tokens && "encoder requires n_ubatch >= n_tokens");
 
-    // embd_seq may still be receiving an async copy from a previous encode()/decode()
-    // call (see the matching comment in decode()); synchronize before freeing it, and
-    // before the timing/accounting below, since synchronize() finalizes the perf stats
-    // for the *previous* batch
+    // TODO: this clear of the buffer can easily be forgotten - need something better
+    // sync first so any in-flight async copies into embd_seq complete before it is freed
     if (!embd_seq.empty()) {
         synchronize();
     }
@@ -1903,12 +1901,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     GGML_ASSERT((cparams.causal_attn || cparams.n_ubatch >= n_tokens_all) && "non-causal attention requires n_ubatch >= n_tokens");
 
-    // embeddings extracted via LLAMA_POOLING_TYPE_{MEAN,CLS,LAST,RANK} are copied into
-    // embd_seq asynchronously (see ggml_backend_tensor_get_async); a caller that issues
-    // back-to-back decode() calls without reading the output in between (e.g. mtmd image
-    // chunking) can otherwise free this buffer while the backend is still writing to it.
-    // do this before the timing/accounting below, since synchronize() finalizes the perf
-    // stats for the *previous* batch
+    // TODO: this clear of the buffer can easily be forgotten - need something better
+    // sync first so any in-flight async copies into embd_seq complete before it is freed
     if (!embd_seq.empty()) {
         synchronize();
     }

@@ -1584,7 +1584,9 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_v
     char base[256];
     char name[256];
 
-    snprintf(base, 256, "kernel_flash_attn_ext_vec_mla_f16_dk512_dv512");
+    const bool use_mla_v3a = getenv("GGML_METAL_FA_MLA_V3A") != nullptr;
+
+    snprintf(base, 256, use_mla_v3a ? "kernel_flash_attn_ext_vec_mla_f16_dk512_dv512_v3a" : "kernel_flash_attn_ext_vec_mla_f16_dk512_dv512");
     snprintf(name, 256, "%s_nwg=%d", base, nwg);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);

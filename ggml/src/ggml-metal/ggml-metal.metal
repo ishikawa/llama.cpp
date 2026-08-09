@@ -7874,17 +7874,27 @@ kernel void kernel_flash_attn_ext_vec_reduce(
 
     const uint64_t rid = tgpig;
 
-    const short iwg = tiisg;
+    // fold NWG partials across lanes so NWG can exceed the 32-lane simdgroup width;
+    // the threadgroup itself stays capped at 32 simdgroups regardless of NWG
+    const short nsg = NWG < 32 ? NWG : 32;
 
     device const float  * ss    = (device const float  *) htmp + (uint64_t)args.nrows*DV*NWG;
 
-    float S = ss[rid*(2*NWG) + 2*iwg + 0];
-    float M = ss[rid*(2*NWG) + 2*iwg + 1];
+    float M = -FLT_MAX/2;
+    for (short iwg = tiisg; iwg < NWG; iwg += 32) {
+        M = max(M, ss[rid*(2*NWG) + 2*iwg + 1]);
+    }
 
     const float m  = simd_max(M);
-    const float ms = exp(M - m);
 
-    S = simd_sum(S*ms);
+    float S = 0.0f;
+    for (short iwg = tiisg; iwg < NWG; iwg += 32) {
+        const float Sj = ss[rid*(2*NWG) + 2*iwg + 0];
+        const float Mj = ss[rid*(2*NWG) + 2*iwg + 1];
+        S += Sj*exp(Mj - m);
+    }
+
+    S = simd_sum(S);
     S = S == 0.0f ? 0.0f : 1.0f/S;
 
     const short DV4 = DV/4;
@@ -7892,10 +7902,16 @@ kernel void kernel_flash_attn_ext_vec_reduce(
     device const float4 * htmp4 = (device const float4 *) htmp + rid*DV4*NWG;
     device       float4 * dst4  = (device       float4 *) dst  + rid*DV4;
 
-    for (short i = sgitg; i < DV4; i += NWG) {
-        const float4 v = simd_sum(htmp4[i*NWG + iwg]*ms);
+    for (short i = sgitg; i < DV4; i += nsg) {
+        float4 vj = 0.0f;
+        for (short iwg = tiisg; iwg < NWG; iwg += 32) {
+            const float Mj = ss[rid*(2*NWG) + 2*iwg + 1];
+            vj += htmp4[i*NWG + iwg]*exp(Mj - m);
+        }
 
-        if (iwg == 0) {
+        const float4 v = simd_sum(vj);
+
+        if (tiisg == 0) {
             dst4[i] = v*S;
         }
     }

@@ -734,6 +734,83 @@ ggml_metal_device_t ggml_metal_device_init(int device) {
             dev->props.has_simdgroup_mm = [dev->mtl_device supportsFamily:MTLGPUFamilyApple7];
             dev->props.has_unified_memory = dev->mtl_device.hasUnifiedMemory;
 
+            dev->props.has_thread_elements_mla = false;
+            if (dev->props.has_simdgroup_mm && getenv("GGML_METAL_THREAD_ELEMENTS_DISABLE") == NULL) {
+                const char * src_thread_elements = "\n"
+                    "#include <metal_stdlib> \n"
+                    "using namespace metal; \n"
+                    " \n"
+                    "kernel void dummy_kernel( \n"
+                    "    device const float * src [[buffer(0)]], \n"
+                    "    device uint * diag [[buffer(1)]], \n"
+                    "    uint lane [[thread_index_in_simdgroup]]) { \n"
+                    "    simdgroup_float8x8 m; \n"
+                    "    simdgroup_load(m, src, 8, 0, false); \n"
+                    "    const float e0 = m.thread_elements()[0]; \n"
+                    "    const float e1 = m.thread_elements()[1]; \n"
+                    "    const uint qid = lane/4u; \n"
+                    "    const uint row = (qid & 4u) + (lane/2u)%4u; \n"
+                    "    const uint col0 = (qid & 2u)*2u + (lane%2u)*2u; \n"
+                    "    const float v0 = (float)(row*100u + col0); \n"
+                    "    const float v1 = (float)(row*100u + col0 + 1u); \n"
+                    "    diag[lane] = (e0 == v0 && e1 == v1) ? 1u : 0u; \n"
+                    "} ";
+
+                GGML_LOG_INFO("%s: testing simdgroup matrix thread_elements support\n", __func__);
+
+                NSError * error = nil;
+                NSString * src = [NSString stringWithUTF8String:src_thread_elements];
+                id<MTLLibrary> library = [dev->mtl_device newLibraryWithSource:src options:nil error:&error];
+
+                if (library == nil) {
+                    GGML_LOG_WARN("%s: - thread_elements compile failed - disabling MLA v4B\n", __func__);
+                } else {
+                    id<MTLFunction> function = [library newFunctionWithName:@"dummy_kernel"];
+                    id<MTLComputePipelineState> pipeline = function ? [dev->mtl_device newComputePipelineStateWithFunction:function error:&error] : nil;
+
+                    if (pipeline == nil || [pipeline threadExecutionWidth] != 32) {
+                        GGML_LOG_WARN("%s: - thread_elements pipeline failed - disabling MLA v4B\n", __func__);
+                    } else {
+                        float src_data[64];
+                        uint32_t diag_data[32];
+                        for (uint32_t row = 0; row < 8; ++row) {
+                            for (uint32_t col = 0; col < 8; ++col) {
+                                src_data[row*8 + col] = (float)(row*100u + col);
+                            }
+                        }
+                        memset(diag_data, 0, sizeof(diag_data));
+
+                        id<MTLBuffer> src_buf  = [dev->mtl_device newBufferWithBytes:src_data length:sizeof(src_data) options:MTLResourceStorageModeShared];
+                        id<MTLBuffer> diag_buf = [dev->mtl_device newBufferWithBytes:diag_data length:sizeof(diag_data) options:MTLResourceStorageModeShared];
+
+                        if (src_buf != nil && diag_buf != nil) {
+                            id<MTLCommandBuffer> command_buffer = [dev->mtl_queue commandBuffer];
+                            id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
+                            [encoder setComputePipelineState:pipeline];
+                            [encoder setBuffer:src_buf  offset:0 atIndex:0];
+                            [encoder setBuffer:diag_buf offset:0 atIndex:1];
+                            [encoder dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+                            [encoder endEncoding];
+                            [command_buffer commit];
+                            [command_buffer waitUntilCompleted];
+
+                            if ([command_buffer status] != MTLCommandBufferStatusError) {
+                                memcpy(diag_data, [diag_buf contents], sizeof(diag_data));
+                                bool ok = true;
+                                for (int i = 0; i < 32; ++i) {
+                                    ok = ok && diag_data[i] == 1u;
+                                }
+                                dev->props.has_thread_elements_mla = ok;
+                            }
+                        }
+
+                        if (!dev->props.has_thread_elements_mla) {
+                            GGML_LOG_WARN("%s: - thread_elements mapping check failed - disabling MLA v4B\n", __func__);
+                        }
+                    }
+                }
+            }
+
             dev->props.has_bfloat  = [dev->mtl_device supportsFamily:MTLGPUFamilyMetal3_GGML];
             dev->props.has_bfloat |= [dev->mtl_device supportsFamily:MTLGPUFamilyApple6];
             if (getenv("GGML_METAL_BF16_DISABLE") != NULL) {
@@ -935,6 +1012,7 @@ ggml_metal_device_t ggml_metal_device_init(int device) {
 
             GGML_LOG_INFO("%s: simdgroup reduction   = %s\n", __func__, dev->props.has_simdgroup_reduction ? "true" : "false");
             GGML_LOG_INFO("%s: simdgroup matrix mul. = %s\n", __func__, dev->props.has_simdgroup_mm        ? "true" : "false");
+            GGML_LOG_INFO("%s: thread elements MLA   = %s\n", __func__, dev->props.has_thread_elements_mla ? "true" : "false");
             GGML_LOG_INFO("%s: has unified memory    = %s\n", __func__, dev->props.has_unified_memory      ? "true" : "false");
             GGML_LOG_INFO("%s: has bfloat            = %s\n", __func__, dev->props.has_bfloat              ? "true" : "false");
             GGML_LOG_INFO("%s: has tensor            = %s\n", __func__, dev->props.has_tensor              ? "true" : "false");

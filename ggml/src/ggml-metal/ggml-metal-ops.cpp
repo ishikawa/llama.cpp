@@ -46,6 +46,74 @@ static int32_t ggml_metal_flash_attn_ext_vec_nwg(int64_t ne11) {
     return (int32_t) value;
 }
 
+static int32_t ggml_metal_flash_attn_ext_vec_baseline_ne(int64_t dk, int64_t dv) {
+    if (dk == 32 && dv == 32) {
+        return 4;
+    }
+    if (dk == 64 && dv == 64) {
+        return 2;
+    }
+    if (dk == 96 && dv == 96) {
+        return 4;
+    }
+    if (dk == 128 && dv == 128) {
+        return 1;
+    }
+    if (dk == 192 && (dv == 128 || dv == 192)) {
+        return 2;
+    }
+    if (dk == 256 && dv == 256) {
+        return 1;
+    }
+    if (dk == 320 && dv == 256) {
+        return 2;
+    }
+    if (dk == 512 && dv == 512) {
+        return 1;
+    }
+    if (dk == 576 && dv == 512) {
+        return 2;
+    }
+
+    return 4;
+}
+
+static bool ggml_metal_flash_attn_ext_vec_qne_env(enum ggml_type type, int64_t dk, int64_t dv, int32_t * q, int32_t * ne) {
+    const char * q_env  = getenv("GGML_METAL_FA_VEC_Q");
+    const char * ne_env = getenv("GGML_METAL_FA_VEC_NE");
+
+    *q  = 1;
+    *ne = ggml_metal_flash_attn_ext_vec_baseline_ne(dk, dv);
+
+    if (q_env == nullptr && ne_env == nullptr) {
+        return false;
+    }
+    if (type != GGML_TYPE_F16 || dk != 512 || dv != 512) {
+        return false;
+    }
+
+    bool active = false;
+    if (q_env != nullptr) {
+        char * end = nullptr;
+        const long value = strtol(q_env, &end, 10);
+        if (end != q_env && (value == 1 || value == 2 || value == 3)) {
+            *q = (int32_t) value;
+            active = true;
+        }
+    }
+
+    if (ne_env != nullptr) {
+        char * end = nullptr;
+        const long value = strtol(ne_env, &end, 10);
+        if (end != ne_env && (value == 1 || value == 2 || value == 4)) {
+            *ne = (int32_t) value;
+            active = true;
+        }
+    }
+
+    return active;
+}
+
 static ggml_metal_buffer_id ggml_metal_get_buffer_id(const ggml_tensor * t) {
     if (!t) {
         return { nullptr, 0 };
@@ -2943,11 +3011,16 @@ size_t ggml_metal_op_flash_attn_ext_extra_tmp(const ggml_tensor * op) {
     const bool has_scap  = logit_softcap != 0.0f;
     const bool has_kvpad = ne11 % OP_FLASH_ATTN_EXT_VEC_NCPSG != 0;
 
+    int32_t vec_q_env;
+    int32_t vec_ne_env;
+    const bool use_vec_qne_env = ggml_metal_flash_attn_ext_vec_qne_env(op->src[1]->type, ne00, ne20, &vec_q_env, &vec_ne_env);
+
     const bool use_mla =
         op->src[1]->type == GGML_TYPE_F16 &&
         ne00 == 512 && ne20 == 512 &&
         ne01 <= 8 && ne12 == 1 && ne22 == 1 &&
         has_mask && !has_sinks && !has_bias && !has_scap && !has_kvpad &&
+        !use_vec_qne_env &&
         getenv("GGML_METAL_FA_MLA_DISABLE") == nullptr;
 
     // note: always reserve the temp buffer to avoid graph reallocations
@@ -3208,12 +3281,15 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
 #undef FATTN_SMEM
     } else {
         // half4x4 kernel
-        const int nqptg = OP_FLASH_ATTN_EXT_VEC_NQPSG; // queries per threadgroup
+        int32_t nqptg; // queries per threadgroup
+        int32_t nept;  // head elements per thread
+        ggml_metal_flash_attn_ext_vec_qne_env(op->src[1]->type, ne00, ne20, &nqptg, &nept);
         const int ncpsg = OP_FLASH_ATTN_EXT_VEC_NCPSG; // cache values per simdgroup !! sync with kernel template arguments !!
         const int nhptg = 1;                           // heads per threadgroup
 
         GGML_ASSERT(nqptg <= 32);
-        GGML_ASSERT(nqptg  % 1  == 0);
+        GGML_ASSERT(nqptg == 1 || nqptg == 2 || nqptg == 3);
+        GGML_ASSERT(nept == 1 || nept == 2 || nept == 4);
         GGML_ASSERT(ncpsg  % 32 == 0);
 
         bool need_sync = false;
@@ -3272,7 +3348,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         // ne20*(nsg)
         // each simdgroup has a full f32 head vector in shared mem to accumulate results
         //
-#define FATTN_SMEM(nsg) (GGML_PAD(((GGML_PAD(ne00, 128) + 4*ncpsg + 2*GGML_PAD(ne20, 128))*(nsg))*(sizeof(float)/2), 16))
+#define FATTN_SMEM(nsg) (GGML_PAD(((GGML_PAD(ne00, 128) + 4*ncpsg + 2*GGML_PAD(ne20, 128))*(nsg)*nqptg)*(sizeof(float)/2), 16))
 
         int64_t nsg = 1;
 
@@ -3290,6 +3366,11 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             while (2*nwg*nsg*ncpsg < ne11 && nsg < 4) {
                 nsg *= 2;
             }
+        }
+
+        if ((size_t) FATTN_SMEM(nsg) > props_dev->max_theadgroup_memory_size) {
+            nqptg = 1;
+            nept  = ggml_metal_flash_attn_ext_vec_baseline_ne(ne00, ne20);
         }
 
         ggml_metal_kargs_flash_attn_ext_vec args = {
@@ -3327,34 +3408,43 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             /*.logit_softcap =*/ logit_softcap,
         };
 
+        int32_t vec_q_env;
+        int32_t vec_ne_env;
+        const bool use_vec_qne_env = ggml_metal_flash_attn_ext_vec_qne_env(op->src[1]->type, ne00, ne20, &vec_q_env, &vec_ne_env);
+
         const bool use_mla =
             op->src[1]->type == GGML_TYPE_F16 &&
             ne00 == 512 && ne20 == 512 &&
             ne01 <= 8 && ne12 == 1 && ne22 == 1 &&
-            has_mask && !has_sinks && !has_bias && !has_scap && !has_kvpad;
+            has_mask && !has_sinks && !has_bias && !has_scap && !has_kvpad &&
+            !use_vec_qne_env;
 
         const bool req_mla_v5  = getenv("GGML_METAL_FA_MLA_V5")  != nullptr;
+        const bool req_mla_v6_nq2 = getenv("GGML_METAL_FA_MLA_V6_NQ2") != nullptr;
+        const bool req_mla_v6_nq3 = getenv("GGML_METAL_FA_MLA_V6_NQ3") != nullptr;
         const bool req_mla_v4c = getenv("GGML_METAL_FA_MLA_V4C") != nullptr;
         const bool req_mla_v4b = getenv("GGML_METAL_FA_MLA_V4B") != nullptr;
         const bool req_mla_v4x = req_mla_v4b || req_mla_v4c;
-        const bool can_mla_vx = (!req_mla_v5 || props_dev->has_tensor) && (!req_mla_v4x || props_dev->has_thread_elements_mla);
+        const bool req_mla_v6x = (req_mla_v6_nq2 && ne01 == 2) || (req_mla_v6_nq3 && ne01 == 3);
+        const bool can_mla_vx = req_mla_v6x || ((!req_mla_v5 || props_dev->has_tensor) && (!req_mla_v4x || props_dev->has_thread_elements_mla));
 
         if (use_mla && can_mla_vx && getenv("GGML_METAL_FA_MLA_DISABLE") == nullptr) {
+            const bool use_mla_v6x = req_mla_v6x;
             const bool use_mla_v5x = req_mla_v5 && props_dev->has_tensor;
             const bool use_mla_v4x = req_mla_v4x && props_dev->has_thread_elements_mla;
             const bool use_mla_v3b = getenv("GGML_METAL_FA_MLA_V3B") != nullptr;
             const bool use_mla_v3a = getenv("GGML_METAL_FA_MLA_V3A") != nullptr;
             const bool use_mla_v3x = use_mla_v3a || use_mla_v3b || use_mla_v4x || use_mla_v5x;
             const int32_t mla_nwg = ggml_metal_flash_attn_ext_mla_nwg();
-            const int qtile = OP_FLASH_ATTN_EXT_VEC_MLA_Q_TILE;
-            const int ktile = use_mla_v3x ? 32 : OP_FLASH_ATTN_EXT_VEC_MLA_K_TILE;
-            const int qrows = use_mla_v3x ? 16 : qtile;
+            const int qtile = use_mla_v6x ? 1 : OP_FLASH_ATTN_EXT_VEC_MLA_Q_TILE;
+            const int ktile = (use_mla_v6x || use_mla_v3x) ? 32 : OP_FLASH_ATTN_EXT_VEC_MLA_K_TILE;
+            const int qrows = use_mla_v6x ? ne01 : (use_mla_v3x ? 16 : qtile);
             const int qpad  = 8;
             const int smem_rows = use_mla_v5x ? 32 : (use_mla_v4x ? 20 : (use_mla_v3x ? 16 : qpad));
 
 #define FATTN_MLA_SMEM(qrows, ktile) (GGML_PAD(((qrows)*ne00)*ggml_type_size(GGML_TYPE_F16) + (qrows)*(ktile)*ggml_type_size(GGML_TYPE_F32), 16))
             const size_t smem_pv = 4*8*ktile*ggml_type_size(GGML_TYPE_F16) + 4*8*8*ggml_type_size(GGML_TYPE_F32);
-            const size_t smem = (use_mla_v4x || use_mla_v5x) ? GGML_PAD(smem_rows*ne00*ggml_type_size(GGML_TYPE_F16), 16) : FATTN_MLA_SMEM(smem_rows, ktile) + (use_mla_v3b ? smem_pv : 0);
+            const size_t smem = use_mla_v6x ? 0 : ((use_mla_v4x || use_mla_v5x) ? GGML_PAD(smem_rows*ne00*ggml_type_size(GGML_TYPE_F16), 16) : FATTN_MLA_SMEM(smem_rows, ktile) + (use_mla_v3b ? smem_pv : 0));
 #undef FATTN_MLA_SMEM
 
             GGML_ASSERT(smem <= props_dev->max_theadgroup_memory_size);
@@ -3395,7 +3485,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             return 1;
         }
 
-        auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext_vec(lib, op, has_mask, has_sinks, has_bias, has_scap, has_kvpad, nsg, nwg);
+        auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext_vec(lib, op, has_mask, has_sinks, has_bias, has_scap, has_kvpad, nqptg, nept, nsg, nwg);
 
         GGML_ASSERT(nsg*32 <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
 

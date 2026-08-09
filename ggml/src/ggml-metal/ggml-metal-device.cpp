@@ -30,6 +30,38 @@ struct ggml_metal_pipelines {
     std::unordered_map<std::string, ggml_metal_pipeline_t> data;
 };
 
+static int32_t ggml_metal_flash_attn_ext_vec_baseline_ne(int32_t dk, int32_t dv) {
+    if (dk == 32 && dv == 32) {
+        return 4;
+    }
+    if (dk == 64 && dv == 64) {
+        return 2;
+    }
+    if (dk == 96 && dv == 96) {
+        return 4;
+    }
+    if (dk == 128 && dv == 128) {
+        return 1;
+    }
+    if (dk == 192 && (dv == 128 || dv == 192)) {
+        return 2;
+    }
+    if (dk == 256 && dv == 256) {
+        return 1;
+    }
+    if (dk == 320 && dv == 256) {
+        return 2;
+    }
+    if (dk == 512 && dv == 512) {
+        return 1;
+    }
+    if (dk == 576 && dv == 512) {
+        return 2;
+    }
+
+    return 4;
+}
+
 ggml_metal_pipelines_t ggml_metal_pipelines_init(void) {
     ggml_metal_pipelines_t res = new ggml_metal_pipelines();
 
@@ -1516,6 +1548,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_v
         bool    has_bias,
         bool    has_scap,
         bool    has_kvpad,
+        int32_t nqptg,
+        int32_t ne,
         int32_t nsg,
         int32_t nwg) {
     assert(op->op == GGML_OP_FLASH_ATTN_EXT);
@@ -1532,11 +1566,17 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_v
     const char * qk_limit_env = getenv("GGML_METAL_FA_VEC_QK_LIMIT");
     const int32_t qk_limit = qk_limit_env ? atoi(qk_limit_env) : 0;
 
-    snprintf(base, 256, "kernel_%s_%s_dk%d_dv%d",
+    char qne_suffix[32] = { 0 };
+    if (!(nqptg == 1 && ne == ggml_metal_flash_attn_ext_vec_baseline_ne(dk, dv))) {
+        snprintf(qne_suffix, sizeof(qne_suffix), "_q%d_ne%d", nqptg, ne);
+    }
+
+    snprintf(base, 256, "kernel_%s_%s_dk%d_dv%d%s",
             "flash_attn_ext_vec",
             ggml_type_name(op->src[1]->type),
             dk,
-            dv);
+            dv,
+            qne_suffix);
 
     snprintf(name, 256, "%s_mask=%d_sink=%d_bias=%d_scap=%d_kvpad=%d_ns10=%d_ns20=%d_nsg=%d_nwg=%d_qklim=%d",
             base,
@@ -1585,12 +1625,18 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_v
     char name[256];
 
     const bool use_mla_v5  = getenv("GGML_METAL_FA_MLA_V5")  != nullptr;
+    const bool use_mla_v6_nq2 = getenv("GGML_METAL_FA_MLA_V6_NQ2") != nullptr && op->src[0]->ne[1] == 2;
+    const bool use_mla_v6_nq3 = getenv("GGML_METAL_FA_MLA_V6_NQ3") != nullptr && op->src[0]->ne[1] == 3;
     const bool use_mla_v4c = getenv("GGML_METAL_FA_MLA_V4C") != nullptr;
     const bool use_mla_v4b = getenv("GGML_METAL_FA_MLA_V4B") != nullptr;
     const bool use_mla_v3b = getenv("GGML_METAL_FA_MLA_V3B") != nullptr;
     const bool use_mla_v3a = getenv("GGML_METAL_FA_MLA_V3A") != nullptr;
 
-    if (use_mla_v5) {
+    if (use_mla_v6_nq2) {
+        snprintf(base, 256, "kernel_flash_attn_ext_vec_mla_f16_dk512_dv512_v6_nq2");
+    } else if (use_mla_v6_nq3) {
+        snprintf(base, 256, "kernel_flash_attn_ext_vec_mla_f16_dk512_dv512_v6_nq3");
+    } else if (use_mla_v5) {
         snprintf(base, 256, "kernel_flash_attn_ext_vec_mla_f16_dk512_dv512_v5");
     } else if (use_mla_v4c) {
         snprintf(base, 256, "kernel_flash_attn_ext_vec_mla_f16_dk512_dv512_v4c");

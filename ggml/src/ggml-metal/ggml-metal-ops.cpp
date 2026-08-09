@@ -3284,15 +3284,18 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             has_mask && !has_sinks && !has_bias && !has_scap && !has_kvpad;
 
         if (use_mla && getenv("GGML_METAL_FA_MLA_DISABLE") == nullptr) {
+            const bool use_mla_v3b = getenv("GGML_METAL_FA_MLA_V3B") != nullptr;
             const bool use_mla_v3a = getenv("GGML_METAL_FA_MLA_V3A") != nullptr;
+            const bool use_mla_v3x = use_mla_v3a || use_mla_v3b;
             const int qtile = OP_FLASH_ATTN_EXT_VEC_MLA_Q_TILE;
-            const int ktile = use_mla_v3a ? 32 : OP_FLASH_ATTN_EXT_VEC_MLA_K_TILE;
-            const int qrows = use_mla_v3a ? 16 : qtile;
+            const int ktile = use_mla_v3x ? 32 : OP_FLASH_ATTN_EXT_VEC_MLA_K_TILE;
+            const int qrows = use_mla_v3x ? 16 : qtile;
             const int qpad  = 8;
-            const int smem_rows = use_mla_v3a ? 16 : qpad;
+            const int smem_rows = use_mla_v3x ? 16 : qpad;
 
 #define FATTN_MLA_SMEM(qrows, ktile) (GGML_PAD(((qrows)*ne00)*ggml_type_size(GGML_TYPE_F16) + (qrows)*(ktile)*ggml_type_size(GGML_TYPE_F32), 16))
-            const size_t smem = FATTN_MLA_SMEM(smem_rows, ktile);
+            const size_t smem_pv = 4*8*ktile*ggml_type_size(GGML_TYPE_F16) + 4*8*8*ggml_type_size(GGML_TYPE_F32);
+            const size_t smem = FATTN_MLA_SMEM(smem_rows, ktile) + (use_mla_v3b ? smem_pv : 0);
 #undef FATTN_MLA_SMEM
 
             GGML_ASSERT(smem <= props_dev->max_theadgroup_memory_size);

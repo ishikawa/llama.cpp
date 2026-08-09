@@ -3276,6 +3276,58 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             /*.logit_softcap =*/ logit_softcap,
         };
 
+        const bool use_mla =
+            op->src[1]->type == GGML_TYPE_F16 &&
+            ne00 == 512 && ne20 == 512 &&
+            ne01 <= 8 && ne12 == 1 && ne22 == 1 &&
+            has_mask && !has_sinks && !has_bias && !has_scap && !has_kvpad;
+
+        if (use_mla) {
+            const int qtile = OP_FLASH_ATTN_EXT_VEC_MLA_Q_TILE;
+            const int ktile = OP_FLASH_ATTN_EXT_VEC_MLA_K_TILE;
+
+#define FATTN_MLA_SMEM(qtile, ktile) (GGML_PAD(((ktile)*std::max(ne00, ne20) + (qtile)*ne00)*ggml_type_size(GGML_TYPE_F16), 16))
+            const size_t smem = FATTN_MLA_SMEM(qtile, ktile);
+#undef FATTN_MLA_SMEM
+
+            GGML_ASSERT(smem <= props_dev->max_theadgroup_memory_size);
+            GGML_ASSERT(ggml_metal_op_flash_attn_ext_extra_tmp(op) != 0);
+
+            auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext_vec_mla(lib, op, nwg);
+
+            GGML_ASSERT(qtile*32 <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+
+            ggml_metal_encoder_set_pipeline(enc, pipeline);
+            ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+            ggml_metal_encoder_set_buffer  (enc, bid_src0, 1);
+            ggml_metal_encoder_set_buffer  (enc, bid_src1, 2);
+            ggml_metal_encoder_set_buffer  (enc, bid_src2, 3);
+            ggml_metal_encoder_set_buffer  (enc, bid_src3, 4);
+            ggml_metal_encoder_set_buffer  (enc, bid_tmp,  5);
+
+            ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
+            ggml_metal_encoder_dispatch_threadgroups(enc, (ne01*ne02 + qtile - 1)/qtile, ne03, nwg, 32, qtile, 1);
+
+            ggml_metal_op_concurrency_reset(ctx);
+
+            const int32_t nrows = ne1*ne2*ne3;
+
+            ggml_metal_kargs_flash_attn_ext_vec_reduce args0 = {
+                nrows,
+            };
+
+            auto pipeline0 = ggml_metal_library_get_pipeline_flash_attn_ext_vec_reduce(lib, op, ne20, nwg);
+
+            ggml_metal_encoder_set_pipeline(enc, pipeline0);
+            ggml_metal_encoder_set_bytes   (enc, &args0, sizeof(args0), 0);
+            ggml_metal_encoder_set_buffer  (enc, bid_tmp, 1);
+            ggml_metal_encoder_set_buffer  (enc, bid_dst, 2);
+
+            ggml_metal_encoder_dispatch_threadgroups(enc, nrows, 1, 1, 32*nwg, 1, 1);
+
+            return 1;
+        }
+
         auto pipeline = ggml_metal_library_get_pipeline_flash_attn_ext_vec(lib, op, has_mask, has_sinks, has_bias, has_scap, has_kvpad, nsg, nwg);
 
         GGML_ASSERT(nsg*32 <= ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));

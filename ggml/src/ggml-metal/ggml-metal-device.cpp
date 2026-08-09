@@ -1568,6 +1568,33 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_v
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_vec_mla(
+        ggml_metal_library_t lib,
+        const ggml_tensor * op,
+        int32_t nwg) {
+    assert(op->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_UNUSED(op);
+
+    char base[256];
+    char name[256];
+
+    snprintf(base, 256, "kernel_flash_attn_ext_vec_mla_f16_dk512_dv512");
+    snprintf(name, 256, "%s_nwg=%d", base, nwg);
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        ggml_metal_cv_t cv = ggml_metal_cv_init();
+
+        ggml_metal_cv_set_int32(cv, nwg, FC_FLASH_ATTN_EXT_VEC_MLA + 0);
+
+        res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
+
+        ggml_metal_cv_free(cv);
+    }
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_vec_reduce(
         ggml_metal_library_t lib,
         const ggml_tensor * op,

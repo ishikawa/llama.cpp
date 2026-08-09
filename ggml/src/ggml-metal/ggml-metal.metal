@@ -7859,6 +7859,185 @@ template [[host_name("kernel_flash_attn_ext_vec_q8_0_dk576_dv512")]] kernel flas
 #undef FA_TYPES
 #undef FA_TYPES_F32
 
+constant int32_t FC_flash_attn_ext_vec_mla_NWG [[function_constant(FC_FLASH_ATTN_EXT_VEC_MLA + 0)]];
+
+kernel void kernel_flash_attn_ext_vec_mla_f16_dk512_dv512(
+        constant ggml_metal_kargs_flash_attn_ext_vec & args,
+        device const char * q,
+        device const char * k,
+        device const char * v,
+        device const char * mask,
+        device       char * htmp,
+        threadgroup  half * shmem_f16 [[threadgroup(0)]],
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]],
+        ushort  tiitg[[thread_index_in_threadgroup]]) {
+#define NWG FC_flash_attn_ext_vec_mla_NWG
+
+    constexpr short DK = 512;
+    constexpr short DV = 512;
+    constexpr short DK4 = DK/4;
+    constexpr short DV4 = DV/4;
+    constexpr short Q_TILE = OP_FLASH_ATTN_EXT_VEC_MLA_Q_TILE;
+    constexpr short K_TILE = OP_FLASH_ATTN_EXT_VEC_MLA_K_TILE;
+    constexpr short NW = N_SIMDWIDTH;
+    constexpr short NO = DV4/NW;
+
+    threadgroup half4 * skv4 = (threadgroup half4 *) shmem_f16;
+    threadgroup half4 * sq4  = skv4 + K_TILE*DK4;
+
+    const int qrow0 = tgpig[0]*Q_TILE;
+    const int q3    = tgpig[1];
+    const int iwg   = tgpig[2];
+    const int nqr   = args.ne01*args.ne02;
+
+    for (int i = tiitg; i < Q_TILE*DK4; i += Q_TILE*NW) {
+        const int iq = i/DK4;
+        const int id = i - iq*DK4;
+        const int qr = qrow0 + iq;
+
+        if (qr < nqr) {
+            const int q1 = qr%args.ne01;
+            const int q2 = qr/args.ne01;
+            device const float4 * pq4 = (device const float4 *) (q + q1*args.nb01 + q2*args.nb02 + q3*args.nb03);
+            sq4[i] = (half4) pq4[id];
+        } else {
+            sq4[i] = (half4) 0.0h;
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const int qr = qrow0 + sgitg;
+    const bool valid_q = qr < nqr;
+    const int q1 = valid_q ? qr%args.ne01 : 0;
+    const int q2 = valid_q ? qr/args.ne01 : 0;
+    const int ikv2 = valid_q ? q2/(args.ne02/args.ne_12_2) : 0;
+    const int ikv3 = q3/(args.ne03/args.ne_12_3);
+
+    device const char * k_base = k + ikv2*args.nb12 + ikv3*args.nb13;
+    device const char * v_base = v + ikv2*args.nb22 + ikv3*args.nb23;
+    device const half * pm = valid_q ? (device const half *) (mask + q1*args.nb31 + (q2%args.ne32)*args.nb32 + (q3%args.ne33)*args.nb33) : (device const half *) mask;
+
+    float4 acc[NO];
+    for (short i = 0; i < NO; ++i) {
+        acc[i] = 0.0f;
+    }
+
+    float S = 0.0f;
+    float M = -FLT_MAX/2;
+
+    for (int ic = iwg*K_TILE; ic < args.ne11; ic += NWG*K_TILE) {
+        for (int i = tiitg; i < K_TILE*DK4; i += Q_TILE*NW) {
+            const int kc = i/DK4;
+            const int id = i - kc*DK4;
+            const int kv = ic + kc;
+
+            if (kv < args.ne11) {
+                device const half4 * pk4 = (device const half4 *) (k_base + kv*args.nb11);
+                skv4[i] = pk4[id];
+            } else {
+                skv4[i] = (half4) 0.0h;
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float scores[K_TILE];
+
+        for (short kc = 0; kc < K_TILE; ++kc) {
+            float qk = 0.0f;
+
+            if (valid_q && ic + kc < args.ne11) {
+                for (short id = tiisg; id < DK4; id += NW) {
+                    qk += dot((float4) sq4[sgitg*DK4 + id], (float4) skv4[kc*DK4 + id]);
+                }
+
+                qk = simd_sum(qk);
+
+                const float mv = (float) pm[ic + kc];
+                scores[kc] = mv <= -MAXHALF ? -FLT_MAX/2 : fma(qk, args.scale, mv);
+            } else {
+                scores[kc] = -FLT_MAX/2;
+            }
+        }
+
+        float mt = -FLT_MAX/2;
+        for (short kc = 0; kc < K_TILE; ++kc) {
+            mt = max(mt, scores[kc]);
+        }
+
+        const float M_new = max(M, mt);
+        const float alpha = M <= -FLT_MAX/4 ? 0.0f : exp(M - M_new);
+
+        float probs[K_TILE];
+        float psum = 0.0f;
+
+        for (short kc = 0; kc < K_TILE; ++kc) {
+            probs[kc] = scores[kc] <= -FLT_MAX/4 ? 0.0f : exp(scores[kc] - M_new);
+            psum += probs[kc];
+        }
+
+        S = S*alpha + psum;
+        M = M_new;
+
+        for (short i = 0; i < NO; ++i) {
+            acc[i] *= alpha;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (int i = tiitg; i < K_TILE*DV4; i += Q_TILE*NW) {
+            const int kc = i/DV4;
+            const int id = i - kc*DV4;
+            const int kv = ic + kc;
+
+            if (kv < args.ne11) {
+                device const half4 * pv4 = (device const half4 *) (v_base + kv*args.nb21);
+                skv4[i] = pv4[id];
+            } else {
+                skv4[i] = (half4) 0.0h;
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (valid_q) {
+            for (short kc = 0; kc < K_TILE; ++kc) {
+                const float p = probs[kc];
+
+                for (short i = 0; i < NO; ++i) {
+                    const short id = tiisg + i*NW;
+                    acc[i] += (float4) skv4[kc*DV4 + id]*p;
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (valid_q) {
+        const int nrows = args.ne3*args.ne2*args.ne1;
+        const int rid = q3*args.ne2*args.ne1 + q2 + q1*args.ne1;
+
+        device float4 * htmp4 = (device float4 *) htmp;
+        device float  * ss    = (device float  *) htmp + (uint64_t)nrows*DV*NWG;
+
+        for (short i = 0; i < NO; ++i) {
+            const short id = tiisg + i*NW;
+            htmp4[(uint64_t)rid*DV4*NWG + NWG*id + iwg] = acc[i];
+        }
+
+        if (tiisg == 0) {
+            ss[rid*(2*NWG) + 2*iwg + 0] = S;
+            ss[rid*(2*NWG) + 2*iwg + 1] = M;
+        }
+    }
+
+#undef NWG
+}
+
 constant int32_t FC_flash_attn_ext_vec_reduce_DV  [[function_constant(FC_FLASH_ATTN_EXT_VEC_REDUCE + 0)]];
 constant int32_t FC_flash_attn_ext_vec_reduce_NWG [[function_constant(FC_FLASH_ATTN_EXT_VEC_REDUCE + 1)]];
 

@@ -93,6 +93,7 @@
 #define FC_FLASH_ATTN_EXT              300
 #define FC_FLASH_ATTN_EXT_VEC          400
 #define FC_FLASH_ATTN_EXT_VEC_REDUCE   500
+#define FC_FLASH_ATTN_EXT_VEC_MLA      550
 #define FC_MUL_MV                      600
 #define FC_MUL_MM                      700
 #define FC_ROPE                        800
@@ -111,6 +112,8 @@
 
 #define OP_FLASH_ATTN_EXT_VEC_NQPSG 1
 #define OP_FLASH_ATTN_EXT_VEC_NCPSG 32
+#define OP_FLASH_ATTN_EXT_VEC_MLA_Q_TILE 4
+#define OP_FLASH_ATTN_EXT_VEC_MLA_K_TILE 16
 
 #define OP_LIGHTNING_INDEXER_DK    128
 #define OP_LIGHTNING_INDEXER_NH     64

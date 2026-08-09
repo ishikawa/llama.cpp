@@ -29,6 +29,23 @@ static int32_t ggml_metal_flash_attn_ext_mla_nwg(void) {
     return (int32_t) value;
 }
 
+static int32_t ggml_metal_flash_attn_ext_vec_nwg(int64_t ne11) {
+    const int32_t default_nwg = ne11 >= 8192 && ne11 <= 24576 ? 64 : 32;
+
+    const char * env = getenv("GGML_METAL_FA_VEC_NWG");
+    if (env == nullptr) {
+        return default_nwg;
+    }
+
+    char * end = nullptr;
+    const long value = strtol(env, &end, 10);
+    if (end == env || value < 1 || value > 128) {
+        return default_nwg;
+    }
+
+    return (int32_t) value;
+}
+
 static ggml_metal_buffer_id ggml_metal_get_buffer_id(const ggml_tensor * t) {
     if (!t) {
         return { nullptr, 0 };
@@ -2913,17 +2930,30 @@ size_t ggml_metal_op_flash_attn_ext_extra_tmp(const ggml_tensor * op) {
   //GGML_TENSOR_LOCALS( int32_t, ne3, op->src[3], ne);
   //GGML_TENSOR_LOCALS(uint64_t, nb3, op->src[3], nb);
 
+    float max_bias;
+    float logit_softcap;
+
+    memcpy(&max_bias,      ((const int32_t *) op->op_params) + 1, sizeof(max_bias));
+    memcpy(&logit_softcap, ((const int32_t *) op->op_params) + 2, sizeof(logit_softcap));
+
     size_t res = 0;
+    const bool has_mask  = op->src[3] != nullptr;
+    const bool has_sinks = op->src[4] != nullptr;
+    const bool has_bias  = max_bias != 0.0f;
+    const bool has_scap  = logit_softcap != 0.0f;
+    const bool has_kvpad = ne11 % OP_FLASH_ATTN_EXT_VEC_NCPSG != 0;
+
     const bool use_mla =
         op->src[1]->type == GGML_TYPE_F16 &&
         ne00 == 512 && ne20 == 512 &&
         ne01 <= 8 && ne12 == 1 && ne22 == 1 &&
-        op->src[3] != nullptr;
+        has_mask && !has_sinks && !has_bias && !has_scap && !has_kvpad &&
+        getenv("GGML_METAL_FA_MLA_DISABLE") == nullptr;
 
     // note: always reserve the temp buffer to avoid graph reallocations
     //if (ggml_metal_op_flash_attn_ext_use_vec(op)) {
     if (true) {
-        const int64_t nwg = use_mla ? ggml_metal_flash_attn_ext_mla_nwg() : 32;
+        const int64_t nwg = use_mla ? ggml_metal_flash_attn_ext_mla_nwg() : ggml_metal_flash_attn_ext_vec_nwg(ne11);
         const int64_t ne01_max = std::min(ne01, 32);
 
         // temp buffer for writing the results from each workgroup
@@ -3255,7 +3285,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             nwg = 1;
             nsg = 4;
         } else {
-            nwg = 32;
+            nwg = ggml_metal_flash_attn_ext_vec_nwg(ne11);
             nsg = 1;
             while (2*nwg*nsg*ncpsg < ne11 && nsg < 4) {
                 nsg *= 2;
@@ -3422,7 +3452,7 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
                 ggml_metal_encoder_set_buffer  (enc, bid_tmp, 1);
                 ggml_metal_encoder_set_buffer  (enc, bid_dst, 2);
 
-                ggml_metal_encoder_dispatch_threadgroups(enc, nrows, 1, 1, 32*nwg, 1, 1);
+                ggml_metal_encoder_dispatch_threadgroups(enc, nrows, 1, 1, 32*std::min(nwg, 32), 1, 1);
             }
         }
 #undef FATTN_SMEM

@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <limits>
 #include <cmath>
+#include <cstdlib>
 
 static ggml_metal_buffer_id ggml_metal_get_buffer_id(const ggml_tensor * t) {
     if (!t) {
@@ -3282,12 +3283,13 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             ne01 <= 8 && ne12 == 1 && ne22 == 1 &&
             has_mask && !has_sinks && !has_bias && !has_scap && !has_kvpad;
 
-        if (use_mla) {
+        if (use_mla && getenv("GGML_METAL_FA_MLA_DISABLE") == nullptr) {
             const int qtile = OP_FLASH_ATTN_EXT_VEC_MLA_Q_TILE;
             const int ktile = OP_FLASH_ATTN_EXT_VEC_MLA_K_TILE;
+            const int qpad  = 8;
 
-#define FATTN_MLA_SMEM(qtile, ktile) (GGML_PAD(((ktile)*std::max(ne00, ne20) + (qtile)*ne00)*ggml_type_size(GGML_TYPE_F16), 16))
-            const size_t smem = FATTN_MLA_SMEM(qtile, ktile);
+#define FATTN_MLA_SMEM(qpad, ktile) (GGML_PAD(((qpad)*ne00)*ggml_type_size(GGML_TYPE_F16) + (qpad)*(ktile)*ggml_type_size(GGML_TYPE_F32), 16))
+            const size_t smem = FATTN_MLA_SMEM(qpad, ktile);
 #undef FATTN_MLA_SMEM
 
             GGML_ASSERT(smem <= props_dev->max_theadgroup_memory_size);

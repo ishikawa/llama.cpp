@@ -5,6 +5,7 @@
 #include "ggml-impl.h"
 
 #include <cassert>
+#include <cstdlib>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -1528,13 +1529,16 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_v
     const int32_t ns10 = op->src[1]->nb[1]/op->src[1]->nb[0];
     const int32_t ns20 = op->src[2]->nb[1]/op->src[2]->nb[0];
 
+    const char * qk_limit_env = getenv("GGML_METAL_FA_VEC_QK_LIMIT");
+    const int32_t qk_limit = qk_limit_env ? atoi(qk_limit_env) : 0;
+
     snprintf(base, 256, "kernel_%s_%s_dk%d_dv%d",
             "flash_attn_ext_vec",
             ggml_type_name(op->src[1]->type),
             dk,
             dv);
 
-    snprintf(name, 256, "%s_mask=%d_sink=%d_bias=%d_scap=%d_kvpad=%d_ns10=%d_ns20=%d_nsg=%d_nwg=%d",
+    snprintf(name, 256, "%s_mask=%d_sink=%d_bias=%d_scap=%d_kvpad=%d_ns10=%d_ns20=%d_nsg=%d_nwg=%d_qklim=%d",
             base,
             has_mask,
             has_sinks,
@@ -1543,7 +1547,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_v
             has_kvpad,
             ns10,
             ns20,
-            nsg, nwg);
+            nsg, nwg,
+            qk_limit);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
@@ -1559,6 +1564,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_v
         ggml_metal_cv_set_int32(cv, ns20, FC_FLASH_ATTN_EXT_VEC + 21);
         ggml_metal_cv_set_int32(cv, nsg,  FC_FLASH_ATTN_EXT_VEC + 22);
         ggml_metal_cv_set_int32(cv, nwg,  FC_FLASH_ATTN_EXT_VEC + 23);
+        ggml_metal_cv_set_int32(cv, qk_limit, FC_FLASH_ATTN_EXT_VEC + 24);
 
         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
 

@@ -7273,6 +7273,7 @@ constant int32_t FC_flash_attn_ext_vec_ns10 [[function_constant(FC_FLASH_ATTN_EX
 constant int32_t FC_flash_attn_ext_vec_ns20 [[function_constant(FC_FLASH_ATTN_EXT_VEC + 21)]];
 constant int32_t FC_flash_attn_ext_vec_nsg  [[function_constant(FC_FLASH_ATTN_EXT_VEC + 22)]];
 constant int32_t FC_flash_attn_ext_vec_nwg  [[function_constant(FC_FLASH_ATTN_EXT_VEC + 23)]];
+constant int32_t FC_flash_attn_ext_vec_qk_limit [[function_constant(FC_FLASH_ATTN_EXT_VEC + 24)]];
 
 template<
     typename q4_t,  // query types in shared memory
@@ -7314,6 +7315,7 @@ kernel void kernel_flash_attn_ext_vec(
 
 #define NS10 (FC_flash_attn_ext_vec_ns10)
 #define NS20 (FC_flash_attn_ext_vec_ns20)
+#define QK_NI ((FC_flash_attn_ext_vec_qk_limit > 0 && FC_flash_attn_ext_vec_qk_limit < DK4/NL) ? FC_flash_attn_ext_vec_qk_limit : DK4/NL)
 
     const short iwg = tgpig[2]%NWG;
 
@@ -7463,7 +7465,7 @@ kernel void kernel_flash_attn_ext_vec(
                 // each simdgroup processes 1 query and NE (NW/NL) cache elements
                 FOR_UNROLL (short cc = 0; cc < C/NE; ++cc) {
                     if (is_same<kd4_t, k4_t>::value) {
-                        FOR_UNROLL (short ii = 0; ii < DK4/NL; ++ii) {
+                        FOR_UNROLL (short ii = 0; ii < QK_NI; ++ii) {
                             mqk[cc] += dot((float4) pk4[cc*NE*NS10/4 +  ii*NL], (float4) pq4[ii*NL]);
                         }
                     } else {
@@ -7471,7 +7473,7 @@ kernel void kernel_flash_attn_ext_vec(
 
                         k4_t mk;
 
-                        FOR_UNROLL (short ii = 0; ii < DK4/NL; ++ii) {
+                        FOR_UNROLL (short ii = 0; ii < QK_NI; ++ii) {
                             const short i = ii*NL + tx;
 
                             deq_k_t4(pk + i/nl_k, i%nl_k, mk);
@@ -7723,6 +7725,7 @@ kernel void kernel_flash_attn_ext_vec(
 #undef NSG
 #undef NS10
 #undef NS20
+#undef QK_NI
 }
 
 // note: I think the s_t can be half instead of float, because the Q*K scaling is done before storing to shared mem
@@ -7881,23 +7884,25 @@ kernel void kernel_flash_attn_ext_vec_mla_f16_dk512_dv512(
     constexpr short DV4 = DV/4;
     constexpr short Q_TILE = OP_FLASH_ATTN_EXT_VEC_MLA_Q_TILE;
     constexpr short K_TILE = OP_FLASH_ATTN_EXT_VEC_MLA_K_TILE;
+    constexpr short Q_PAD = 8;
     constexpr short NW = N_SIMDWIDTH;
     constexpr short NO = DV4/NW;
 
-    threadgroup half4 * skv4 = (threadgroup half4 *) shmem_f16;
-    threadgroup half4 * sq4  = skv4 + K_TILE*DK4;
+    threadgroup half  * sq  = shmem_f16;
+    threadgroup half4 * sq4 = (threadgroup half4 *) sq;
+    threadgroup float * ss  = (threadgroup float *) (shmem_f16 + Q_PAD*DK);
 
     const int qrow0 = tgpig[0]*Q_TILE;
     const int q3    = tgpig[1];
     const int iwg   = tgpig[2];
     const int nqr   = args.ne01*args.ne02;
 
-    for (int i = tiitg; i < Q_TILE*DK4; i += Q_TILE*NW) {
+    for (int i = tiitg; i < Q_PAD*DK4; i += Q_TILE*NW) {
         const int iq = i/DK4;
         const int id = i - iq*DK4;
         const int qr = qrow0 + iq;
 
-        if (qr < nqr) {
+        if (iq < Q_TILE && qr < nqr) {
             const int q1 = qr%args.ne01;
             const int q2 = qr/args.ne01;
             device const float4 * pq4 = (device const float4 *) (q + q1*args.nb01 + q2*args.nb02 + q3*args.nb03);
@@ -7929,17 +7934,41 @@ kernel void kernel_flash_attn_ext_vec_mla_f16_dk512_dv512(
     float M = -FLT_MAX/2;
 
     for (int ic = iwg*K_TILE; ic < args.ne11; ic += NWG*K_TILE) {
-        for (int i = tiitg; i < K_TILE*DK4; i += Q_TILE*NW) {
-            const int kc = i/DK4;
-            const int id = i - kc*DK4;
-            const int kv = ic + kc;
+        if (sgitg == 0) {
+            device const half * pk = (device const half *) (k_base + ic*args.nb11);
 
-            if (kv < args.ne11) {
-                device const half4 * pk4 = (device const half4 *) (k_base + kv*args.nb11);
-                skv4[i] = pk4[id];
-            } else {
-                skv4[i] = (half4) 0.0h;
+            simdgroup_float8x8 mqk0 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+            simdgroup_float8x8 mqk1 = make_filled_simdgroup_matrix<float, 8>(0.0f);
+
+            simdgroup_half8x8 mq[2];
+            simdgroup_half8x8 mk[2];
+
+            #pragma unroll (16)
+            for (short ii = 0; ii < DK/16; ++ii) {
+                simdgroup_barrier(mem_flags::mem_none);
+
+                simdgroup_load(mq[0], sq + 16*ii,     DK);
+                simdgroup_load(mq[1], sq + 16*ii + 8, DK);
+
+                simdgroup_load(mk[0], pk + 16*ii,         DK, 0, true);
+                simdgroup_load(mk[1], pk + 16*ii + 8,     DK, 0, true);
+
+                simdgroup_barrier(mem_flags::mem_none);
+
+                simdgroup_multiply_accumulate(mqk0, mq[0], mk[0], mqk0);
+                simdgroup_multiply_accumulate(mqk0, mq[1], mk[1], mqk0);
+
+                simdgroup_load(mk[0], pk + 8*DK + 16*ii,     DK, 0, true);
+                simdgroup_load(mk[1], pk + 8*DK + 16*ii + 8, DK, 0, true);
+
+                simdgroup_barrier(mem_flags::mem_none);
+
+                simdgroup_multiply_accumulate(mqk1, mq[0], mk[0], mqk1);
+                simdgroup_multiply_accumulate(mqk1, mq[1], mk[1], mqk1);
             }
+
+            simdgroup_store(mqk0, ss,     K_TILE, 0, false);
+            simdgroup_store(mqk1, ss + 8, K_TILE, 0, false);
         }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -7947,20 +7976,8 @@ kernel void kernel_flash_attn_ext_vec_mla_f16_dk512_dv512(
         float scores[K_TILE];
 
         for (short kc = 0; kc < K_TILE; ++kc) {
-            float qk = 0.0f;
-
-            if (valid_q && ic + kc < args.ne11) {
-                for (short id = tiisg; id < DK4; id += NW) {
-                    qk += dot((float4) sq4[sgitg*DK4 + id], (float4) skv4[kc*DK4 + id]);
-                }
-
-                qk = simd_sum(qk);
-
-                const float mv = (float) pm[ic + kc];
-                scores[kc] = mv <= -MAXHALF ? -FLT_MAX/2 : fma(qk, args.scale, mv);
-            } else {
-                scores[kc] = -FLT_MAX/2;
-            }
+            const float mv = valid_q ? (float) pm[ic + kc] : -MAXHALF;
+            scores[kc] = valid_q && mv > -MAXHALF ? fma(ss[sgitg*K_TILE + kc], args.scale, mv) : -FLT_MAX/2;
         }
 
         float mt = -FLT_MAX/2;
@@ -7986,30 +8003,14 @@ kernel void kernel_flash_attn_ext_vec_mla_f16_dk512_dv512(
             acc[i] *= alpha;
         }
 
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        for (int i = tiitg; i < K_TILE*DV4; i += Q_TILE*NW) {
-            const int kc = i/DV4;
-            const int id = i - kc*DV4;
-            const int kv = ic + kc;
-
-            if (kv < args.ne11) {
-                device const half4 * pv4 = (device const half4 *) (v_base + kv*args.nb21);
-                skv4[i] = pv4[id];
-            } else {
-                skv4[i] = (half4) 0.0h;
-            }
-        }
-
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
         if (valid_q) {
             for (short kc = 0; kc < K_TILE; ++kc) {
                 const float p = probs[kc];
+                device const half4 * pv4 = (device const half4 *) (v_base + (ic + kc)*args.nb21);
 
                 for (short i = 0; i < NO; ++i) {
                     const short id = tiisg + i*NW;
-                    acc[i] += (float4) skv4[kc*DV4 + id]*p;
+                    acc[i] += (float4) pv4[id]*p;
                 }
             }
         }

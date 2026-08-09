@@ -2350,10 +2350,46 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
     // to the matrix-vector kernel
     const int ne11_mm_min = 8;
     const bool proto_mmv_force_mm = ggml_metal_getenv_flag("GGML_METAL_PROTO_MMV_FORCE_MM");
+    const bool proto_mmv_narrow_q8_n4 = ggml_metal_getenv_flag("GGML_METAL_PROTO_MMV_NARROW_Q8_N4");
 
     // first try to use small-batch mat-mv kernels
     // these should be efficient for BS [2, ~8]
-    if (!proto_mmv_force_mm && op->src[1]->type == GGML_TYPE_F32 && (ne00%128 == 0) &&
+    if (proto_mmv_narrow_q8_n4 &&
+        !ggml_is_transposed(op->src[0]) &&
+        !ggml_is_transposed(op->src[1]) &&
+        props_dev->has_simdgroup_mm &&
+        op->src[0]->type == GGML_TYPE_Q8_0 &&
+        op->src[1]->type == GGML_TYPE_F32 &&
+        ne11 == 4 &&
+        ne00 % 32 == 0) {
+        auto pipeline = ggml_metal_library_get_pipeline_mul_mm_q8_0_n4(lib);
+
+        ggml_metal_kargs_mul_mm args = {
+            /*.ne00 =*/ ne00,
+            /*.ne02 =*/ ne02,
+            /*.nb01 =*/ nb01,
+            /*.nb02 =*/ nb02,
+            /*.nb03 =*/ nb03,
+            /*.ne12 =*/ ne12,
+            /*.nb10 =*/ nb10,
+            /*.nb11 =*/ nb11,
+            /*.nb12 =*/ nb12,
+            /*.nb13 =*/ nb13,
+            /*.ne0  =*/ ne0,
+            /*.ne1  =*/ ne1,
+            /*.r2   =*/ r2,
+            /*.r3   =*/ r3,
+        };
+
+        ggml_metal_encoder_set_pipeline(enc, pipeline);
+        ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
+        ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         3);
+        ggml_metal_encoder_set_threadgroup_memory_size(enc, pipeline.smem, 0);
+
+        ggml_metal_encoder_dispatch_threadgroups(enc, ((ne11 + pipeline.nr1 - 1)/pipeline.nr1), ((ne01 + pipeline.nr0 - 1)/pipeline.nr0), ne12*ne13, 32, pipeline.nsg, 1);
+    } else if (!proto_mmv_force_mm && op->src[1]->type == GGML_TYPE_F32 && (ne00%128 == 0) &&
         (
          (
           (

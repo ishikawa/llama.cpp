@@ -10382,6 +10382,135 @@ kernel void kernel_mul_mm(
 
 #endif // GGML_METAL_HAS_TENSOR
 
+[[host_name("kernel_mul_mm_q8_0_f32_n4")]]
+kernel void kernel_mul_mm_q8_0_f32_n4(
+        constant ggml_metal_kargs_mul_mm & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiitg[[thread_index_in_threadgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    (void) sgitg;
+
+    threadgroup half  * sa = (threadgroup half *)(shmem);
+    threadgroup half  * sb = sa + 8*64;
+    threadgroup float * sc = (threadgroup float *)(sb + 4*64);
+
+    constexpr int NR0 = 16;
+    constexpr int NR1 = 4;
+    constexpr int NK  = 32;
+    constexpr int NL0 = NK/16;
+    constexpr int NL1 = NK/8;
+
+    const int im = tgpig.z;
+    const int r0 = tgpig.y*NR0;
+    const int r1 = tgpig.x*NR1;
+
+    const short nr0 = (args.ne0 - r0 < NR0) ? (args.ne0 - r0) : NR0;
+    const short nr1 = (args.ne1 - r1 < NR1) ? (args.ne1 - r1) : NR1;
+
+    const short row_load = (short) tiitg/NL0;
+    const short col_load = (short) tiitg/NL1;
+    const bool  valid_row = row_load < nr0;
+    const bool  valid_col = col_load < nr1;
+    const short lr0 = valid_row ? row_load : 0;
+    const short lr1 = valid_col ? col_load : 0;
+    const short il0 = tiitg % NL0;
+    const short iy  = 8*(tiitg % NL1);
+
+    const int i12 = im % args.ne12;
+    const int i13 = im / args.ne12;
+
+    const uint64_t offset0 = (i12/args.r2)*args.nb02 + (i13/args.r3)*args.nb03;
+
+    simdgroup_half8x8 ma[2];
+    simdgroup_half8x8 mb;
+    simdgroup_float8x8 mc[2];
+
+    for (short i = 0; i < 2; i++) {
+        mc[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
+    }
+
+    for (int loop_k = 0; loop_k < args.ne00; loop_k += NK) {
+        device const block_q8_0 * x = (device const block_q8_0 *)(src0 + args.nb01*(r0 + lr0) + offset0) + loop_k/NK;
+
+        half4x4 temp_a;
+        dequantize_q8_0(x, il0, temp_a);
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        FOR_UNROLL (short i = 0; i < 16; i++) {
+            const short sx = 2*il0 + i/8;
+            const short sy = row_load/8;
+
+            const short lx = row_load%8;
+            const short ly = i%8;
+
+            const short ib = 2*sx + sy;
+
+            *(sa + 64*ib + 8*ly + lx) = valid_row ? temp_a[i/4][i%4] : half(0.0h);
+        }
+
+        device const float * y = (device const float *)(src1
+            + args.nb13*i13
+            + args.nb12*i12
+            + args.nb11*(r1 + lr1)
+            + args.nb10*(loop_k + iy));
+
+        FOR_UNROLL (short i = 0; i < 8; ++i) {
+            const short sx = tiitg%NL1;
+            const short ly = col_load%8;
+
+            *(sb + 64*sx + 8*ly + i) = (valid_col && loop_k + iy + i < args.ne00) ? (half) y[i] : half(0.0h);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup const half * lsma = sa;
+        threadgroup const half * lsmb = sb;
+
+        FOR_UNROLL (short ik = 0; ik < NK/8; ik++) {
+            simdgroup_barrier(mem_flags::mem_none);
+
+            FOR_UNROLL (short i = 0; i < 2; i++) {
+                simdgroup_load(ma[i], lsma + 64*i, 8, 0, false);
+            }
+
+            simdgroup_barrier(mem_flags::mem_none);
+
+            simdgroup_load(mb, lsmb, 8, 0, false);
+
+            simdgroup_barrier(mem_flags::mem_none);
+
+            FOR_UNROLL (short i = 0; i < 2; i++) {
+                simdgroup_multiply_accumulate(mc[i], mb, ma[i], mc[i]);
+            }
+
+            lsma += 2*64;
+            lsmb += 64;
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    FOR_UNROLL (short i = 0; i < 2; i++) {
+        simdgroup_store(mc[i], sc + 8*i, NR0, 0, false);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (short j = 0; j < nr1; j++) {
+        device float * D = (device float *) dst + r0 + (r1 + j)*args.ne0 + im*args.ne1*args.ne0;
+        threadgroup float * C = sc + j*NR0;
+
+        for (short i = tiitg; i < nr0; i += 32) {
+            D[i] = C[i];
+        }
+    }
+}
+
 template<short ne20> // n_expert_used
 kernel void kernel_mul_mm_id_map0(
         constant ggml_metal_kargs_mul_mm_id_map0 & args,

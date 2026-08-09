@@ -1584,12 +1584,15 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext_v
     char base[256];
     char name[256];
 
+    const bool use_mla_v5  = getenv("GGML_METAL_FA_MLA_V5")  != nullptr;
     const bool use_mla_v4c = getenv("GGML_METAL_FA_MLA_V4C") != nullptr;
     const bool use_mla_v4b = getenv("GGML_METAL_FA_MLA_V4B") != nullptr;
     const bool use_mla_v3b = getenv("GGML_METAL_FA_MLA_V3B") != nullptr;
     const bool use_mla_v3a = getenv("GGML_METAL_FA_MLA_V3A") != nullptr;
 
-    if (use_mla_v4c) {
+    if (use_mla_v5) {
+        snprintf(base, 256, "kernel_flash_attn_ext_vec_mla_f16_dk512_dv512_v5");
+    } else if (use_mla_v4c) {
         snprintf(base, 256, "kernel_flash_attn_ext_vec_mla_f16_dk512_dv512_v4c");
     } else if (use_mla_v4b) {
         snprintf(base, 256, "kernel_flash_attn_ext_vec_mla_f16_dk512_dv512_v4b");

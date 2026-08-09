@@ -16,6 +16,9 @@ __embed_ggml-common.h__
 #endif
 
 using namespace metal;
+#ifdef GGML_METAL_HAS_TENSOR
+using namespace mpp::tensor_ops;
+#endif
 
 #define MAX(x, y) ((x) > (y) ? (x) : (y))
 #define MIN(x, y) ((x) < (y) ? (x) : (y))
@@ -8699,6 +8702,248 @@ kernel void kernel_flash_attn_ext_vec_mla_f16_dk512_dv512_v4c(
 
 #undef NWG
 }
+
+#ifdef GGML_METAL_HAS_TENSOR
+kernel void kernel_flash_attn_ext_vec_mla_f16_dk512_dv512_v5(
+        constant ggml_metal_kargs_flash_attn_ext_vec & args,
+        device const char * q,
+        device const char * k,
+        device const char * v,
+        device const char * mask,
+        device       char * htmp,
+        threadgroup  half * shmem_f16 [[threadgroup(0)]],
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]]) {
+#define NWG FC_flash_attn_ext_vec_mla_NWG
+
+    constexpr short DK = 512;
+    constexpr short DV = 512;
+    constexpr short DK4 = DK/4;
+    constexpr short M_CHUNK = 16;
+    constexpr short M_TILE = 8;
+    constexpr short ROWS_PER_SG = 4;
+    constexpr short N_TILE = 32;
+    constexpr short K_STEP = 16;
+    constexpr short OT_CAP = 160;
+    constexpr short NW = N_SIMDWIDTH;
+
+    threadgroup half * sq = shmem_f16 + sgitg*M_TILE*DK;
+    threadgroup half4 * sq4 = (threadgroup half4 *) sq;
+
+    const int qrow0 = tgpig[0]*M_CHUNK;
+    const int q3    = tgpig[1];
+    const int iwg   = tgpig[2];
+    const int nqr   = args.ne01*args.ne02;
+
+    for (int i = tiisg; i < M_TILE*DK4; i += NW) {
+        const int iq = i/DK4;
+        const int id = i - iq*DK4;
+        const int qr = qrow0 + sgitg*ROWS_PER_SG + iq;
+
+        if (iq < ROWS_PER_SG && qr < nqr) {
+            const int q1 = qr%args.ne01;
+            const int q2 = qr/args.ne01;
+            device const float4 * pq4 = (device const float4 *) (q + q1*args.nb01 + q2*args.nb02 + q3*args.nb03);
+            sq4[i] = (half4) pq4[id];
+        } else {
+            sq4[i] = (half4) 0.0h;
+        }
+    }
+
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+
+    const int ikv3 = q3/(args.ne03/args.ne_12_3);
+    device const char * k_base = k + ikv3*args.nb13;
+    device const char * v_base = v + ikv3*args.nb23;
+
+    auto tQ = tensor<threadgroup half, dextents<int32_t, 2>, tensor_inline>(sq, dextents<int32_t, 2>(DK, M_TILE));
+
+    matmul2d<
+        matmul2d_descriptor(M_TILE, N_TILE, K_STEP, false, false, true,
+            matmul2d_descriptor::mode::multiply_accumulate),
+        execution_simdgroup> qk_mm;
+
+    matmul2d<
+        matmul2d_descriptor(M_TILE, DV, N_TILE, false, false, true,
+            matmul2d_descriptor::mode::multiply),
+        execution_simdgroup> pv_mm;
+
+    float acc[OT_CAP];
+    ushort acc_dv[OT_CAP];
+    ushort acc_row[OT_CAP];
+    ushort acc_valid[OT_CAP];
+    float S_row[M_TILE];
+    float M_row[M_TILE];
+    float M_new_row[M_TILE];
+    float alpha_row[M_TILE];
+
+    FOR_UNROLL (short i = 0; i < OT_CAP; ++i) {
+        acc[i] = 0.0f;
+        acc_dv[i] = 0;
+        acc_row[i] = 0;
+        acc_valid[i] = 0;
+    }
+
+    FOR_UNROLL (short i = 0; i < M_TILE; ++i) {
+        S_row[i] = 0.0f;
+        M_row[i] = -FLT_MAX/2;
+        M_new_row[i] = -FLT_MAX/2;
+        alpha_row[i] = 0.0f;
+    }
+
+    for (int ic = iwg*N_TILE; ic + N_TILE <= args.ne11; ic += NWG*N_TILE) {
+        device half * pk = (device half *) (k_base + ic*args.nb11);
+        auto tK = tensor(pk, dextents<int32_t, 2>(N_TILE, DK), array<int, 2>({ args.ns10, 1 }));
+
+        auto mQ0 = tQ.slice(0, 0);
+        auto mK0 = tK.slice(0, 0);
+
+        auto scoreT = qk_mm.get_destination_cooperative_tensor<decltype(mQ0), decltype(mK0), float>();
+        auto rowMaxT = qk_mm.get_row_reduction_destination_cooperative_tensor<decltype(mQ0), decltype(mK0), float>();
+        auto rowSumT = qk_mm.get_row_reduction_destination_cooperative_tensor<decltype(mQ0), decltype(mK0), float>();
+
+        FOR_UNROLL (short k0 = 0; k0 < DK; k0 += K_STEP) {
+            auto mQ = tQ.slice(k0, 0);
+            auto mK = tK.slice(0, k0);
+            qk_mm.run(mQ, mK, scoreT);
+        }
+
+        #pragma clang loop unroll(full)
+        for (uint16_t i = 0; i < scoreT.get_capacity(); ++i) {
+            if (scoreT.is_valid_element(i)) {
+                auto idx = scoreT.get_multidimensional_index(i);
+                const short col = (short) idx[0];
+                const short row = (short) idx[1];
+                const int qr = qrow0 + sgitg*ROWS_PER_SG + row;
+
+                if (row < ROWS_PER_SG && col < N_TILE && qr < nqr) {
+                    const int q1 = qr%args.ne01;
+                    const int q2 = qr/args.ne01;
+                    device const half * pm = (device const half *) (mask + q1*args.nb31 + (q2%args.ne32)*args.nb32 + (q3%args.ne33)*args.nb33);
+                    const float mv = (float) pm[ic + col];
+                    scoreT[i] = mv > -MAXHALF ? fma(scoreT[i], args.scale, mv) : -FLT_MAX/2;
+                } else {
+                    scoreT[i] = -FLT_MAX/2;
+                }
+            }
+        }
+
+        reduce_rows(scoreT, rowMaxT, reduction_operation::max, reduction_operation_identity<float>::max_identity);
+
+        float tileMax[M_TILE];
+        float tileSum[M_TILE];
+
+        FOR_UNROLL (short i = 0; i < M_TILE; ++i) {
+            tileMax[i] = -FLT_MAX/2;
+            tileSum[i] = 0.0f;
+            alpha_row[i] = 0.0f;
+        }
+
+        #pragma clang loop unroll(full)
+        for (uint16_t i = 0; i < rowMaxT.get_capacity(); ++i) {
+            if (rowMaxT.is_valid_element(i)) {
+                auto idx = rowMaxT.get_multidimensional_index(i);
+                const short row = (short) idx[0];
+                if (row < M_TILE) {
+                    tileMax[row] = rowMaxT[i];
+                }
+            }
+        }
+
+        FOR_UNROLL (short row = 0; row < M_TILE; ++row) {
+            const float M_new = max(M_row[row], tileMax[row]);
+            const float alpha = M_row[row] <= -FLT_MAX/4 ? 0.0f : exp(M_row[row] - M_new);
+            M_new_row[row] = M_new;
+            alpha_row[row] = alpha;
+        }
+
+        #pragma clang loop unroll(full)
+        for (uint16_t i = 0; i < scoreT.get_capacity(); ++i) {
+            if (scoreT.is_valid_element(i)) {
+                auto idx = scoreT.get_multidimensional_index(i);
+                const short row = (short) idx[1];
+                if (row < M_TILE) {
+                    scoreT[i] = scoreT[i] <= -FLT_MAX/4 ? 0.0f : exp(scoreT[i] - M_new_row[row]);
+                } else {
+                    scoreT[i] = 0.0f;
+                }
+            }
+        }
+
+        reduce_rows(scoreT, rowSumT, reduction_operation::sum, 0.0f);
+
+        #pragma clang loop unroll(full)
+        for (uint16_t i = 0; i < rowSumT.get_capacity(); ++i) {
+            if (rowSumT.is_valid_element(i)) {
+                auto idx = rowSumT.get_multidimensional_index(i);
+                const short row = (short) idx[0];
+                if (row < M_TILE) {
+                    tileSum[row] = rowSumT[i];
+                }
+            }
+        }
+
+        auto pT = pv_mm.get_left_input_cooperative_tensor<float, half, float>(scoreT);
+        device half * pv = (device half *) (v_base + ic*args.nb21);
+        auto tV = tensor(pv, dextents<int32_t, 2>(DV, N_TILE), array<int, 2>({ 1, args.ns20 }));
+        auto mV = tV.slice(0, 0);
+        auto oT = pv_mm.get_destination_cooperative_tensor<decltype(pT), decltype(mV), float>();
+
+        pv_mm.run(pT, mV, oT);
+
+        #pragma clang loop unroll(full)
+        for (uint16_t i = 0; i < oT.get_capacity(); ++i) {
+            if (i < OT_CAP && oT.is_valid_element(i)) {
+                auto idx = oT.get_multidimensional_index(i);
+                const short dv = (short) idx[0];
+                const short row = (short) idx[1];
+                const int qr = qrow0 + sgitg*ROWS_PER_SG + row;
+
+                if (row < ROWS_PER_SG && dv < DV && qr < nqr) {
+                    acc[i] = acc[i]*alpha_row[row] + oT[i];
+                    acc_dv[i] = (ushort) dv;
+                    acc_row[i] = (ushort) row;
+                    acc_valid[i] = 1;
+                }
+            }
+        }
+
+        FOR_UNROLL (short row = 0; row < M_TILE; ++row) {
+            S_row[row] = S_row[row]*alpha_row[row] + tileSum[row];
+            M_row[row] = M_new_row[row];
+        }
+    }
+
+    #pragma clang loop unroll(full)
+    for (short i = 0; i < OT_CAP; ++i) {
+        if (acc_valid[i]) {
+            const short dv = (short) acc_dv[i];
+            const short row = (short) acc_row[i];
+            const int qr = qrow0 + sgitg*ROWS_PER_SG + row;
+
+            if (row < ROWS_PER_SG && dv < DV && qr < nqr) {
+                const int q1 = qr%args.ne01;
+                const int q2 = qr/args.ne01;
+                const int nrows = args.ne3*args.ne2*args.ne1;
+                const int rid = q3*args.ne2*args.ne1 + q2 + q1*args.ne1;
+
+                device float * htmpf = (device float *) htmp;
+                device float * dsts  = (device float *) htmp + (uint64_t)nrows*DV*NWG;
+
+                htmpf[((uint64_t)rid*(DV/4)*NWG + (dv/4)*NWG + iwg)*4 + (dv & 3)] = acc[i];
+
+                if (dv == 0) {
+                    dsts[rid*(2*NWG) + 2*iwg + 0] = S_row[row];
+                    dsts[rid*(2*NWG) + 2*iwg + 1] = M_row[row];
+                }
+            }
+        }
+    }
+
+#undef NWG
+}
+#endif
 
 kernel void kernel_flash_attn_ext_vec_mla_f16_dk512_dv512_v3b(
         constant ggml_metal_kargs_flash_attn_ext_vec & args,

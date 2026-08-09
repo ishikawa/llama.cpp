@@ -42,6 +42,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 #include <unordered_map>
 
@@ -1094,6 +1095,11 @@ struct csv_printer : public printer {
             "op_params",
             "supported",
             "error_message",
+            "time_us",
+            "flops",
+            "bandwidth_gb_s",
+            "memory_kb",
+            "n_runs",
             "test_mode",
             "backend_reg_name",
             "backend_name",
@@ -4351,6 +4357,23 @@ struct test_mul_mat : public test_case {
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
         return ggml_op_name(GGML_OP_MUL_MAT);
+    }
+};
+
+struct test_mul_mat_named : public test_mul_mat {
+    const std::string name;
+
+    test_mul_mat_named(std::string name,
+            ggml_type type_a = GGML_TYPE_F32, ggml_type type_b = GGML_TYPE_F32,
+            int64_t m = 32, int64_t n = 32, int64_t k = 32,
+            std::array<int64_t, 2> bs = {10, 10},
+            std::array<int64_t, 2> nr = {2, 2},
+            std::array<int64_t, 4> per = {0, 1, 2, 3},
+            int64_t k_v = 0, uint32_t o = 1)
+        : test_mul_mat(type_a, type_b, m, n, k, bs, nr, per, k_v, o), name(std::move(name)) {}
+
+    std::string vars() override {
+        return "name=" + name + "," + test_mul_mat::vars();
     }
 };
 
@@ -9801,6 +9824,30 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    struct dsv4_dense_case {
+        const char * name;
+        ggml_type type;
+        int64_t m;
+        int64_t k;
+        std::array<int64_t, 2> bs;
+    };
+
+    const std::vector<dsv4_dense_case> dsv4_dense_cases = {
+        { "DSV4_MMV_attn_q_b_q8_1024_32768",       GGML_TYPE_Q8_0, 32768, 1024, { 1, 1 } },
+        { "DSV4_MMV_attn_wo_b_q8_8192_4096",       GGML_TYPE_Q8_0,  4096, 8192, { 1, 1 } },
+        { "DSV4_MMV_attn_wo_a_q8_4096_1024_x8",    GGML_TYPE_Q8_0,  1024, 4096, { 8, 1 } },
+        { "DSV4_MMV_attn_kv_q8_4096_512",          GGML_TYPE_Q8_0,   512, 4096, { 1, 1 } },
+        { "DSV4_MMV_shared_up_gate_q6_4096_2048",  GGML_TYPE_Q6_K,  2048, 4096, { 1, 1 } },
+        { "DSV4_MMV_shared_down_q6_2048_4096",     GGML_TYPE_Q6_K,  4096, 2048, { 1, 1 } },
+        { "DSV4_MMV_lm_head_q6_4096_129280",       GGML_TYPE_Q6_K,129280, 4096, { 1, 1 } },
+    };
+
+    for (const dsv4_dense_case & c : dsv4_dense_cases) {
+        for (int64_t n : { 1, 2, 3, 4, 5, 6, 7, 8 }) {
+            test_cases.emplace_back(new test_mul_mat_named(c.name, c.type, GGML_TYPE_F32, c.m, n, c.k, c.bs, { 1, 1 }));
+        }
+    }
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here

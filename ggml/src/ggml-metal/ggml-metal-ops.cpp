@@ -12,6 +12,26 @@
 #include <algorithm>
 #include <limits>
 #include <cmath>
+#include <cstdlib>
+
+static int ggml_metal_getenv_i32(const char * name, int fallback) {
+    const char * value = getenv(name);
+    if (value == nullptr || value[0] == '\0') {
+        return fallback;
+    }
+
+    char * end = nullptr;
+    const long parsed = strtol(value, &end, 10);
+    if (end == value) {
+        return fallback;
+    }
+
+    return (int) parsed;
+}
+
+static bool ggml_metal_getenv_flag(const char * name) {
+    return ggml_metal_getenv_i32(name, 0) != 0;
+}
 
 static ggml_metal_buffer_id ggml_metal_get_buffer_id(const ggml_tensor * t) {
     if (!t) {
@@ -2329,10 +2349,11 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
     // find the break-even point where the matrix-matrix kernel becomes more efficient compared
     // to the matrix-vector kernel
     const int ne11_mm_min = 8;
+    const bool proto_mmv_force_mm = ggml_metal_getenv_flag("GGML_METAL_PROTO_MMV_FORCE_MM");
 
     // first try to use small-batch mat-mv kernels
     // these should be efficient for BS [2, ~8]
-    if (op->src[1]->type == GGML_TYPE_F32 && (ne00%128 == 0) &&
+    if (!proto_mmv_force_mm && op->src[1]->type == GGML_TYPE_F32 && (ne00%128 == 0) &&
         (
          (
           (
@@ -2369,7 +2390,8 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         //       my current hypothesis is that the work grid is not evenly divisible for different nsg
         //       values and there can be some tail effects when nsg is high. need to confirm this
         //
-        const int nsg    = 2;                 // num simdgroups per threadgroup
+        int nsg = 2;                         // num simdgroups per threadgroup
+        nsg = std::clamp(ggml_metal_getenv_i32("GGML_METAL_PROTO_MMV_NSG", nsg), 1, 8);
 
         // num threads along row per simdgroup
         int16_t nxpsg = 0;
@@ -2380,6 +2402,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         } else {
             nxpsg = 4;
         }
+        nxpsg = std::clamp(ggml_metal_getenv_i32("GGML_METAL_PROTO_MMV_NXPSG", nxpsg), 1, 32);
 
         const int16_t nypsg  = 32/nxpsg;          // num threads along col per simdgroup (i.e. a simdgroup processes that many src0 rows at a time)
         const int16_t r0ptg  = nypsg*nsg;         // num src0 rows per threadgroup
@@ -2401,6 +2424,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
             default:
                 GGML_ABORT("unsupported ne11");
         };
+        r1ptg = std::clamp(ggml_metal_getenv_i32("GGML_METAL_PROTO_MMV_R1PTG", r1ptg), 2, 5);
 
         auto pipeline = ggml_metal_library_get_pipeline_mul_mv_ext(lib, op, nsg, nxpsg, r1ptg);
 
@@ -2437,7 +2461,7 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         !ggml_is_transposed(op->src[1]) &&
         // for now the matrix-matrix multiplication kernel only works on A14+/M1+ SoCs
         // AMD GPU and older A-chips will reuse matrix-vector multiplication kernel
-        props_dev->has_simdgroup_mm && ne00 >= 64 && ne11 > ne11_mm_min) {
+        props_dev->has_simdgroup_mm && ne00 >= 64 && (ne11 > ne11_mm_min || proto_mmv_force_mm)) {
         //GGML_LOG_INFO("matrix: ne00 = %6d, ne01 = %6d, ne02 = %6d, ne11 = %6d, ne12 = %6d\n", ne00, ne01, ne02, ne11, ne12);
 
         // some Metal matrix data types require aligned pointers

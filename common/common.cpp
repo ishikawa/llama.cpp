@@ -1561,6 +1561,9 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
         return res;
     }
 
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    common_moe_stats_maybe_init_vocab(vocab);
+
     if (model_only) {
         return res;
     }
@@ -1570,8 +1573,6 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
         COM_ERR("failed to create context with model '%s'\n", params.model.path.c_str());
         return res;
     }
-
-    const llama_vocab * vocab = llama_model_get_vocab(model);
 
     if (params.ctx_shift && !llama_memory_can_shift(llama_get_memory(lctx))) {
         COM_WRN("%s", "KV cache shifting is not supported for this context, disabling KV cache shifting\n");

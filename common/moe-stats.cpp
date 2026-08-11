@@ -4,8 +4,10 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "log.h"
+#include "unicode.h"
 
 #include <algorithm>
+#include <array>
 #include <climits>
 #include <cstdint>
 #include <cstdio>
@@ -36,6 +38,8 @@ struct common_moe_stats_tensor {
     std::vector<uint8_t> data;
 };
 
+static int32_t common_moe_stats_get_i32(const common_moe_stats_tensor & t, int64_t i0, int64_t i1);
+
 struct common_moe_stats_layer_pending {
     bool topk_ready    = false;
     bool weights_ready = false;
@@ -47,6 +51,30 @@ struct common_moe_stats_layer_pending {
 struct common_moe_stats_expert {
     uint64_t count      = 0;
     double   weight_sum = 0.0;
+};
+
+using common_moe_stats_layer_stats   = std::map<int, common_moe_stats_expert>;
+using common_moe_stats_forward_stats = std::map<int, common_moe_stats_layer_stats>;
+
+enum common_moe_stats_token_class : uint8_t {
+    COMMON_MOE_STATS_CLASS_BYTE = 0,
+    COMMON_MOE_STATS_CLASS_DIGIT,
+    COMMON_MOE_STATS_CLASS_CJK,
+    COMMON_MOE_STATS_CLASS_CODE,
+    COMMON_MOE_STATS_CLASS_SPACE,
+    COMMON_MOE_STATS_CLASS_LATIN,
+    COMMON_MOE_STATS_CLASS_OTHER,
+    COMMON_MOE_STATS_CLASS_COUNT,
+};
+
+static const std::array<const char *, COMMON_MOE_STATS_CLASS_COUNT> common_moe_stats_class_names = {
+    "byte",
+    "digit",
+    "cjk",
+    "code",
+    "space",
+    "latin",
+    "other",
 };
 
 static std::string common_moe_stats_json_escape(const std::string & s) {
@@ -78,6 +106,196 @@ static std::string common_moe_stats_json_escape(const std::string & s) {
     return out;
 }
 
+static bool common_moe_stats_parse_utf8(const std::string & s, std::vector<uint32_t> & codepoints) {
+    if (!common_utf8_is_complete(s)) {
+        return false;
+    }
+
+    for (size_t offset = 0; offset < s.size();) {
+        const utf8_parse_result parsed = common_parse_utf8_codepoint(s, offset);
+        if (parsed.status != utf8_parse_result::SUCCESS || parsed.bytes_consumed == 0) {
+            return false;
+        }
+        codepoints.push_back(parsed.codepoint);
+        offset += parsed.bytes_consumed;
+    }
+
+    return true;
+}
+
+static bool common_moe_stats_is_ascii_digit(uint32_t cpt) {
+    return cpt >= '0' && cpt <= '9';
+}
+
+static bool common_moe_stats_is_ascii_alpha(uint32_t cpt) {
+    return (cpt >= 'a' && cpt <= 'z') || (cpt >= 'A' && cpt <= 'Z');
+}
+
+static bool common_moe_stats_is_space(uint32_t cpt) {
+    return cpt == 0x09 || cpt == 0x0a || cpt == 0x0b || cpt == 0x0c || cpt == 0x0d ||
+           cpt == 0x20 || cpt == 0x85 || cpt == 0xa0 || cpt == 0x1680 ||
+           (cpt >= 0x2000 && cpt <= 0x200a) || cpt == 0x2028 || cpt == 0x2029 ||
+           cpt == 0x202f || cpt == 0x205f || cpt == 0x3000;
+}
+
+static bool common_moe_stats_is_cjk(uint32_t cpt) {
+    return (cpt >= 0x3000  && cpt <= 0x303f)  ||
+           (cpt >= 0x3040  && cpt <= 0x30ff)  ||
+           (cpt >= 0x31f0  && cpt <= 0x31ff)  ||
+           (cpt >= 0x3400  && cpt <= 0x4dbf)  ||
+           (cpt >= 0x4e00  && cpt <= 0x9fff)  ||
+           (cpt >= 0xac00  && cpt <= 0xd7af)  ||
+           (cpt >= 0xf900  && cpt <= 0xfaff)  ||
+           (cpt >= 0x20000 && cpt <= 0x2ebef) ||
+           (cpt >= 0x2f800 && cpt <= 0x2fa1f);
+}
+
+static bool common_moe_stats_is_code_symbol(uint32_t cpt) {
+    switch (cpt) {
+        case '(':
+        case ')':
+        case '[':
+        case ']':
+        case '{':
+        case '}':
+        case '<':
+        case '>':
+        case '+':
+        case '-':
+        case '*':
+        case '/':
+        case '%':
+        case '=':
+        case '!':
+        case '&':
+        case '|':
+        case '^':
+        case '~':
+        case '?':
+        case ':':
+        case ';':
+        case '.':
+        case ',':
+        case '#':
+        case '@':
+        case '\\':
+        case '$':
+        case '"':
+        case '\'':
+        case '`':
+            return true;
+        default:
+            return false;
+    }
+}
+
+static bool common_moe_stats_is_digit_piece(const std::vector<uint32_t> & codepoints) {
+    bool has_digit = false;
+
+    for (uint32_t cpt : codepoints) {
+        if (common_moe_stats_is_ascii_digit(cpt)) {
+            has_digit = true;
+            continue;
+        }
+        if (cpt == ',' || cpt == '.') {
+            continue;
+        }
+        return false;
+    }
+
+    return has_digit;
+}
+
+static bool common_moe_stats_is_space_piece(const std::vector<uint32_t> & codepoints) {
+    if (codepoints.empty()) {
+        return false;
+    }
+
+    for (uint32_t cpt : codepoints) {
+        if (!common_moe_stats_is_space(cpt)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static bool common_moe_stats_is_code_piece(const std::vector<uint32_t> & codepoints) {
+    int n_code = 0;
+    int n_text = 0;
+
+    for (uint32_t cpt : codepoints) {
+        if (common_moe_stats_is_space(cpt)) {
+            continue;
+        }
+        if (cpt == '_') {
+            return true;
+        }
+        if (common_moe_stats_is_code_symbol(cpt)) {
+            ++n_code;
+        } else {
+            ++n_text;
+        }
+    }
+
+    return n_code > 0 && n_code >= n_text;
+}
+
+static bool common_moe_stats_is_latin_piece(const std::vector<uint32_t> & codepoints) {
+    int n_alpha = 0;
+    int n_other = 0;
+
+    for (uint32_t cpt : codepoints) {
+        if (common_moe_stats_is_space(cpt)) {
+            continue;
+        }
+        if (common_moe_stats_is_ascii_alpha(cpt)) {
+            ++n_alpha;
+        } else {
+            ++n_other;
+        }
+    }
+
+    return n_alpha > 0 && n_alpha >= n_other;
+}
+
+static common_moe_stats_token_class common_moe_stats_classify_token(const llama_vocab * vocab, llama_token id) {
+    const llama_token_attr attr = llama_vocab_get_attr(vocab, id);
+    if (attr & LLAMA_TOKEN_ATTR_BYTE) {
+        return COMMON_MOE_STATS_CLASS_BYTE;
+    }
+
+    const std::string piece = common_token_to_piece(vocab, id, true);
+    std::vector<uint32_t> codepoints;
+    if (!common_moe_stats_parse_utf8(piece, codepoints)) {
+        return COMMON_MOE_STATS_CLASS_BYTE;
+    }
+
+    if (common_moe_stats_is_digit_piece(codepoints)) {
+        return COMMON_MOE_STATS_CLASS_DIGIT;
+    }
+
+    for (uint32_t cpt : codepoints) {
+        if (common_moe_stats_is_cjk(cpt)) {
+            return COMMON_MOE_STATS_CLASS_CJK;
+        }
+    }
+
+    if (common_moe_stats_is_code_piece(codepoints)) {
+        return COMMON_MOE_STATS_CLASS_CODE;
+    }
+
+    if (common_moe_stats_is_space_piece(codepoints)) {
+        return COMMON_MOE_STATS_CLASS_SPACE;
+    }
+
+    if (common_moe_stats_is_latin_piece(codepoints)) {
+        return COMMON_MOE_STATS_CLASS_LATIN;
+    }
+
+    return COMMON_MOE_STATS_CLASS_OTHER;
+}
+
 class common_moe_stats_collector {
 public:
     void configure(const std::string & output_path, const std::string & model_path) {
@@ -97,7 +315,85 @@ public:
         }
     }
 
-    void add_forward(std::map<int, std::map<int, common_moe_stats_expert>> && forward_stats, uint64_t n_tokens) {
+    void enable() {
+        std::lock_guard<std::mutex> lock(mutex);
+        enabled = true;
+    }
+
+    bool is_enabled() {
+        std::lock_guard<std::mutex> lock(mutex);
+        return enabled;
+    }
+
+    void configure_vocab(const llama_vocab * vocab) {
+        std::lock_guard<std::mutex> lock(mutex);
+
+        if (!enabled || vocab == nullptr || vocab_ready) {
+            return;
+        }
+
+        const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+        token_classes.resize(n_vocab);
+        for (llama_token id = 0; id < n_vocab; ++id) {
+            token_classes[id] = (uint8_t) common_moe_stats_classify_token(vocab, id);
+        }
+
+        vocab_ready = true;
+    }
+
+    bool make_forward_token_classes(
+            const common_moe_stats_tensor & tokens,
+            int64_t n_tokens,
+            std::vector<uint8_t> & forward_token_classes,
+            std::array<uint64_t, COMMON_MOE_STATS_CLASS_COUNT> & forward_class_tokens,
+            bool & warned_bad_tokens) {
+        std::lock_guard<std::mutex> lock(mutex);
+
+        if (!vocab_ready) {
+            return false;
+        }
+
+        // Embedding-only ubatches can leave the token GET_ROWS branch unused. If the
+        // captured leaf does not match the router token axis, keep plain stats only.
+        if (tokens.type != GGML_TYPE_I32 || tokens.ne[0] != n_tokens) {
+            if (!warned_bad_tokens) {
+                warned_bad_tokens = true;
+                LOG_WRN("%s: unexpected inp_tokens tensor type or shape, class stats disabled for this forward\n", __func__);
+            }
+            return false;
+        }
+
+        forward_token_classes.clear();
+        forward_token_classes.reserve(n_tokens);
+        forward_class_tokens.fill(0);
+
+        for (int64_t it = 0; it < n_tokens; ++it) {
+            const int32_t token_id = common_moe_stats_get_i32(tokens, it, 0);
+            if (token_id < 0 || token_id >= (int32_t) token_classes.size()) {
+                forward_token_classes.clear();
+                forward_class_tokens.fill(0);
+                if (!warned_bad_tokens) {
+                    warned_bad_tokens = true;
+                    LOG_WRN("%s: inp_tokens contains token id outside the vocab, class stats disabled for this forward\n", __func__);
+                }
+                return false;
+            }
+
+            const uint8_t token_class = token_classes[token_id];
+            forward_token_classes.push_back(token_class);
+            if (token_class < COMMON_MOE_STATS_CLASS_COUNT) {
+                forward_class_tokens[token_class] += 1;
+            }
+        }
+
+        return true;
+    }
+
+    void add_forward(
+            common_moe_stats_forward_stats && forward_stats,
+            std::array<common_moe_stats_forward_stats, COMMON_MOE_STATS_CLASS_COUNT> && forward_class_stats,
+            const std::array<uint64_t, COMMON_MOE_STATS_CLASS_COUNT> & forward_class_tokens,
+            uint64_t n_tokens) {
         std::lock_guard<std::mutex> lock(mutex);
 
         total_tokens += n_tokens;
@@ -108,6 +404,19 @@ public:
                 auto & dst = layer[expert_it.first];
                 dst.count      += expert_it.second.count;
                 dst.weight_sum += expert_it.second.weight_sum;
+            }
+        }
+
+        for (int ic = 0; ic < COMMON_MOE_STATS_CLASS_COUNT; ++ic) {
+            class_total_tokens[ic] += forward_class_tokens[ic];
+
+            for (const auto & layer_it : forward_class_stats[ic]) {
+                auto & layer = class_stats[ic][layer_it.first];
+                for (const auto & expert_it : layer_it.second) {
+                    auto & dst = layer[expert_it.first];
+                    dst.count      += expert_it.second.count;
+                    dst.weight_sum += expert_it.second.weight_sum;
+                }
             }
         }
     }
@@ -157,6 +466,50 @@ public:
         if (!stats.empty()) {
             out << "\n";
         }
+        out << "  },\n";
+        out << "  \"classes\": {";
+
+        bool first_class = true;
+        for (int ic = 0; ic < COMMON_MOE_STATS_CLASS_COUNT; ++ic) {
+            if (class_total_tokens[ic] == 0 && class_stats[ic].empty()) {
+                continue;
+            }
+
+            out << (first_class ? "\n" : ",\n");
+            first_class = false;
+            out << "    \"" << common_moe_stats_class_names[ic] << "\": {\n";
+            out << "      \"total_tokens\": " << class_total_tokens[ic] << ",\n";
+            out << "      \"layers\": {";
+
+            bool first_layer = true;
+            for (const auto & layer_it : class_stats[ic]) {
+                out << (first_layer ? "\n" : ",\n");
+                first_layer = false;
+                out << "        \"" << layer_it.first << "\": {";
+
+                bool first_expert = true;
+                for (const auto & expert_it : layer_it.second) {
+                    out << (first_expert ? "\n" : ",\n");
+                    first_expert = false;
+                    out << "          \"" << expert_it.first << "\": {\"count\": " << expert_it.second.count << ", \"weight_sum\": " << expert_it.second.weight_sum << "}";
+                }
+
+                if (!layer_it.second.empty()) {
+                    out << "\n";
+                }
+                out << "        }";
+            }
+
+            if (!class_stats[ic].empty()) {
+                out << "\n";
+            }
+            out << "      }\n";
+            out << "    }";
+        }
+
+        if (!first_class) {
+            out << "\n";
+        }
         out << "  }\n";
         out << "}\n";
 
@@ -175,9 +528,14 @@ private:
     std::mutex mutex;
     std::string output_path;
     std::string model_path;
-    std::map<int, std::map<int, common_moe_stats_expert>> stats;
+    common_moe_stats_forward_stats stats;
+    std::array<common_moe_stats_forward_stats, COMMON_MOE_STATS_CLASS_COUNT> class_stats;
+    std::array<uint64_t, COMMON_MOE_STATS_CLASS_COUNT> class_total_tokens = {};
+    std::vector<uint8_t> token_classes;
     uint64_t total_tokens = 0;
     bool warned_multiple_models = false;
+    bool enabled = false;
+    bool vocab_ready = false;
 };
 
 struct common_moe_stats_cb_data {
@@ -186,8 +544,11 @@ struct common_moe_stats_cb_data {
     common_moe_stats_collector & collector;
     std::mutex mutex;
     std::map<int, common_moe_stats_layer_pending> pending;
+    bool tokens_ready = false;
+    common_moe_stats_tensor tokens;
     bool warned_bad_topk    = false;
     bool warned_bad_weights = false;
+    bool warned_bad_tokens  = false;
 };
 
 static common_moe_stats_collector & common_moe_stats_get_collector() {
@@ -231,9 +592,15 @@ static bool common_moe_stats_weights_name(const char * name, int & layer) {
            common_moe_stats_name_layer(name, "ffn_moe_weights_scaled",  layer);
 }
 
-static bool common_moe_stats_wants_tensor(const char * name) {
+static bool common_moe_stats_tokens_embd_name(const char * name) {
+    return std::strcmp(name, "inp_tokens_embd") == 0;
+}
+
+static bool common_moe_stats_wants_tensor(const ggml_tensor * t) {
+    const char * name = t->name;
     int layer;
     return std::strcmp(name, "result_output") == 0 ||
+           (common_moe_stats_tokens_embd_name(name) && (t->flags & GGML_TENSOR_FLAG_COMPUTE)) ||
            common_moe_stats_topk_name(name, layer) ||
            common_moe_stats_weights_name(name, layer);
 }
@@ -285,7 +652,9 @@ static double common_moe_stats_get_float(const common_moe_stats_tensor & t, int6
 
 static bool common_moe_stats_commit_layer(
         const common_moe_stats_layer_pending & pending,
-        std::map<int, common_moe_stats_expert> & layer_stats,
+        common_moe_stats_layer_stats & layer_stats,
+        std::array<common_moe_stats_layer_stats, COMMON_MOE_STATS_CLASS_COUNT> * class_layer_stats,
+        const std::vector<uint8_t> * forward_token_classes,
         bool & warned_bad_topk,
         bool & warned_bad_weights) {
     const common_moe_stats_tensor & topk    = pending.topk;
@@ -334,6 +703,15 @@ static bool common_moe_stats_commit_layer(
             auto & stat = layer_stats[expert];
             stat.count += 1;
             stat.weight_sum += weight;
+
+            if (class_layer_stats != nullptr && forward_token_classes != nullptr) {
+                const uint8_t token_class = (*forward_token_classes)[it];
+                if (token_class < COMMON_MOE_STATS_CLASS_COUNT) {
+                    auto & class_stat = (*class_layer_stats)[token_class][expert];
+                    class_stat.count += 1;
+                    class_stat.weight_sum += weight;
+                }
+            }
         }
     }
 
@@ -341,7 +719,10 @@ static bool common_moe_stats_commit_layer(
 }
 
 static void common_moe_stats_commit_forward(common_moe_stats_cb_data & cb_data) {
-    std::map<int, std::map<int, common_moe_stats_expert>> forward_stats;
+    common_moe_stats_forward_stats forward_stats;
+    std::array<common_moe_stats_forward_stats, COMMON_MOE_STATS_CLASS_COUNT> forward_class_stats;
+    std::array<uint64_t, COMMON_MOE_STATS_CLASS_COUNT> forward_class_tokens = {};
+    std::vector<uint8_t> forward_token_classes;
     uint64_t n_tokens = 0;
 
     {
@@ -354,38 +735,77 @@ static void common_moe_stats_commit_forward(common_moe_stats_cb_data & cb_data) 
             }
 
             n_tokens = std::max<uint64_t>(n_tokens, pending.topk.ne[1] > 0 ? (uint64_t) pending.topk.ne[1] : 0);
+        }
+
+        if (cb_data.tokens_ready && n_tokens > 0) {
+            cb_data.collector.make_forward_token_classes(
+                cb_data.tokens,
+                n_tokens,
+                forward_token_classes,
+                forward_class_tokens,
+                cb_data.warned_bad_tokens);
+        }
+
+        for (const auto & layer_it : cb_data.pending) {
+            const auto & pending = layer_it.second;
+            if (!pending.topk_ready) {
+                continue;
+            }
 
             if (!pending.weights_ready) {
                 continue;
             }
 
-            std::map<int, common_moe_stats_expert> layer_stats;
+            common_moe_stats_layer_stats layer_stats;
+            std::array<common_moe_stats_layer_stats, COMMON_MOE_STATS_CLASS_COUNT> class_layer_stats;
+            const bool has_classes = !forward_token_classes.empty() && (int64_t) forward_token_classes.size() == pending.topk.ne[1];
             if (common_moe_stats_commit_layer(
                 pending,
                 layer_stats,
+                has_classes ? &class_layer_stats : nullptr,
+                has_classes ? &forward_token_classes : nullptr,
                 cb_data.warned_bad_topk,
                 cb_data.warned_bad_weights) && !layer_stats.empty()) {
                 forward_stats[layer_it.first] = std::move(layer_stats);
+                if (has_classes) {
+                    for (int ic = 0; ic < COMMON_MOE_STATS_CLASS_COUNT; ++ic) {
+                        if (!class_layer_stats[ic].empty()) {
+                            forward_class_stats[ic][layer_it.first] = std::move(class_layer_stats[ic]);
+                        }
+                    }
+                }
             }
         }
 
         cb_data.pending.clear();
+        cb_data.tokens_ready = false;
+        cb_data.tokens = common_moe_stats_tensor();
     }
 
     if (!forward_stats.empty() || n_tokens > 0) {
-        cb_data.collector.add_forward(std::move(forward_stats), n_tokens);
+        cb_data.collector.add_forward(std::move(forward_stats), std::move(forward_class_stats), forward_class_tokens, n_tokens);
     }
 }
 
 static bool common_moe_stats_cb_eval(struct ggml_tensor * t, bool ask, void * user_data) {
     if (ask) {
-        return common_moe_stats_wants_tensor(t->name);
+        return common_moe_stats_wants_tensor(t);
     }
 
     auto & cb_data = *(common_moe_stats_cb_data *) user_data;
 
     if (std::strcmp(t->name, "result_output") == 0) {
         common_moe_stats_commit_forward(cb_data);
+        return true;
+    }
+
+    if (common_moe_stats_tokens_embd_name(t->name)) {
+        if (t->src[1] != nullptr) {
+            auto snapshot = common_moe_stats_copy_tensor(t->src[1]);
+            std::lock_guard<std::mutex> lock(cb_data.mutex);
+            cb_data.tokens = std::move(snapshot);
+            cb_data.tokens_ready = true;
+        }
         return true;
     }
 
@@ -522,6 +942,8 @@ void common_moe_stats_maybe_init(common_params & params) {
         return;
     }
 
+    collector.enable();
+
     params.cb_eval           = common_moe_stats_cb_eval;
     params.cb_eval_user_data = new common_moe_stats_cb_data(collector);
 
@@ -529,4 +951,18 @@ void common_moe_stats_maybe_init(common_params & params) {
     // disabled run (cb_eval conflict) does not keep dumping empty stats
     static std::once_flag once;
     std::call_once(once, common_moe_stats_install_dump_handlers);
+}
+
+void common_moe_stats_maybe_init_vocab(const llama_vocab * vocab) {
+    const char * output_path = std::getenv("LLAMA_MOE_STATS");
+    if (output_path == nullptr || output_path[0] == '\0') {
+        return;
+    }
+
+    auto & collector = common_moe_stats_get_collector();
+    if (!collector.is_enabled()) {
+        return;
+    }
+
+    collector.configure_vocab(vocab);
 }

@@ -2289,6 +2289,7 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
         auto & cur = inps[0];
 
         cur = ggml_get_rows(ctx0, tok_embd, inp->tokens);
+        cb(cur, "inp_tokens_embd", -1);
 
         // apply lora for embedding tokens if needed
         for (const auto & lora : *loras) {

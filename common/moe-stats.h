@@ -7,9 +7,14 @@ struct llama_vocab;
 // Hooks the eval callback to accumulate per-(layer, expert) and per-(class, layer, expert)
 // selection counts and gate weight sums, dumped as JSON atexit, on SIGUSR1, and every LLAMA_MOE_STATS_INTERVAL=<seconds>
 // when set (crash insurance for long collection runs; SIGUSR1 and interval dumps are
-// POSIX-only — on Windows only the atexit dump fires). Semantics and caveats:
+// POSIX-only - on Windows only the atexit dump fires). Semantics and caveats:
 //   - the captured gate weight is the last "ffn_moe_weights*" tensor in the graph
 //     (post-normalization/scaling), i.e. the actual mixing weight of the expert output
+//   - top-1 margin stats use the actual selection score space when available
+//     (masked, then biased, then raw probs) plus raw probs for the mixing-space margin
+//   - layers whose experts are selected without argsort over router scores (e.g. the
+//     hash-routed leading layers of deepseek4, selected_experts_in) still get margin
+//     fields, but they are meaningless there (often negative) - filter them downstream
 //   - a forward pass is committed when "result_output" is evaluated; prompt-processing
 //     ubatches without logits do not commit, so the stats lean towards decode tokens
 //   - concurrent slots are not separated (fine with --parallel 1); with -ngl > 0 the

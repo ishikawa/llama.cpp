@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <climits>
 #include <cstdint>
 #include <cstdio>
@@ -41,16 +42,30 @@ struct common_moe_stats_tensor {
 static int32_t common_moe_stats_get_i32(const common_moe_stats_tensor & t, int64_t i0, int64_t i1);
 
 struct common_moe_stats_layer_pending {
-    bool topk_ready    = false;
-    bool weights_ready = false;
+    bool topk_ready         = false;
+    bool weights_ready      = false;
+    bool probs_ready        = false;
+    bool probs_biased_ready = false;
+    bool probs_masked_ready = false;
 
     common_moe_stats_tensor topk;
     common_moe_stats_tensor weights;
+    common_moe_stats_tensor probs;
+    common_moe_stats_tensor probs_biased;
+    common_moe_stats_tensor probs_masked;
 };
 
+static constexpr int COMMON_MOE_STATS_SEL_MARGIN_HIST_BINS = 14;
+
 struct common_moe_stats_expert {
-    uint64_t count      = 0;
-    double   weight_sum = 0.0;
+    uint64_t count                 = 0;
+    uint64_t top1_count            = 0;
+    double   weight_sum            = 0.0;
+    double   sel_margin_sum        = 0.0;
+    double   sel_margin_sumsq      = 0.0;
+    double   mix_margin_sum        = 0.0;
+    double   mix_margin_sumsq      = 0.0;
+    std::array<uint64_t, COMMON_MOE_STATS_SEL_MARGIN_HIST_BINS> sel_margin_hist = {};
 };
 
 using common_moe_stats_layer_stats   = std::map<int, common_moe_stats_expert>;
@@ -76,6 +91,35 @@ static const std::array<const char *, COMMON_MOE_STATS_CLASS_COUNT> common_moe_s
     "latin",
     "other",
 };
+
+static const std::array<double, COMMON_MOE_STATS_SEL_MARGIN_HIST_BINS> common_moe_stats_sel_margin_hist_edges = {
+    0.0, 1e-4, 2e-4, 5e-4, 1e-3, 2e-3, 5e-3, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0,
+};
+
+static void common_moe_stats_add_expert(common_moe_stats_expert & dst, const common_moe_stats_expert & src) {
+    dst.count            += src.count;
+    dst.top1_count       += src.top1_count;
+    dst.weight_sum       += src.weight_sum;
+    dst.sel_margin_sum   += src.sel_margin_sum;
+    dst.sel_margin_sumsq += src.sel_margin_sumsq;
+    dst.mix_margin_sum   += src.mix_margin_sum;
+    dst.mix_margin_sumsq += src.mix_margin_sumsq;
+
+    for (int i = 0; i < COMMON_MOE_STATS_SEL_MARGIN_HIST_BINS; ++i) {
+        dst.sel_margin_hist[i] += src.sel_margin_hist[i];
+    }
+}
+
+static int common_moe_stats_sel_margin_hist_bin(double margin) {
+    int bin = 0;
+    for (int i = 1; i < COMMON_MOE_STATS_SEL_MARGIN_HIST_BINS; ++i) {
+        if (margin < common_moe_stats_sel_margin_hist_edges[i]) {
+            break;
+        }
+        bin = i;
+    }
+    return bin;
+}
 
 static std::string common_moe_stats_json_escape(const std::string & s) {
     std::string out;
@@ -402,8 +446,7 @@ public:
             auto & layer = stats[layer_it.first];
             for (const auto & expert_it : layer_it.second) {
                 auto & dst = layer[expert_it.first];
-                dst.count      += expert_it.second.count;
-                dst.weight_sum += expert_it.second.weight_sum;
+                common_moe_stats_add_expert(dst, expert_it.second);
             }
         }
 
@@ -414,8 +457,7 @@ public:
                 auto & layer = class_stats[ic][layer_it.first];
                 for (const auto & expert_it : layer_it.second) {
                     auto & dst = layer[expert_it.first];
-                    dst.count      += expert_it.second.count;
-                    dst.weight_sum += expert_it.second.weight_sum;
+                    common_moe_stats_add_expert(dst, expert_it.second);
                 }
             }
         }
@@ -442,6 +484,12 @@ public:
         out << "{\n";
         out << "  \"model\": \"" << common_moe_stats_json_escape(model_path) << "\",\n";
         out << "  \"total_tokens\": " << total_tokens << ",\n";
+        // finite lower edges for sel_margin_hist; the last bin has implicit +inf upper edge
+        out << "  \"sel_margin_hist_edges\": [";
+        for (int i = 0; i < COMMON_MOE_STATS_SEL_MARGIN_HIST_BINS; ++i) {
+            out << (i == 0 ? "" : ", ") << common_moe_stats_sel_margin_hist_edges[i];
+        }
+        out << "],\n";
         out << "  \"layers\": {";
 
         bool first_layer = true;
@@ -454,7 +502,20 @@ public:
             for (const auto & expert_it : layer_it.second) {
                 out << (first_expert ? "\n" : ",\n");
                 first_expert = false;
-                out << "      \"" << expert_it.first << "\": {\"count\": " << expert_it.second.count << ", \"weight_sum\": " << expert_it.second.weight_sum << "}";
+                out << "      \"" << expert_it.first << "\": {\"count\": " << expert_it.second.count << ", \"weight_sum\": " << expert_it.second.weight_sum;
+                if (expert_it.second.top1_count > 0) {
+                    out << ", \"top1\": {\"count\": " << expert_it.second.top1_count
+                        << ", \"sel_margin_sum\": " << expert_it.second.sel_margin_sum
+                        << ", \"sel_margin_sumsq\": " << expert_it.second.sel_margin_sumsq
+                        << ", \"mix_margin_sum\": " << expert_it.second.mix_margin_sum
+                        << ", \"mix_margin_sumsq\": " << expert_it.second.mix_margin_sumsq
+                        << ", \"sel_margin_hist\": [";
+                    for (int i = 0; i < COMMON_MOE_STATS_SEL_MARGIN_HIST_BINS; ++i) {
+                        out << (i == 0 ? "" : ", ") << expert_it.second.sel_margin_hist[i];
+                    }
+                    out << "]}";
+                }
+                out << "}";
             }
 
             if (!layer_it.second.empty()) {
@@ -491,7 +552,12 @@ public:
                 for (const auto & expert_it : layer_it.second) {
                     out << (first_expert ? "\n" : ",\n");
                     first_expert = false;
-                    out << "          \"" << expert_it.first << "\": {\"count\": " << expert_it.second.count << ", \"weight_sum\": " << expert_it.second.weight_sum << "}";
+                    out << "          \"" << expert_it.first << "\": {\"count\": " << expert_it.second.count << ", \"weight_sum\": " << expert_it.second.weight_sum;
+                    if (expert_it.second.top1_count > 0) {
+                        out << ", \"top1_count\": " << expert_it.second.top1_count;
+                        out << ", \"top1_sel_margin_sum\": " << expert_it.second.sel_margin_sum;
+                    }
+                    out << "}";
                 }
 
                 if (!layer_it.second.empty()) {
@@ -549,6 +615,7 @@ struct common_moe_stats_cb_data {
     bool warned_bad_topk    = false;
     bool warned_bad_weights = false;
     bool warned_bad_tokens  = false;
+    bool warned_bad_probs   = false;
 };
 
 static common_moe_stats_collector & common_moe_stats_get_collector() {
@@ -592,6 +659,12 @@ static bool common_moe_stats_weights_name(const char * name, int & layer) {
            common_moe_stats_name_layer(name, "ffn_moe_weights_scaled",  layer);
 }
 
+static bool common_moe_stats_probs_name(const char * name, int & layer) {
+    return common_moe_stats_name_layer(name, "ffn_moe_probs",        layer) ||
+           common_moe_stats_name_layer(name, "ffn_moe_probs_biased", layer) ||
+           common_moe_stats_name_layer(name, "ffn_moe_probs_masked", layer);
+}
+
 static bool common_moe_stats_tokens_probe_name(const char * name) {
     return std::strcmp(name, "inp_tokens_probe") == 0;
 }
@@ -602,7 +675,8 @@ static bool common_moe_stats_wants_tensor(const ggml_tensor * t) {
     return std::strcmp(name, "result_output") == 0 ||
            (common_moe_stats_tokens_probe_name(name) && (t->flags & GGML_TENSOR_FLAG_COMPUTE)) ||
            common_moe_stats_topk_name(name, layer) ||
-           common_moe_stats_weights_name(name, layer);
+           common_moe_stats_weights_name(name, layer) ||
+           common_moe_stats_probs_name(name, layer);
 }
 
 static common_moe_stats_tensor common_moe_stats_copy_tensor(const ggml_tensor * t) {
@@ -650,13 +724,53 @@ static double common_moe_stats_get_float(const common_moe_stats_tensor & t, int6
     }
 }
 
+static bool common_moe_stats_is_float_type(ggml_type type) {
+    return type == GGML_TYPE_F32 || type == GGML_TYPE_F16 || type == GGML_TYPE_BF16;
+}
+
+static bool common_moe_stats_probs_ok(const common_moe_stats_tensor & t, int64_t n_tokens) {
+    return common_moe_stats_is_float_type(t.type) && t.ne[0] > 1 && t.ne[1] == n_tokens;
+}
+
+static bool common_moe_stats_topk_ids_ok(
+        const common_moe_stats_tensor & topk,
+        int64_t n_expert_probs,
+        int64_t n_expert_sel) {
+    for (int64_t it = 0; it < topk.ne[1]; ++it) {
+        for (int64_t ie = 0; ie < topk.ne[0]; ++ie) {
+            const int32_t expert = common_moe_stats_get_i32(topk, ie, it);
+            if (expert >= n_expert_probs || expert >= n_expert_sel) {
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
+static double common_moe_stats_max_other(
+        const common_moe_stats_tensor & scores,
+        int64_t n_expert,
+        int64_t expert,
+        int64_t token) {
+    double max_score = -std::numeric_limits<double>::infinity();
+    for (int64_t other = 0; other < n_expert; ++other) {
+        if (other == expert) {
+            continue;
+        }
+        max_score = std::max(max_score, common_moe_stats_get_float(scores, other, token, 0));
+    }
+    return max_score;
+}
+
 static bool common_moe_stats_commit_layer(
         const common_moe_stats_layer_pending & pending,
         common_moe_stats_layer_stats & layer_stats,
         std::array<common_moe_stats_layer_stats, COMMON_MOE_STATS_CLASS_COUNT> * class_layer_stats,
         const std::vector<uint8_t> * forward_token_classes,
         bool & warned_bad_topk,
-        bool & warned_bad_weights) {
+        bool & warned_bad_weights,
+        bool & warned_bad_probs) {
     const common_moe_stats_tensor & topk    = pending.topk;
     const common_moe_stats_tensor & weights = pending.weights;
 
@@ -689,7 +803,75 @@ static bool common_moe_stats_commit_layer(
         return false;
     }
 
+    const common_moe_stats_tensor * sel = nullptr;
+    if (pending.probs_masked_ready) {
+        sel = &pending.probs_masked;
+    } else if (pending.probs_biased_ready) {
+        sel = &pending.probs_biased;
+    } else if (pending.probs_ready) {
+        sel = &pending.probs;
+    }
+
+    bool margins_ready = false;
+    if (!pending.probs_ready) {
+        if (!warned_bad_probs) {
+            warned_bad_probs = true;
+            LOG_WRN("%s: ffn_moe_probs tensor not captured, top1 margin stats disabled for this layer\n", __func__);
+        }
+    } else {
+        bool probs_ok = common_moe_stats_probs_ok(pending.probs, n_tokens);
+        if (pending.probs_biased_ready) {
+            probs_ok = probs_ok && common_moe_stats_probs_ok(pending.probs_biased, n_tokens) && pending.probs_biased.ne[0] == pending.probs.ne[0];
+        }
+        if (pending.probs_masked_ready) {
+            probs_ok = probs_ok && common_moe_stats_probs_ok(pending.probs_masked, n_tokens) && pending.probs_masked.ne[0] == pending.probs.ne[0];
+        }
+
+        if (sel == nullptr || !probs_ok) {
+            if (!warned_bad_probs) {
+                warned_bad_probs = true;
+                LOG_WRN("%s: unexpected ffn_moe_probs tensor type or shape, top1 margin stats disabled for this layer\n", __func__);
+            }
+        } else if (!common_moe_stats_topk_ids_ok(topk, pending.probs.ne[0], sel->ne[0])) {
+            if (!warned_bad_probs) {
+                warned_bad_probs = true;
+                LOG_WRN("%s: ffn_moe_topk contains expert id outside ffn_moe_probs, top1 margin stats disabled for this layer\n", __func__);
+            }
+        } else {
+            margins_ready = true;
+        }
+    }
+
     for (int64_t it = 0; it < n_tokens; ++it) {
+        if (margins_ready) {
+            const int32_t top1_expert = common_moe_stats_get_i32(topk, 0, it);
+            if (top1_expert >= 0) {
+                const double sel_score  = common_moe_stats_get_float(*sel, top1_expert, it, 0);
+                const double mix_score  = common_moe_stats_get_float(pending.probs, top1_expert, it, 0);
+                const double sel_margin = sel_score - common_moe_stats_max_other(*sel, sel->ne[0], top1_expert, it);
+                const double mix_margin = mix_score - common_moe_stats_max_other(pending.probs, pending.probs.ne[0], top1_expert, it);
+
+                if (std::isfinite(sel_margin) && std::isfinite(mix_margin)) {
+                    auto & top1_stat = layer_stats[top1_expert];
+                    top1_stat.top1_count += 1;
+                    top1_stat.sel_margin_sum += sel_margin;
+                    top1_stat.sel_margin_sumsq += sel_margin*sel_margin;
+                    top1_stat.mix_margin_sum += mix_margin;
+                    top1_stat.mix_margin_sumsq += mix_margin*mix_margin;
+                    top1_stat.sel_margin_hist[common_moe_stats_sel_margin_hist_bin(sel_margin)] += 1;
+
+                    if (class_layer_stats != nullptr && forward_token_classes != nullptr) {
+                        const uint8_t token_class = (*forward_token_classes)[it];
+                        if (token_class < COMMON_MOE_STATS_CLASS_COUNT) {
+                            auto & class_stat = (*class_layer_stats)[token_class][top1_expert];
+                            class_stat.top1_count += 1;
+                            class_stat.sel_margin_sum += sel_margin;
+                        }
+                    }
+                }
+            }
+        }
+
         for (int64_t ie = 0; ie < n_expert_used; ++ie) {
             const int32_t expert = common_moe_stats_get_i32(topk, ie, it);
             if (expert < 0) {
@@ -765,7 +947,8 @@ static void common_moe_stats_commit_forward(common_moe_stats_cb_data & cb_data) 
                 has_classes ? &class_layer_stats : nullptr,
                 has_classes ? &forward_token_classes : nullptr,
                 cb_data.warned_bad_topk,
-                cb_data.warned_bad_weights) && !layer_stats.empty()) {
+                cb_data.warned_bad_weights,
+                cb_data.warned_bad_probs) && !layer_stats.empty()) {
                 forward_stats[layer_it.first] = std::move(layer_stats);
                 if (has_classes) {
                     for (int ic = 0; ic < COMMON_MOE_STATS_CLASS_COUNT; ++ic) {
@@ -823,6 +1006,33 @@ static bool common_moe_stats_cb_eval(struct ggml_tensor * t, bool ask, void * us
         auto & pending = cb_data.pending[layer];
         pending.weights = std::move(snapshot);
         pending.weights_ready = true;
+        return true;
+    }
+
+    if (common_moe_stats_name_layer(t->name, "ffn_moe_probs_masked", layer)) {
+        auto snapshot = common_moe_stats_copy_tensor(t);
+        std::lock_guard<std::mutex> lock(cb_data.mutex);
+        auto & pending = cb_data.pending[layer];
+        pending.probs_masked = std::move(snapshot);
+        pending.probs_masked_ready = true;
+        return true;
+    }
+
+    if (common_moe_stats_name_layer(t->name, "ffn_moe_probs_biased", layer)) {
+        auto snapshot = common_moe_stats_copy_tensor(t);
+        std::lock_guard<std::mutex> lock(cb_data.mutex);
+        auto & pending = cb_data.pending[layer];
+        pending.probs_biased = std::move(snapshot);
+        pending.probs_biased_ready = true;
+        return true;
+    }
+
+    if (common_moe_stats_name_layer(t->name, "ffn_moe_probs", layer)) {
+        auto snapshot = common_moe_stats_copy_tensor(t);
+        std::lock_guard<std::mutex> lock(cb_data.mutex);
+        auto & pending = cb_data.pending[layer];
+        pending.probs = std::move(snapshot);
+        pending.probs_ready = true;
         return true;
     }
 

@@ -13,8 +13,13 @@ struct llama_vocab;
 //   - top-1 margin stats use the actual selection score space when available
 //     (masked, then biased, then raw probs) plus raw probs for the mixing-space margin
 //   - LLAMA_MOE_STATS_RAW=<path> also appends per-token raw router scores for
-//     knockout replay; dumps are large (layers x tokens x n_expert x 4B), so use
-//     them only with small calibration text
+//     knockout replay; dumps are large ((1 + has_sel) x layers x tokens x n_expert
+//     x 4B, i.e. doubled when a separate selection tensor exists), so use them only
+//     with small calibration text; records are native-endian and flushed per record,
+//     so a crash loses at most the record being written
+//   - LLAMA4 assigns raw logits as the selection scores without a cb() name, so its
+//     margins fall back to the probs space (ranking is unaffected, absolute
+//     sel_margin values are not logit-space differences)
 //   - layers whose experts are selected without argsort over router scores (e.g. the
 //     hash-routed leading layers of deepseek4, selected_experts_in) still get margin
 //     fields, but they are meaningless there (often negative) - filter them downstream

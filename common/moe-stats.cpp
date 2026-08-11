@@ -805,6 +805,11 @@ public:
         if (!disabled && sel != nullptr) {
             write_scores(*sel, n_expert, n_tokens);
         }
+
+        // flush per record so a crash loses at most the record being written
+        if (!disabled && file != nullptr) {
+            std::fflush(file);
+        }
     }
 
 private:

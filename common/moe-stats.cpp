@@ -592,15 +592,15 @@ static bool common_moe_stats_weights_name(const char * name, int & layer) {
            common_moe_stats_name_layer(name, "ffn_moe_weights_scaled",  layer);
 }
 
-static bool common_moe_stats_tokens_embd_name(const char * name) {
-    return std::strcmp(name, "inp_tokens_embd") == 0;
+static bool common_moe_stats_tokens_probe_name(const char * name) {
+    return std::strcmp(name, "inp_tokens_probe") == 0;
 }
 
 static bool common_moe_stats_wants_tensor(const ggml_tensor * t) {
     const char * name = t->name;
     int layer;
     return std::strcmp(name, "result_output") == 0 ||
-           (common_moe_stats_tokens_embd_name(name) && (t->flags & GGML_TENSOR_FLAG_COMPUTE)) ||
+           (common_moe_stats_tokens_probe_name(name) && (t->flags & GGML_TENSOR_FLAG_COMPUTE)) ||
            common_moe_stats_topk_name(name, layer) ||
            common_moe_stats_weights_name(name, layer);
 }
@@ -799,13 +799,11 @@ static bool common_moe_stats_cb_eval(struct ggml_tensor * t, bool ask, void * us
         return true;
     }
 
-    if (common_moe_stats_tokens_embd_name(t->name)) {
-        if (t->src[1] != nullptr) {
-            auto snapshot = common_moe_stats_copy_tensor(t->src[1]);
-            std::lock_guard<std::mutex> lock(cb_data.mutex);
-            cb_data.tokens = std::move(snapshot);
-            cb_data.tokens_ready = true;
-        }
+    if (common_moe_stats_tokens_probe_name(t->name)) {
+        auto snapshot = common_moe_stats_copy_tensor(t);
+        std::lock_guard<std::mutex> lock(cb_data.mutex);
+        cb_data.tokens = std::move(snapshot);
+        cb_data.tokens_ready = true;
         return true;
     }
 

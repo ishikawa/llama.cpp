@@ -2276,6 +2276,13 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
     ggml_set_input(inp->tokens);
     res->t_inp_tokens = inp->tokens;
 
+    if (ubatch.token) {
+        // Use a view node because cb_eval sees graph nodes, not leaf inputs; a later "embd" name can overwrite GET_ROWS.
+        ggml_tensor * inp_tokens_probe = ggml_view_1d(ctx0, inp->tokens, ubatch.n_tokens, 0);
+        cb(inp_tokens_probe, "inp_tokens_probe", -1);
+        ggml_build_forward_expand(gf, inp_tokens_probe);
+    }
+
     inp->embd = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_embd_inp, ubatch.n_tokens);
     cb(inp->embd, "inp_embd", -1);
     ggml_set_input(inp->embd);
@@ -2289,7 +2296,6 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
         auto & cur = inps[0];
 
         cur = ggml_get_rows(ctx0, tok_embd, inp->tokens);
-        cb(cur, "inp_tokens_embd", -1);
 
         // apply lora for embedding tokens if needed
         for (const auto & lora : *loras) {

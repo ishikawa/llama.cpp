@@ -10,6 +10,7 @@
 #include <array>
 #include <cmath>
 #include <climits>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -25,7 +26,6 @@
 #include <vector>
 
 #if !defined(_WIN32)
-#include <cerrno>
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
@@ -40,6 +40,7 @@ struct common_moe_stats_tensor {
 };
 
 static int32_t common_moe_stats_get_i32(const common_moe_stats_tensor & t, int64_t i0, int64_t i1);
+static double common_moe_stats_get_float(const common_moe_stats_tensor & t, int64_t i0, int64_t i1, int64_t i2);
 
 struct common_moe_stats_layer_pending {
     bool topk_ready         = false;
@@ -728,6 +729,160 @@ static bool common_moe_stats_is_float_type(ggml_type type) {
     return type == GGML_TYPE_F32 || type == GGML_TYPE_F16 || type == GGML_TYPE_BF16;
 }
 
+// Raw record format:
+// u32 magic; i32 layer, n_tokens, n_expert, n_topk, has_sel; i32 token_ids[n_tokens]; i32 topk_ids[token][slot]; f32 probs[token][expert]; optional f32 sel[token][expert].
+class common_moe_stats_raw_writer {
+public:
+    void configure(const char * raw_path) {
+        std::lock_guard<std::mutex> lock(mutex);
+
+        if (raw_path == nullptr || raw_path[0] == '\0') {
+            return;
+        }
+
+        if (output_path.empty()) {
+            output_path = raw_path;
+        } else if (output_path != raw_path) {
+            LOG_WRN("%s: LLAMA_MOE_STATS_RAW changed from '%s' to '%s', keeping first path\n", __func__, output_path.c_str(), raw_path);
+        }
+    }
+
+    void write_record(int layer, const common_moe_stats_layer_pending & pending, const common_moe_stats_tensor * tokens) {
+        std::lock_guard<std::mutex> lock(mutex);
+
+        if (output_path.empty() || disabled) {
+            return;
+        }
+
+        if (!open_file()) {
+            return;
+        }
+
+        const common_moe_stats_tensor * sel = nullptr;
+        if (pending.probs_masked_ready) {
+            sel = &pending.probs_masked;
+        } else if (pending.probs_biased_ready) {
+            sel = &pending.probs_biased;
+        }
+
+        const uint32_t magic    = 0x4D4F4552;
+        const int32_t i_layer   = (int32_t) layer;
+        const int32_t n_tokens  = (int32_t) pending.topk.ne[1];
+        const int32_t n_expert  = (int32_t) pending.probs.ne[0];
+        const int32_t n_topk    = (int32_t) pending.topk.ne[0];
+        const int32_t has_sel   = sel != nullptr ? 1 : 0;
+
+        if (!write_value(magic) ||
+            !write_value(i_layer) ||
+            !write_value(n_tokens) ||
+            !write_value(n_expert) ||
+            !write_value(n_topk) ||
+            !write_value(has_sel)) {
+            return;
+        }
+
+        std::vector<int32_t> token_ids(n_tokens, -1);
+        if (tokens != nullptr && tokens->type == GGML_TYPE_I32 && tokens->ne[0] == n_tokens) {
+            for (int32_t it = 0; it < n_tokens; ++it) {
+                token_ids[it] = common_moe_stats_get_i32(*tokens, it, 0);
+            }
+        }
+        if (!write_vector(token_ids)) {
+            return;
+        }
+
+        std::vector<int32_t> topk_row(n_topk);
+        for (int32_t it = 0; it < n_tokens; ++it) {
+            for (int32_t ik = 0; ik < n_topk; ++ik) {
+                topk_row[ik] = common_moe_stats_get_i32(pending.topk, ik, it);
+            }
+            if (!write_vector(topk_row)) {
+                return;
+            }
+        }
+
+        write_scores(pending.probs, n_expert, n_tokens);
+        if (!disabled && sel != nullptr) {
+            write_scores(*sel, n_expert, n_tokens);
+        }
+    }
+
+private:
+    bool open_file() {
+        if (file != nullptr) {
+            return true;
+        }
+
+        file = std::fopen(output_path.c_str(), "ab");
+        if (file == nullptr) {
+            if (!warned_open_failed) {
+                warned_open_failed = true;
+                LOG_WRN("%s: failed to open LLAMA_MOE_STATS_RAW '%s': %s\n", __func__, output_path.c_str(), std::strerror(errno));
+            }
+            disabled = true;
+            return false;
+        }
+
+        return true;
+    }
+
+    bool write_bytes(const void * data, size_t size, size_t count) {
+        if (count == 0) {
+            return true;
+        }
+
+        if (std::fwrite(data, size, count, file) == count) {
+            return true;
+        }
+
+        if (!warned_write_failed) {
+            warned_write_failed = true;
+            LOG_WRN("%s: failed to write LLAMA_MOE_STATS_RAW '%s'\n", __func__, output_path.c_str());
+        }
+
+        if (file != nullptr) {
+            std::fclose(file);
+            file = nullptr;
+        }
+        disabled = true;
+        return false;
+    }
+
+    template <typename T>
+    bool write_value(const T & value) {
+        return write_bytes(&value, sizeof(value), 1);
+    }
+
+    template <typename T>
+    bool write_vector(const std::vector<T> & values) {
+        return write_bytes(values.data(), sizeof(T), values.size());
+    }
+
+    void write_scores(const common_moe_stats_tensor & scores, int32_t n_expert, int32_t n_tokens) {
+        std::vector<float> row(n_expert);
+        for (int32_t it = 0; it < n_tokens; ++it) {
+            for (int32_t ie = 0; ie < n_expert; ++ie) {
+                row[ie] = (float) common_moe_stats_get_float(scores, ie, it, 0);
+            }
+            if (!write_vector(row)) {
+                return;
+            }
+        }
+    }
+
+    std::mutex mutex;
+    std::string output_path;
+    std::FILE * file = nullptr;
+    bool warned_open_failed = false;
+    bool warned_write_failed = false;
+    bool disabled = false;
+};
+
+static common_moe_stats_raw_writer & common_moe_stats_get_raw_writer() {
+    static common_moe_stats_raw_writer * writer = new common_moe_stats_raw_writer();
+    return *writer;
+}
+
 static bool common_moe_stats_probs_ok(const common_moe_stats_tensor & t, int64_t n_tokens) {
     return common_moe_stats_is_float_type(t.type) && t.ne[0] > 1 && t.ne[1] == n_tokens;
 }
@@ -764,10 +919,12 @@ static double common_moe_stats_max_other(
 }
 
 static bool common_moe_stats_commit_layer(
+        int layer,
         const common_moe_stats_layer_pending & pending,
         common_moe_stats_layer_stats & layer_stats,
         std::array<common_moe_stats_layer_stats, COMMON_MOE_STATS_CLASS_COUNT> * class_layer_stats,
         const std::vector<uint8_t> * forward_token_classes,
+        const common_moe_stats_tensor * tokens,
         bool & warned_bad_topk,
         bool & warned_bad_weights,
         bool & warned_bad_probs) {
@@ -839,6 +996,7 @@ static bool common_moe_stats_commit_layer(
             }
         } else {
             margins_ready = true;
+            common_moe_stats_get_raw_writer().write_record(layer, pending, tokens);
         }
     }
 
@@ -942,10 +1100,12 @@ static void common_moe_stats_commit_forward(common_moe_stats_cb_data & cb_data) 
             std::array<common_moe_stats_layer_stats, COMMON_MOE_STATS_CLASS_COUNT> class_layer_stats;
             const bool has_classes = !forward_token_classes.empty() && (int64_t) forward_token_classes.size() == pending.topk.ne[1];
             if (common_moe_stats_commit_layer(
+                layer_it.first,
                 pending,
                 layer_stats,
                 has_classes ? &class_layer_stats : nullptr,
                 has_classes ? &forward_token_classes : nullptr,
+                cb_data.tokens_ready ? &cb_data.tokens : nullptr,
                 cb_data.warned_bad_topk,
                 cb_data.warned_bad_weights,
                 cb_data.warned_bad_probs) && !layer_stats.empty()) {
@@ -1140,6 +1300,7 @@ void common_moe_stats_maybe_init(common_params & params) {
 
     auto & collector = common_moe_stats_get_collector();
     collector.configure(output_path, params.model.path);
+    common_moe_stats_get_raw_writer().configure(std::getenv("LLAMA_MOE_STATS_RAW"));
 
     if (params.cb_eval == common_moe_stats_cb_eval && params.cb_eval_user_data != nullptr) {
         return;

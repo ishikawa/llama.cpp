@@ -12,6 +12,9 @@ struct llama_vocab;
 //     (post-normalization/scaling), i.e. the actual mixing weight of the expert output
 //   - top-1 margin stats use the actual selection score space when available
 //     (masked, then biased, then raw probs) plus raw probs for the mixing-space margin
+//   - LLAMA_MOE_STATS_RAW=<path> also appends per-token raw router scores for
+//     knockout replay; dumps are large (layers x tokens x n_expert x 4B), so use
+//     them only with small calibration text
 //   - layers whose experts are selected without argsort over router scores (e.g. the
 //     hash-routed leading layers of deepseek4, selected_experts_in) still get margin
 //     fields, but they are meaningless there (often negative) - filter them downstream

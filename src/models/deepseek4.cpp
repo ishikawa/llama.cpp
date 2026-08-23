@@ -16,6 +16,10 @@ static float dsv4_rope_attn_factor(float freq_scale, float ext_factor) {
     return 1.0f / (1.0f + 0.1f*logf(1.0f/freq_scale));
 }
 
+static int64_t dsv4_n_expert_layer(const llama_hparams & hparams, int il) {
+    return (uint32_t) il < hparams.dsv4_hash_layer_count ? hparams.dsv4_hash_layer_expert_count : hparams.n_expert;
+}
+
 void llama_model_deepseek4::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS, hparams.n_layer_nextn, false);
     if (hparams.n_layer_nextn > 0 && hparams.n_layer_nextn < hparams.n_layer_all) {
@@ -51,6 +55,11 @@ void llama_model_deepseek4::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS, hparams.dsv4_hc_sinkhorn_iters);
     ml.get_key(LLM_KV_HYPER_CONNECTION_EPSILON,             hparams.dsv4_hc_eps);
     ml.get_key(LLM_KV_HASH_LAYER_COUNT,                     hparams.dsv4_hash_layer_count);
+    ml.get_key(LLM_KV_HASH_LAYER_EXPERT_COUNT,              hparams.dsv4_hash_layer_expert_count, false);
+    if (hparams.dsv4_hash_layer_expert_count == 0) {
+        hparams.dsv4_hash_layer_expert_count = hparams.n_expert;
+    }
+    GGML_ASSERT(hparams.dsv4_hash_layer_expert_count <= LLAMA_MAX_EXPERTS);
 
     hparams.n_embd_out_impl = hparams.dsv4_hc_mult * hparams.n_embd;
 
@@ -108,6 +117,7 @@ void llama_model_deepseek4::load_arch_tensors(llama_model_loader & ml) {
     for (int i = 0; i < n_layer_all; ++i) {
         auto & layer = layers[i];
         const int flags = i < n_layer ? trunk_flags : mtp_flags;
+        const int64_t n_expert_layer = dsv4_n_expert_layer(hparams, i);
 
         layer.attn_norm     = create_tensor(tn(LLM_TENSOR_ATTN_NORM,     "weight", i), {n_embd}, flags);
         layer.attn_sinks    = create_tensor(tn(LLM_TENSOR_ATTN_SINKS,    "weight", i), {n_head}, flags);
@@ -152,17 +162,29 @@ void llama_model_deepseek4::load_arch_tensors(llama_model_loader & ml) {
             }
         }
 
-        layer.ffn_gate_inp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP, "weight", i), {n_embd, n_expert}, flags);
+        layer.ffn_gate_inp = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP, "weight", i), {n_embd, n_expert_layer}, flags);
         if ((uint32_t) i < hparams.dsv4_hash_layer_count) {
-            layer.ffn_gate_tid2eid = create_tensor(tn(LLM_TENSOR_FFN_GATE_TID2EID, "weight", i), {n_expert_used, n_vocab}, flags);
+            // the hash-routing table width is baked into the GGUF and must not follow an
+            // expert_used_count KV override (the routed layers can run with fewer experts,
+            // the hash layers cannot)
+            const ggml_tensor * tid2eid_meta = ml.get_tensor_meta(tn(LLM_TENSOR_FFN_GATE_TID2EID, "weight", i).str().c_str());
+            if (tid2eid_meta == nullptr) {
+                // metadata-only load paths (llama_model_init_from_user) have no weights map;
+                // fall back to n_expert_used, which then must not be overridden
+                LLAMA_LOG_WARN("%s: cannot read the width of %s, assuming expert_used_count (%lld) is not overridden\n",
+                        __func__, tn(LLM_TENSOR_FFN_GATE_TID2EID, "weight", i).str().c_str(), (long long) n_expert_used);
+            }
+            const int64_t n_hash_used = tid2eid_meta ? tid2eid_meta->ne[0] : n_expert_used;
+            layer.ffn_gate_tid2eid = create_tensor(tn(LLM_TENSOR_FFN_GATE_TID2EID, "weight", i), {n_hash_used, n_vocab}, flags);
+            layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias", i), {n_expert_layer}, TENSOR_NOT_REQUIRED | flags);
         } else {
-            layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias", i), {n_expert}, flags);
+            layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias", i), {n_expert_layer}, flags);
         }
         layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, flags);
 
-        layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd,   n_ff_exp, n_expert}, flags);
-        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp, n_embd,   n_expert}, flags);
-        layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd,   n_ff_exp, n_expert}, flags);
+        layer.ffn_gate_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_EXPS, "weight", i), {n_embd,   n_ff_exp, n_expert_layer}, flags);
+        layer.ffn_down_exps = create_tensor(tn(LLM_TENSOR_FFN_DOWN_EXPS, "weight", i), {n_ff_exp, n_embd,   n_expert_layer}, flags);
+        layer.ffn_up_exps   = create_tensor(tn(LLM_TENSOR_FFN_UP_EXPS,   "weight", i), {n_embd,   n_ff_exp, n_expert_layer}, flags);
 
         layer.ffn_gate_shexp = create_tensor(tn(LLM_TENSOR_FFN_GATE_SHEXP, "weight", i), {n_embd,                     n_ff_exp * n_expert_shared}, flags);
         layer.ffn_down_shexp = create_tensor(tn(LLM_TENSOR_FFN_DOWN_SHEXP, "weight", i), {n_ff_exp * n_expert_shared, n_embd                    }, flags);
@@ -1276,9 +1298,14 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
         const auto & layer = model.layers[il];
         ggml_tensor * selected_experts = nullptr;
         ggml_tensor * exp_probs_b = layer.ffn_exp_probs_b;
+        const int64_t n_expert_layer = dsv4_n_expert_layer(hparams, il);
+        int64_t n_expert_used_layer = hparams.n_expert_used;
         if ((uint32_t) il < hparams.dsv4_hash_layer_count) {
             selected_experts = ggml_get_rows(ctx0, layer.ffn_gate_tid2eid, res->t_inp_tokens);
             exp_probs_b = nullptr;
+            // hash layers always use the table's expert count, even when
+            // expert_used_count is overridden for the routed layers
+            n_expert_used_layer = layer.ffn_gate_tid2eid->ne[0];
         }
 
         ggml_tensor * moe_out = build_moe_ffn(cur,
@@ -1287,7 +1314,7 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                 layer.ffn_gate_exps,
                 layer.ffn_down_exps,
                 exp_probs_b,
-                n_expert, hparams.n_expert_used,
+                n_expert_layer, n_expert_used_layer,
                 LLM_FFN_SILU, hparams.expert_weights_norm,
                 hparams.expert_weights_scale,
                 (llama_expert_gating_func_type) hparams.expert_gating_func,

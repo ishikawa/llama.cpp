@@ -281,7 +281,7 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
 
         // the head's own output mixer, mirroring the trunk's hc_head_*: it collapses the
         // hc streams and stands in for the output norm, of which qwen4exp has none
-        layer.nextn.hc_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_NORM, "weight", il), { hc_dim }, flags);
+        layer.nextn.hc_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_NORM, "weight", il), { n_embd, hc }, flags | TENSOR_ALLOW_RESHAPE);
         layer.nextn.hc_head_down = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_DOWN, "weight", il), { hc_dim, hc_lr }, flags);
         layer.nextn.hc_head_up   = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_UP,   "weight", il), { hc_lr, hc_dim }, flags);
 
@@ -596,6 +596,7 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     cb(concat, "mtp_concat", il);
 
     ggml_tensor * res_hc = build_lora_mm(layer.nextn.eh_proj, concat, layer.nextn.eh_proj_s);
+    res_hc = ggml_reshape_3d(ctx0, res_hc, n_embd, hc, n_tokens);
     cb(res_hc, "mtp_eh_proj", il);
 
     ggml_tensor * inject = nullptr;

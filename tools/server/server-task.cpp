@@ -12,6 +12,107 @@
 
 #include <sstream>
 
+static void replace_all(std::string & text, const std::string & from, const std::string & to) {
+    for (size_t pos = 0; (pos = text.find(from, pos)) != std::string::npos; pos += to.size()) {
+        text.replace(pos, from.size(), to);
+    }
+}
+
+static void restore_reasoning_delimiters(
+        common_chat_msg & msg,
+        const std::vector<std::pair<std::string, std::string>> & replacements) {
+    auto restore = [&](std::string & text) {
+        for (const auto & replacement : replacements) {
+            replace_all(text, replacement.first, replacement.second);
+        }
+    };
+
+    restore(msg.content);
+    restore(msg.reasoning_content);
+    for (auto & part : msg.content_parts) {
+        restore(part.text);
+    }
+    for (auto & tool_call : msg.tool_calls) {
+        restore(tool_call.name);
+        restore(tool_call.arguments);
+    }
+}
+
+static bool mask_non_token_reasoning_delimiters(
+        std::string & input,
+        std::vector<std::pair<std::string, std::string>> & replacements,
+        const std::vector<task_result_state::generated_token_piece> & pieces,
+        const common_chat_msg_delimiters & delimiters) {
+    if (pieces.empty() || delimiters.delimiters.empty()) {
+        return false;
+    }
+
+    std::string decoded;
+    std::vector<size_t> token_offsets;
+    token_offsets.reserve(pieces.size());
+    for (const auto & piece : pieces) {
+        token_offsets.push_back(decoded.size());
+        decoded += piece.piece;
+    }
+    if (decoded.size() < input.size() || decoded.compare(0, input.size(), input) != 0) {
+        return false;
+    }
+
+    std::vector<std::pair<std::string, std::vector<size_t>>> allowed;
+    size_t reasoning_end = input.size();
+    for (const auto & delimiter : delimiters.delimiters) {
+        if (delimiter.delimiter.empty() || delimiter.tokens.empty()) {
+            continue;
+        }
+
+        std::vector<size_t> positions;
+        for (size_t i = 0; i + delimiter.tokens.size() <= pieces.size(); ++i) {
+            bool matches = true;
+            std::string text;
+            for (size_t j = 0; j < delimiter.tokens.size(); ++j) {
+                matches &= pieces[i + j].token == delimiter.tokens[j];
+                text += pieces[i + j].piece;
+            }
+            if (matches && text == delimiter.delimiter) {
+                positions.push_back(token_offsets[i]);
+                reasoning_end = std::min(reasoning_end, token_offsets[i]);
+            }
+        }
+        allowed.emplace_back(delimiter.delimiter, std::move(positions));
+    }
+
+    char marker = 0x1f;
+    while (marker > 0 && input.find(marker) != std::string::npos) {
+        --marker;
+    }
+    if (marker == 0) {
+        return false;
+    }
+
+    bool changed = false;
+    for (const auto & item : allowed) {
+        const auto & delimiter = item.first;
+        const auto & positions = item.second;
+        std::string masked = delimiter;
+        masked[0] = marker;
+        bool delimiter_changed = false;
+
+        size_t pos = 0;
+        while ((pos = input.find(delimiter, pos)) != std::string::npos && pos < reasoning_end) {
+            if (std::find(positions.begin(), positions.end(), pos) == positions.end()) {
+                input.replace(pos, delimiter.size(), masked);
+                changed = true;
+                delimiter_changed = true;
+            }
+            pos += delimiter.size();
+        }
+        if (delimiter_changed) {
+            replacements.emplace_back(std::move(masked), delimiter);
+        }
+    }
+    return changed;
+}
+
 //
 // task_params
 //
@@ -163,14 +264,28 @@ common_chat_msg task_result_state::update_chat_msg(
         const std::string & text_added,
         bool is_partial,
         std::vector<common_chat_msg_diff> & diffs,
-        bool filter_tool_calls) {
+        bool filter_tool_calls,
+        const llama_tokens & tokens_added) {
     generated_text += text_added;
+    if (vocab != nullptr) {
+        for (const auto token : tokens_added) {
+            generated_token_pieces.push_back({ token, common_token_to_piece(vocab, token, true) });
+        }
+    }
     auto msg_prv_copy = chat_msg;
     //SRV_DBG("Parsing chat message: %s\n", generated_text.c_str());
+    std::string parser_input = generated_text;
+    std::vector<std::pair<std::string, std::string>> replacements;
+    mask_non_token_reasoning_delimiters(
+        parser_input,
+        replacements,
+        generated_token_pieces,
+        chat_parser_params.reasoning_end_delimiters);
     auto new_msg = common_chat_parse(
-        generated_text,
+        parser_input,
         is_partial,
         chat_parser_params);
+    restore_reasoning_delimiters(new_msg, replacements);
     if (!new_msg.empty()) {
         new_msg.set_tool_call_ids(generated_tool_call_ids, gen_tool_call_id);
         chat_msg = new_msg;
@@ -525,6 +640,19 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat_stream() {
     return deltas;
 }
 
+static bool is_reasoning_only_response(const common_chat_msg & msg) {
+    return !msg.reasoning_content.empty() && msg.content.empty() && msg.tool_calls.empty();
+}
+
+static json reasoning_only_incomplete_details() {
+    // The Responses API currently limits reason to max_output_tokens or content_filter.
+    // Preserve compatibility while exposing the actual llama.cpp condition separately.
+    return {
+        {"reason",       "max_output_tokens"},
+        {"llama_reason", "reasoning_only"},
+    };
+}
+
 json server_task_result_cmpl_final::to_json_oaicompat_resp() {
     common_chat_msg msg;
     if (!oaicompat_msg.empty()) {
@@ -534,6 +662,8 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp() {
         msg.content = content;
     }
 
+    const bool incomplete = is_reasoning_only_response(msg);
+    const char * status = incomplete ? "incomplete" : "completed";
     std::vector<json> output;
 
     if (msg.reasoning_content != "") {
@@ -553,7 +683,7 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp() {
                 {"type", "reasoning_text"},
             }})},
             {"encrypted_content", ""},
-            {"status",            "completed"},
+            {"status",            status},
         });
     }
 
@@ -585,13 +715,13 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp() {
 
     std::time_t t = std::time(0);
     json res = {
-        {"completed_at", t},
+        {"completed_at", incomplete ? json(nullptr) : json(t)},
         {"created_at",   t},
         {"id",           oai_resp_id},
         {"model",        oaicompat_model},
         {"object",       "response"},
         {"output",       output},
-        {"status",       "completed"},
+        {"status",       status},
         {"usage",        json {
             {"input_tokens",  n_prompt_tokens},
             {"output_tokens", n_decoded},
@@ -601,10 +731,16 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp() {
         }},
     };
 
+    if (incomplete) {
+        res["incomplete_details"] = reasoning_only_incomplete_details();
+    }
+
     return res;
 }
 
 json server_task_result_cmpl_final::to_json_oaicompat_resp_stream() {
+    const bool incomplete = is_reasoning_only_response(oaicompat_msg);
+    const char * status = incomplete ? "incomplete" : "completed";
     std::vector<json> server_sent_events;
     std::vector<json> output;
 
@@ -636,7 +772,7 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp_stream() {
                 {"type", "reasoning_text"},
             }})},
             {"encrypted_content", ""},
-            {"status",            "completed"},
+            {"status",            status},
         };
 
         server_sent_events.push_back(json {
@@ -713,14 +849,14 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp_stream() {
 
     std::time_t t = std::time(0);
     server_sent_events.push_back(json {
-        {"event", "response.completed"},
+        {"event", incomplete ? "response.incomplete" : "response.completed"},
         {"data", json {
-            {"type", "response.completed"},
+            {"type", incomplete ? "response.incomplete" : "response.completed"},
             {"response", json {
                 {"id",         oai_resp_id},
                 {"object",     "response"},
                 {"created_at", t},
-                {"status",     "completed"},
+                {"status",     status},
                 {"model",      oaicompat_model},
                 {"output",     output},
                 {"usage",      json {
@@ -733,6 +869,10 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp_stream() {
             }},
         }}
     });
+
+    if (incomplete) {
+        server_sent_events.back().at("data").at("response")["incomplete_details"] = reasoning_only_incomplete_details();
+    }
 
     if (stats.is_set()) {
         server_sent_events.back().at("data")["timings"] = stats.to_json();
@@ -1018,7 +1158,7 @@ void server_task_result_cmpl_partial::update(task_result_state & state) {
     if (is_begin) {
         return; // begin marker only flushes headers, skip parsing
     }
-    state.update_chat_msg(content, true, oaicompat_msg_diffs);
+    state.update_chat_msg(content, true, oaicompat_msg_diffs, false, tokens);
 
     // Copy current state for use in to_json_*() (reflects state BEFORE this chunk)
     thinking_block_started = state.thinking_block_started;

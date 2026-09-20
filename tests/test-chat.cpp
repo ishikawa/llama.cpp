@@ -8,7 +8,9 @@
 #include "../src/llama-grammar.h"
 #include "../src/unicode.h"
 #include "../tools/server/server-chat.h"
+#include "../tools/server/server-task.h"
 #include "chat-auto-parser.h"
+#include "chat-peg-parser.h"
 #include "chat.h"
 #include "common.h"
 #include "ggml.h"
@@ -7857,6 +7859,106 @@ static void test_utf8_sanitize() {
     }
 }
 
+static common_chat_parser_params make_reasoning_token_parser_params() {
+    common_chat_parser_params params;
+    params.format = COMMON_CHAT_FORMAT_PEG_NATIVE;
+    params.generation_prompt = "<think>";
+    params.parser = build_chat_peg_parser([](common_chat_peg_builder & p) {
+        return p.optional(p.literal("<think>") + p.reasoning(p.until("</think>")) + p.literal("</think>"))
+            + p.content(p.rest()) + p.end();
+    });
+    params.reasoning_end_delimiters = {
+        { { COMMON_CHAT_ROLE_UNKNOWN, "</think>", { 99 } } }
+    };
+    return params;
+}
+
+static void test_reasoning_token_delimiters() {
+    const auto params = make_reasoning_token_parser_params();
+    task_result_state state(params);
+    state.generated_token_pieces = {
+        { 1, "A fenced example: ```" },
+        { 2, "</" },
+        { 3, "think" },
+        { 4, ">``` stays in reasoning." },
+        { 99, "</think>" },
+        { 5, "Final answer" },
+    };
+
+    std::vector<common_chat_msg_diff> diffs;
+    const auto msg = state.update_chat_msg(
+        "A fenced example: ```</think>``` stays in reasoning.</think>Final answer",
+        false,
+        diffs);
+
+    assert_equals(std::string("A fenced example: ```</think>``` stays in reasoning."), msg.reasoning_content);
+    assert_equals(std::string("Final answer"), msg.content);
+
+    task_result_state partial(params);
+    partial.generated_token_pieces = {
+        { 1, "An inline `" },
+        { 2, "</thi" },
+    };
+    auto partial_msg = partial.update_chat_msg("An inline `</thi", true, diffs);
+    assert_equals(std::string("An inline `"), partial_msg.reasoning_content);
+
+    partial.generated_token_pieces.push_back({ 3, "nk>` literal" });
+    partial_msg = partial.update_chat_msg("nk>` literal", true, diffs);
+    assert_equals(std::string("An inline `</think>` literal"), partial_msg.reasoning_content);
+    assert_equals(std::string(), partial_msg.content);
+}
+
+static server_task_result_cmpl_final make_reasoning_only_result(bool stream) {
+    server_task_result_cmpl_final result;
+    result.stream = stream;
+    result.is_updated = true;
+    result.res_type = TASK_RESPONSE_TYPE_OAI_RESP;
+    result.stop = STOP_TYPE_EOS;
+    result.n_decoded = 4;
+    result.n_prompt_tokens = 2;
+    result.n_prompt_tokens_cache = 0;
+    result.n_reasoning_tokens = 4;
+    result.oaicompat_model = "test-model";
+    result.oai_resp_id = "resp_test";
+    result.oai_resp_reasoning_id = "rs_test";
+    result.oai_resp_message_id = "msg_test";
+    result.oaicompat_msg.role = "assistant";
+    result.oaicompat_msg.reasoning_content = "unfinished reasoning";
+    return result;
+}
+
+static void test_responses_reasoning_only_incomplete() {
+    auto result = make_reasoning_only_result(false);
+    const auto response = result.to_json();
+    assert_equals(std::string("incomplete"), response.at("status").get<std::string>());
+    assert_equals(std::string("max_output_tokens"), response.at("incomplete_details").at("reason").get<std::string>());
+    assert_equals(std::string("reasoning_only"), response.at("incomplete_details").at("llama_reason").get<std::string>());
+    assert_equals(std::string("incomplete"), response.at("output").at(0).at("status").get<std::string>());
+
+    result = make_reasoning_only_result(true);
+    const auto events = result.to_json();
+    assert_equals(std::string("response.incomplete"), events.back().at("event").get<std::string>());
+    assert_equals(std::string("incomplete"), events.back().at("data").at("response").at("status").get<std::string>());
+    assert_equals(std::string("max_output_tokens"), events.back().at("data").at("response").at("incomplete_details").at("reason").get<std::string>());
+    assert_equals(std::string("reasoning_only"), events.back().at("data").at("response").at("incomplete_details").at("llama_reason").get<std::string>());
+}
+
+static void test_responses_reasoning_with_answer_completed() {
+    auto result = make_reasoning_only_result(false);
+    result.oaicompat_msg.content = "final answer";
+    const auto response = result.to_json();
+    assert_equals(std::string("completed"), response.at("status").get<std::string>());
+    assert_equals(false, response.contains("incomplete_details"));
+    assert_equals(std::string("completed"), response.at("output").at(0).at("status").get<std::string>());
+
+    result = make_reasoning_only_result(true);
+    result.oaicompat_msg.content = "final answer";
+    const auto events = result.to_json();
+    assert_equals(std::string("response.completed"), events.back().at("event").get<std::string>());
+    assert_equals(std::string("completed"), events.back().at("data").at("response").at("status").get<std::string>());
+    assert_equals(false, events.back().at("data").at("response").contains("incomplete_details"));
+}
+
 int main(int argc, char ** argv) {
     bool detailed_debug    = false;
     bool only_run_filtered = false;
@@ -7930,6 +8032,9 @@ int main(int argc, char ** argv) {
 #endif
     {
         test_utf8_sanitize();
+        test_reasoning_token_delimiters();
+        test_responses_reasoning_only_incomplete();
+        test_responses_reasoning_with_answer_completed();
         test_msg_diffs_compute();
         test_msgs_oaicompat_json_conversion();
         test_msg_token_delimiters_split();

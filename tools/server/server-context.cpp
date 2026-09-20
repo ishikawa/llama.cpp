@@ -1839,7 +1839,8 @@ private:
         slot.sampled = result.tok;
 
         slot.generated_text += token_str;
-        if (slot.task->params.return_tokens) {
+        if (slot.task->params.return_tokens ||
+            !slot.task->params.chat_parser_params.reasoning_end_delimiters.delimiters.empty()) {
             slot.generated_tokens.push_back(result.tok);
         }
         slot.has_next_token = true;
@@ -2135,7 +2136,10 @@ private:
             res->tokens      = llama_tokens{};
         } else {
             res->content     = std::move(slot.generated_text);
-            res->tokens      = std::move(slot.generated_tokens);
+            res->parser_tokens = std::move(slot.generated_tokens);
+            if (slot.task->params.return_tokens) {
+                res->tokens = res->parser_tokens;
+            }
         }
         res->stats           = slot.stats;
         res->prompt          = slot.task->tokens.detokenize(ctx_tgt, true);

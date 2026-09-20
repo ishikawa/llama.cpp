@@ -323,6 +323,26 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
             ctx.params.chat_parser_params.parser.load(data.at("chat_parser").get<std::string>());
         }));
 
+    add((new field_json("reasoning_end_tags"))
+        ->set_desc("Reasoning end tags used by the chat parser")
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            GGML_ASSERT(ctx.vocab != nullptr);
+            for (const auto & value : data.at("reasoning_end_tags")) {
+                common_chat_msg_delimiter delimiter;
+                delimiter.delimiter = value.get<std::string>();
+                delimiter.tokens = common_tokenize(ctx.vocab, delimiter.delimiter, false, true);
+
+                bool has_special_token = false;
+                for (const auto token : delimiter.tokens) {
+                    const auto attr = llama_vocab_get_attr(ctx.vocab, token);
+                    has_special_token |= (attr & (LLAMA_TOKEN_ATTR_CONTROL | LLAMA_TOKEN_ATTR_USER_DEFINED)) != 0;
+                }
+                if (has_special_token) {
+                    ctx.params.chat_parser_params.reasoning_end_delimiters.delimiters.push_back(std::move(delimiter));
+                }
+            }
+        }));
+
     add((new field_json("continue_final_message"))
         ->set_desc("Whether to continue the final message of the chat template")
         ->set_handler([&](field_eval_context & ctx, const json & data) {

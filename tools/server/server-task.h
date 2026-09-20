@@ -108,11 +108,17 @@ struct task_params {
 
 // struct for tracking the state of a task (e.g., for streaming)
 struct task_result_state {
+    struct generated_token_piece {
+        llama_token token;
+        std::string piece;
+    };
+
     // tracking diffs for partial tool calls
     std::vector<common_chat_msg_diff> diffs;
     common_chat_parser_params chat_parser_params;
     common_chat_msg chat_msg;
     std::string generated_text; // append new chunks of generated text here
+    std::vector<generated_token_piece> generated_token_pieces;
     std::vector<std::string> generated_tool_call_ids;
     std::unordered_set<size_t> sent_tool_call_names;
 
@@ -138,7 +144,8 @@ struct task_result_state {
         const std::string & text_added,
         bool is_partial,
         std::vector<common_chat_msg_diff> & diffs,
-        bool filter_tool_calls = false);
+        bool filter_tool_calls = false,
+        const llama_tokens & tokens_added = {});
 };
 
 struct server_task {
@@ -330,6 +337,7 @@ struct completion_token_output {
 struct server_task_result_cmpl_final : server_task_result {
     std::string content;
     llama_tokens tokens;
+    llama_tokens parser_tokens;
 
     bool stream;
     bool include_usage;
@@ -382,7 +390,7 @@ struct server_task_result_cmpl_final : server_task_result {
 
     virtual void update(task_result_state & state) override {
         is_updated = true;
-        oaicompat_msg = state.update_chat_msg(content, false, oaicompat_msg_diffs);
+        oaicompat_msg = state.update_chat_msg(content, false, oaicompat_msg_diffs, false, parser_tokens);
 
         oai_resp_id = state.oai_resp_id;
         oai_resp_reasoning_id = state.oai_resp_reasoning_id;

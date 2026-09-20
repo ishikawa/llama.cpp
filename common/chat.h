@@ -295,10 +295,14 @@ struct common_chat_parser_params {
     bool                    echo                 = false;  // Include assistant prefilled msg in output
     bool                    debug                = false;  // Enable debug output for PEG parser
     common_peg_arena        parser               = {};
+    common_chat_msg_delimiters reasoning_end_delimiters;
     common_chat_parser_params() = default;
     common_chat_parser_params(const common_chat_params & chat_params) {
         format  = chat_params.format;
         generation_prompt = chat_params.generation_prompt;
+        for (const auto & tag : chat_params.thinking_end_tags) {
+            reasoning_end_delimiters.add(COMMON_CHAT_ROLE_UNKNOWN, tag);
+        }
     }
 };
 

@@ -666,6 +666,9 @@ These words will not be included in the completion, so make sure to add them to 
   - `none`: Generating (not stopped)
   - `eos`: Stopped because it encountered the EOS token
   - `limit`: Stopped because `n_predict` tokens were generated before stop words or EOS was encountered
+  - `context`: Stopped because the context capacity was exhausted while context shifting was disabled
+  - `indent`: Stopped because the generated indentation was below `n_indent`
+  - `time`: Stopped because `t_max_predict_ms` was exceeded
   - `word`: Stopped due to encountering a stopping word from `stop` JSON array provided
 - `stopping_word`: The stopping word encountered which stopped the generation (or "" if not stopped due to a stopping word)
 - `timings`: Hash of timing information about the completion such as the number of tokens `predicted_per_second`
@@ -1463,6 +1466,8 @@ Returns a JSON object with a boolean `success` field, and an optional `message` 
 *Options:*
 
 See [OpenAI Responses API documentation](https://platform.openai.com/docs/api-reference/responses).
+
+`reasoning_eos_recovery`: llama.cpp extension that recovers one EOS/EOG sampled inside a reasoning block by forcing the template's reasoning end sequence and continuing the same response. It defaults to `true` for this endpoint and can be set to `false` for diagnostics. Other completion endpoints default it to `false`.
 
 *Examples:*
 

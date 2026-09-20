@@ -1826,6 +1826,17 @@ static void test_tools_oaicompat_json_conversion() {
 }
 
 static void test_convert_responses_to_chatcmpl() {
+    {
+        const json result = server_chat_convert_responses_to_chatcmpl({{"input", "hello"}});
+        assert_equals(true, result.at("reasoning_eos_recovery").get<bool>());
+    }
+    {
+        const json result = server_chat_convert_responses_to_chatcmpl({
+            {"input", "hello"},
+            {"reasoning_eos_recovery", false},
+        });
+        assert_equals(false, result.at("reasoning_eos_recovery").get<bool>());
+    }
     LOG_DBG("%s\n", __func__);
 
     // Test basic conversion with input messages (user/assistant alternating)
@@ -7927,20 +7938,20 @@ static server_task_result_cmpl_final make_reasoning_only_result(bool stream) {
     return result;
 }
 
-static void test_responses_reasoning_only_incomplete() {
+static void test_responses_reasoning_only_failed() {
     auto result = make_reasoning_only_result(false);
     const auto response = result.to_json();
-    assert_equals(std::string("incomplete"), response.at("status").get<std::string>());
-    assert_equals(std::string("max_output_tokens"), response.at("incomplete_details").at("reason").get<std::string>());
-    assert_equals(std::string("reasoning_only"), response.at("incomplete_details").at("llama_reason").get<std::string>());
+    assert_equals(std::string("failed"), response.at("status").get<std::string>());
+    assert_equals(false, response.contains("incomplete_details"));
+    assert_equals(std::string("reasoning_eos"), response.at("error").at("code").get<std::string>());
     assert_equals(std::string("incomplete"), response.at("output").at(0).at("status").get<std::string>());
 
     result = make_reasoning_only_result(true);
     const auto events = result.to_json();
-    assert_equals(std::string("response.incomplete"), events.back().at("event").get<std::string>());
-    assert_equals(std::string("incomplete"), events.back().at("data").at("response").at("status").get<std::string>());
-    assert_equals(std::string("max_output_tokens"), events.back().at("data").at("response").at("incomplete_details").at("reason").get<std::string>());
-    assert_equals(std::string("reasoning_only"), events.back().at("data").at("response").at("incomplete_details").at("llama_reason").get<std::string>());
+    assert_equals(std::string("response.failed"), events.back().at("event").get<std::string>());
+    assert_equals(std::string("failed"), events.back().at("data").at("response").at("status").get<std::string>());
+    assert_equals(false, events.back().at("data").at("response").contains("incomplete_details"));
+    assert_equals(std::string("reasoning_eos"), events.back().at("data").at("response").at("error").at("code").get<std::string>());
 }
 
 static void test_responses_reasoning_with_answer_completed() {
@@ -7957,6 +7968,34 @@ static void test_responses_reasoning_with_answer_completed() {
     assert_equals(std::string("response.completed"), events.back().at("event").get<std::string>());
     assert_equals(std::string("completed"), events.back().at("data").at("response").at("status").get<std::string>());
     assert_equals(false, events.back().at("data").at("response").contains("incomplete_details"));
+}
+
+static void test_responses_actual_token_limit_incomplete() {
+    auto result = make_reasoning_only_result(false);
+    result.stop = STOP_TYPE_LIMIT;
+    const auto response = result.to_json();
+    assert_equals(std::string("incomplete"), response.at("status").get<std::string>());
+    assert_equals(std::string("max_output_tokens"), response.at("incomplete_details").at("reason").get<std::string>());
+    assert_equals(false, response.contains("error"));
+    assert_equals(std::string("incomplete"), response.at("output").at(0).at("status").get<std::string>());
+
+    result = make_reasoning_only_result(true);
+    result.stop = STOP_TYPE_LIMIT;
+    const auto events = result.to_json();
+    assert_equals(std::string("response.incomplete"), events.back().at("event").get<std::string>());
+    assert_equals(std::string("max_output_tokens"), events.back().at("data").at("response").at("incomplete_details").at("reason").get<std::string>());
+}
+
+static void test_responses_non_token_limit_failed() {
+    auto result = make_reasoning_only_result(false);
+    result.oaicompat_msg.reasoning_content.clear();
+    result.oaicompat_msg.content = "partial answer";
+    result.stop = STOP_TYPE_CONTEXT;
+    const auto response = result.to_json();
+    assert_equals(std::string("failed"), response.at("status").get<std::string>());
+    assert_equals(std::string("context"), response.at("error").at("code").get<std::string>());
+    assert_equals(std::string("incomplete"), response.at("output").at(0).at("status").get<std::string>());
+    assert_equals(false, response.contains("incomplete_details"));
 }
 
 int main(int argc, char ** argv) {
@@ -8033,8 +8072,10 @@ int main(int argc, char ** argv) {
     {
         test_utf8_sanitize();
         test_reasoning_token_delimiters();
-        test_responses_reasoning_only_incomplete();
+        test_responses_reasoning_only_failed();
         test_responses_reasoning_with_answer_completed();
+        test_responses_actual_token_limit_incomplete();
+        test_responses_non_token_limit_failed();
         test_msg_diffs_compute();
         test_msgs_oaicompat_json_conversion();
         test_msg_token_delimiters_split();

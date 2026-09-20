@@ -14,6 +14,9 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
     const json input_value = response_body.at("input");
     json chatcmpl_body = response_body;
     chatcmpl_body.erase("input");
+    if (!chatcmpl_body.contains("reasoning_eos_recovery") || chatcmpl_body.at("reasoning_eos_recovery").is_null()) {
+        chatcmpl_body["reasoning_eos_recovery"] = true;
+    }
     std::vector<json> chatcmpl_messages;
 
     if (response_body.contains("reasoning") && response_body.at("reasoning").is_object()) {

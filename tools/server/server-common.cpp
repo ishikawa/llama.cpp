@@ -1484,6 +1484,7 @@ json oaicompat_chat_params_parse(
             llama_params["reasoning_min_message"] = json_value(body, "reasoning_min_message", opt.reasoning_min_message.empty() ? std::string(SERVER_REASONING_MIN_MESSAGE) : opt.reasoning_min_message);
             llama_params["reasoning_min_injections"] = json_value(body, "reasoning_min_injections", opt.reasoning_min_injections);
             llama_params["reasoning_control"] = json_value(body, "reasoning_control", false);
+            llama_params["reasoning_eos_recovery"] = json_value(body, "reasoning_eos_recovery", false);
         }
     }
 

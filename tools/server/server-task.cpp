@@ -368,6 +368,9 @@ static inline std::string stop_type_to_str(stop_type type) {
         case STOP_TYPE_EOS:   return "eos";
         case STOP_TYPE_WORD:  return "word";
         case STOP_TYPE_LIMIT: return "limit";
+        case STOP_TYPE_CONTEXT: return "context";
+        case STOP_TYPE_INDENT:  return "indent";
+        case STOP_TYPE_TIME:    return "time";
         default:              return "none";
     }
 }
@@ -644,12 +647,17 @@ static bool is_reasoning_only_response(const common_chat_msg & msg) {
     return !msg.reasoning_content.empty() && msg.content.empty() && msg.tool_calls.empty();
 }
 
-static json reasoning_only_incomplete_details() {
-    // The Responses API currently limits reason to max_output_tokens or content_filter.
-    // Preserve compatibility while exposing the actual llama.cpp condition separately.
+static json reasoning_only_error() {
     return {
-        {"reason",       "max_output_tokens"},
-        {"llama_reason", "reasoning_only"},
+        {"code",    "reasoning_eos"},
+        {"message", "The model ended generation before producing a final answer or tool call."},
+    };
+}
+
+static json non_token_limit_error(stop_type stop) {
+    return {
+        {"code", stop_type_to_str(stop)},
+        {"message", "Generation stopped before completion due to a server limit."},
     };
 }
 
@@ -662,8 +670,13 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp() {
         msg.content = content;
     }
 
-    const bool incomplete = is_reasoning_only_response(msg);
-    const char * status = incomplete ? "incomplete" : "completed";
+    const bool incomplete = stop == STOP_TYPE_LIMIT;
+    const bool failed = (is_reasoning_only_response(msg) && stop != STOP_TYPE_LIMIT) ||
+        stop == STOP_TYPE_CONTEXT || stop == STOP_TYPE_INDENT || stop == STOP_TYPE_TIME;
+    const char * status = failed ? "failed" : incomplete ? "incomplete" : "completed";
+    const char * reasoning_status = (!msg.content.empty() || !msg.tool_calls.empty()) ? "completed" :
+        (incomplete || failed) ? "incomplete" : "completed";
+    const char * message_status = (incomplete || failed) ? "incomplete" : "completed";
     std::vector<json> output;
 
     if (msg.reasoning_content != "") {
@@ -683,7 +696,7 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp() {
                 {"type", "reasoning_text"},
             }})},
             {"encrypted_content", ""},
-            {"status",            status},
+            {"status",            reasoning_status},
         });
     }
 
@@ -697,7 +710,7 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp() {
             }})},
             {"id",     "msg_" + random_string()},
             {"role",   msg.role},
-            {"status", "completed"},
+            {"status", message_status},
             {"type",   "message"},
         });
     }
@@ -715,7 +728,7 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp() {
 
     std::time_t t = std::time(0);
     json res = {
-        {"completed_at", incomplete ? json(nullptr) : json(t)},
+        {"completed_at", (incomplete || failed) ? json(nullptr) : json(t)},
         {"created_at",   t},
         {"id",           oai_resp_id},
         {"model",        oaicompat_model},
@@ -732,15 +745,23 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp() {
     };
 
     if (incomplete) {
-        res["incomplete_details"] = reasoning_only_incomplete_details();
+        res["incomplete_details"] = {{"reason", "max_output_tokens"}};
+    }
+    if (failed) {
+        res["error"] = (stop == STOP_TYPE_EOS || stop == STOP_TYPE_WORD) ? reasoning_only_error() : non_token_limit_error(stop);
     }
 
     return res;
 }
 
 json server_task_result_cmpl_final::to_json_oaicompat_resp_stream() {
-    const bool incomplete = is_reasoning_only_response(oaicompat_msg);
-    const char * status = incomplete ? "incomplete" : "completed";
+    const bool incomplete = stop == STOP_TYPE_LIMIT;
+    const bool failed = (is_reasoning_only_response(oaicompat_msg) && stop != STOP_TYPE_LIMIT) ||
+        stop == STOP_TYPE_CONTEXT || stop == STOP_TYPE_INDENT || stop == STOP_TYPE_TIME;
+    const char * status = failed ? "failed" : incomplete ? "incomplete" : "completed";
+    const char * reasoning_status = (!oaicompat_msg.content.empty() || !oaicompat_msg.tool_calls.empty()) ? "completed" :
+        (incomplete || failed) ? "incomplete" : "completed";
+    const char * message_status = (incomplete || failed) ? "incomplete" : "completed";
     std::vector<json> server_sent_events;
     std::vector<json> output;
 
@@ -772,7 +793,7 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp_stream() {
                 {"type", "reasoning_text"},
             }})},
             {"encrypted_content", ""},
-            {"status",            status},
+            {"status",            reasoning_status},
         };
 
         server_sent_events.push_back(json {
@@ -812,7 +833,7 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp_stream() {
         });
         const json output_item = {
             {"type",    "message"},
-            {"status",  "completed"},
+            {"status",  message_status},
             {"id",      oai_resp_message_id},
             {"content", json::array({content_part})},
             {"role",    "assistant"}
@@ -849,9 +870,9 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp_stream() {
 
     std::time_t t = std::time(0);
     server_sent_events.push_back(json {
-        {"event", incomplete ? "response.incomplete" : "response.completed"},
+        {"event", failed ? "response.failed" : incomplete ? "response.incomplete" : "response.completed"},
         {"data", json {
-            {"type", incomplete ? "response.incomplete" : "response.completed"},
+            {"type", failed ? "response.failed" : incomplete ? "response.incomplete" : "response.completed"},
             {"response", json {
                 {"id",         oai_resp_id},
                 {"object",     "response"},
@@ -871,7 +892,11 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp_stream() {
     });
 
     if (incomplete) {
-        server_sent_events.back().at("data").at("response")["incomplete_details"] = reasoning_only_incomplete_details();
+        server_sent_events.back().at("data").at("response")["incomplete_details"] = {{"reason", "max_output_tokens"}};
+    }
+    if (failed) {
+        server_sent_events.back().at("data").at("response")["error"] =
+            (stop == STOP_TYPE_EOS || stop == STOP_TYPE_WORD) ? reasoning_only_error() : non_token_limit_error(stop);
     }
 
     if (stats.is_set()) {

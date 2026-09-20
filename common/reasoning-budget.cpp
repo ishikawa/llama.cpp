@@ -425,7 +425,7 @@ bool common_reasoning_budget_force(struct llama_sampler * smpl) {
 
     // only a sampler that is actively counting down the budget may be forced;
     // any other state (idle, already forcing/waiting, or done) is left untouched
-    if (ctx->state != REASONING_BUDGET_COUNTING) {
+    if (ctx->state != REASONING_BUDGET_COUNTING || ctx->forced_tokens.empty()) {
         return false;
     }
 
@@ -434,5 +434,21 @@ bool common_reasoning_budget_force(struct llama_sampler * smpl) {
     ctx->end_matcher.reset();
     COM_TRC("%s", "forced into forcing state (manual transition)\n");
 
+    return true;
+}
+
+bool common_reasoning_budget_cancel_force(struct llama_sampler * smpl) {
+    if (!smpl) {
+        return false;
+    }
+
+    auto * ctx = (common_reasoning_budget_ctx *) smpl->ctx;
+    if (ctx->state != REASONING_BUDGET_FORCING || ctx->force_pos != 0) {
+        return false;
+    }
+
+    ctx->state = REASONING_BUDGET_COUNTING;
+    ctx->end_matcher.reset();
+    COM_TRC("%s", "cancelled manual forcing transition\n");
     return true;
 }

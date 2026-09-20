@@ -418,6 +418,9 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
     add((new field_bool("reasoning_control", params.sampling.reasoning_control))
         ->set_desc("Create the budget sampler on demand so reasoning can be ended at runtime"));
 
+    add((new field_bool("reasoning_eos_recovery", params.sampling.reasoning_eos_recovery))
+        ->set_desc("Recover one EOG sampled inside reasoning by forcing the reasoning end sequence"));
+
     add((new field_num("reasoning_budget_tokens", params.sampling.reasoning_budget_tokens))
         ->set_hard_limits(-1, INT32_MAX)
         ->set_desc("Number of tokens in the reasoning budget (-1 = disabled)"));
@@ -455,6 +458,9 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
                 if (!tag.empty()) {
                     ctx.params.sampling.reasoning_budget_end.push_back(common_tokenize(ctx.vocab, tag, false, true));
                 }
+            }
+            if (!ctx.params.sampling.reasoning_budget_end.empty()) {
+                ctx.params.sampling.reasoning_budget_forced = ctx.params.sampling.reasoning_budget_end.front();
             }
         }));
 
@@ -612,8 +618,8 @@ task_params eval_llama_cmpl_schema(
     {
         auto budget = params.sampling.reasoning_budget_tokens;
         auto min = params.sampling.reasoning_min_tokens;
-        SRV_DBG("reasoning budget: tokens=%d, min=%d, generation_prompt='%s', start=%zu toks, end=%zu seqs, forced=%zu toks, min_forced=%zu toks\n",
-                budget, min, params.sampling.generation_prompt.c_str(),
+        SRV_DBG("reasoning budget: tokens=%d, min=%d, eos_recovery=%d, generation_prompt='%s', start=%zu toks, end=%zu seqs, forced=%zu toks, min_forced=%zu toks\n",
+                budget, min, params.sampling.reasoning_eos_recovery, params.sampling.generation_prompt.c_str(),
                 params.sampling.reasoning_budget_start.size(),
                 params.sampling.reasoning_budget_end.size(),
                 params.sampling.reasoning_budget_forced.size(),

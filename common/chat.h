@@ -295,10 +295,14 @@ struct common_chat_parser_params {
     bool                    echo                 = false;  // Include assistant prefilled msg in output
     bool                    debug                = false;  // Enable debug output for PEG parser
     common_peg_arena        parser               = {};
+    common_chat_msg_delimiters reasoning_end_delimiters;
     common_chat_parser_params() = default;
     common_chat_parser_params(const common_chat_params & chat_params) {
         format  = chat_params.format;
         generation_prompt = chat_params.generation_prompt;
+        for (const auto & tag : chat_params.thinking_end_tags) {
+            reasoning_end_delimiters.add(COMMON_CHAT_ROLE_UNKNOWN, tag);
+        }
     }
 };
 
@@ -359,6 +363,9 @@ common_chat_continuation common_chat_continuation_parse(const common_json & valu
 common_json common_chat_msgs_to_json_oaicompat(const std::vector<common_chat_msg> & msgs, bool concat_typed_text = false);
 
 common_json common_chat_tools_to_json_oaicompat(const std::vector<common_chat_tool> & tools);
+
+// The parameters schema of a function tool. A tool without parameters, or with an empty {}, takes zero arguments.
+common_json common_chat_tool_parameters(const common_json & function);
 
 // get template caps, useful for reporting to server /props endpoint
 std::map<std::string, bool> common_chat_templates_get_caps(const common_chat_templates * chat_templates);

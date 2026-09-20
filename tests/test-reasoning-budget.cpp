@@ -343,6 +343,10 @@ static void test_reasoning_budget_force_manual() {
         GGML_ASSERT(common_reasoning_budget_force(sampler) && "force() should succeed from COUNTING");
         GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_FORCING);
 
+        GGML_ASSERT(common_reasoning_budget_cancel_force(sampler) && "force cancellation should succeed before accepting a token");
+        GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_COUNTING);
+        GGML_ASSERT(common_reasoning_budget_force(sampler) && "force() should succeed again after cancellation");
+
         // forces the configured sequence from force_pos=0, then transitions to DONE
         GGML_ASSERT(get_forced_token(sampler, 102) == 102);
         llama_sampler_accept(sampler, 102);
@@ -393,6 +397,16 @@ static void test_reasoning_budget_force_manual() {
 
     // a null sampler is safely ignored
     GGML_ASSERT(!common_reasoning_budget_force(nullptr));
+
+    // an empty forced sequence must not enter FORCING
+    {
+        auto * sampler = common_reasoning_budget_init(nullptr, {start}, {end}, {}, 5, REASONING_BUDGET_IDLE);
+        llama_sampler_accept(sampler, 100);
+        GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_COUNTING);
+        GGML_ASSERT(!common_reasoning_budget_force(sampler) && "force() must reject an empty forced sequence");
+        GGML_ASSERT(common_reasoning_budget_get_state(sampler) == REASONING_BUDGET_COUNTING);
+        llama_sampler_free(sampler);
+    }
 
     fprintf(stderr, "  Test 'manual force transition' passed\n");
 }

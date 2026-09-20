@@ -1891,7 +1891,7 @@ private:
         // if context shifting is disabled, make sure that we don't run out of context
         if (!params_base.ctx_shift && slot.prompt.n_tokens() + 1 >= slot.n_ctx) {
             slot.truncated      = true;
-            slot.stop           = STOP_TYPE_LIMIT;
+            slot.stop           = STOP_TYPE_CONTEXT;
             slot.has_next_token = false;
 
             SLT_DBG(slot, "stopped due to running out of context capacity, prompt.n_tokens() = %d, task.n_tokens = %d, n_gen = %d, n_ctx = %d\n",
@@ -1921,7 +1921,7 @@ private:
                     }
 
                     if (pos < slot.generated_text.size() && n_indent < slot.task->params.n_indent) {
-                        slot.stop           = STOP_TYPE_LIMIT;
+                        slot.stop           = STOP_TYPE_INDENT;
                         slot.has_next_token = false;
 
                         // cut the last line
@@ -1948,7 +1948,7 @@ private:
 
             // if we have seen a new line, we stop after a certain time limit, but only upon another new line
             if (slot.task->params.t_max_predict_ms > 0 && slot.stats.t_gen_ms() > slot.task->params.t_max_predict_ms) {
-                slot.stop           = STOP_TYPE_LIMIT;
+                slot.stop           = STOP_TYPE_TIME;
                 slot.has_next_token = false;
 
                 SLT_DBG(slot, "stopped by time limit, n_gen = %d, t_max_predict_ms = %d ms\n", (int) slot.stats.n_gen, (int) slot.task->params.t_max_predict_ms);

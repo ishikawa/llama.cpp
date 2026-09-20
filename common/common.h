@@ -296,6 +296,7 @@ struct common_params_sampling {
     std::string               reasoning_min_message = "Wait,"; // message injected when ending before minimum
     int32_t                   reasoning_min_injections = 8;    // maximum minimum-forcing injections
     bool                      reasoning_control = false;       // create the budget sampler on demand so reasoning can be ended at runtime
+    bool                      reasoning_eos_recovery = false;  // replace one EOG sampled inside reasoning with the forced end sequence
 
     bool backend_sampling = false;
 

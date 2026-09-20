@@ -121,8 +121,14 @@ struct common_sampler {
 
     llama_token_data_array cur_p;
 
+    int32_t reasoning_eos_recoveries = 0;
+    bool suppress_eog_after_reasoning_recovery = false;
+
     void reset() {
         prev.clear();
+
+        reasoning_eos_recoveries = 0;
+        suppress_eog_after_reasoning_recovery = false;
 
         llama_sampler_reset(chain);
     }
@@ -310,7 +316,7 @@ struct common_sampler * common_sampler_init(
     }
 
     // reasoning budget sampler (skip when inactive unless lazy grammar needs thinking-block suppression)
-    if (!params.reasoning_budget_start.empty() && !params.reasoning_budget_end.empty() && (params.grammar_lazy || params.reasoning_budget_tokens >= 0 || params.reasoning_min_tokens >= 0 || params.reasoning_control)) {
+    if (!params.reasoning_budget_start.empty() && !params.reasoning_budget_end.empty() && (params.grammar_lazy || params.reasoning_budget_tokens >= 0 || params.reasoning_min_tokens >= 0 || params.reasoning_control || params.reasoning_eos_recovery)) {
         rbudget = common_reasoning_budget_init(
             vocab,
             {params.reasoning_budget_start},
@@ -448,6 +454,8 @@ struct common_sampler * common_sampler_init(
         /* .prev    = */ ring_buffer<llama_token>(std::max(32, params.n_prev)),
         /* .cur     = */ {},
         /* .cur_p   = */ {},
+        /* .reasoning_eos_recoveries = */ 0,
+        /* .suppress_eog_after_reasoning_recovery = */ false,
     };
 
     return result;
@@ -523,7 +531,7 @@ void common_sampler_reset(struct common_sampler * gsmpl) {
 }
 
 struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
-    return new common_sampler {
+    auto * result = new common_sampler {
         /* .params  = */ gsmpl->params,
         /* .grmr    = */ llama_sampler_clone(gsmpl->grmr),
         /* .rbudget = */ llama_sampler_clone(gsmpl->rbudget),
@@ -531,7 +539,11 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
         /* .prev    = */ gsmpl->prev,
         /* .cur     = */ gsmpl->cur,
         /* .cur_p   = */ gsmpl->cur_p,
+        /* .reasoning_eos_recoveries = */ gsmpl->reasoning_eos_recoveries,
+        /* .suppress_eog_after_reasoning_recovery = */ gsmpl->suppress_eog_after_reasoning_recovery,
     };
+    result->cur_p.data = gsmpl->cur_p.data ? result->cur.data() : nullptr;
+    return result;
 }
 
 void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
@@ -548,6 +560,8 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
 
     dst->params     = src->params;
     dst->prev       = src->prev;
+    dst->reasoning_eos_recoveries = src->reasoning_eos_recoveries;
+    dst->suppress_eog_after_reasoning_recovery = src->suppress_eog_after_reasoning_recovery;
     dst->cur        = src->cur;
     dst->cur_p      = src->cur_p;
     dst->cur_p.data = src->cur_p.data ? dst->cur.data() : nullptr; // re-point to dst's buffer
@@ -644,49 +658,119 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
         }
     }
 
-    // apply reasoning budget first
-    llama_sampler_apply(rbudget, &cur_p);
+    const auto sample_cpu = [&](llama_token no_candidate) {
+        // Apply the reasoning budget before grammar. A lazy tool grammar is inactive
+        // while the reasoning sampler is counting or forcing its closing sequence.
+        llama_sampler_apply(rbudget, &cur_p);
 
-    if (grammar_first && grammar_should_apply(gsmpl)) {
-        llama_sampler_apply(grmr, &cur_p);
-    }
+        const bool suppress_eog = gsmpl->suppress_eog_after_reasoning_recovery &&
+            common_reasoning_budget_get_state(rbudget) == REASONING_BUDGET_DONE;
+        const auto has_visible_piece = [&](llama_token token) {
+            const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
+            const std::string piece = common_token_to_piece(vocab, token, true);
+            return std::any_of(piece.begin(), piece.end(), [](unsigned char c) { return !std::isspace(c); });
+        };
+        const auto suppressed_eog_fallback = [&]() {
+            const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
+            for (llama_token token = 0; token < llama_vocab_n_tokens(vocab); ++token) {
+                if (llama_vocab_is_eog(vocab, token)) {
+                    gsmpl->suppress_eog_after_reasoning_recovery = false;
+                    return token;
+                }
+            }
+            return LLAMA_TOKEN_NULL;
+        };
+        if (suppress_eog) {
+            const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
+            for (size_t i = 0; i < cur_p.size; ++i) {
+                if (llama_vocab_is_eog(vocab, cur_p.data[i].id)) {
+                    cur_p.data[i].logit = -INFINITY;
+                }
+            }
+        }
 
-    llama_sampler_apply(chain, &cur_p);
+        if (grammar_first && grammar_should_apply(gsmpl)) {
+            llama_sampler_apply(grmr, &cur_p);
+        }
 
-    id = cur_p.data[cur_p.selected].id;
+        llama_sampler_apply(chain, &cur_p);
+        if (cur_p.selected == -1) {
+            if (suppress_eog) {
+                return suppressed_eog_fallback();
+            }
+            GGML_ASSERT(no_candidate != LLAMA_TOKEN_NULL && "no selected token during initial sampling");
+            return no_candidate;
+        }
 
-    if (grammar_first || !grammar_should_apply(gsmpl)) {
-        return id;
-    }
+        llama_token sampled = cur_p.data[cur_p.selected].id;
+        if (grammar_first || !grammar_should_apply(gsmpl)) {
+            if (suppress_eog && has_visible_piece(sampled)) {
+                gsmpl->suppress_eog_after_reasoning_recovery = false;
+            }
+            return sampled;
+        }
 
-    // check if it the sampled token fits the grammar (grammar-based rejection sampling)
-    {
-        llama_token_data       single_token_data       = { id, 1.0f, 0.0f };
+        // Check whether the sampled token fits the grammar (grammar-based rejection sampling).
+        llama_token_data       single_token_data       = { sampled, 1.0f, 0.0f };
         llama_token_data_array single_token_data_array = { &single_token_data, 1, -1, false };
-
         llama_sampler_apply(grmr, &single_token_data_array);
+        if (single_token_data_array.data[0].logit != -INFINITY) {
+            if (suppress_eog && has_visible_piece(sampled)) {
+                gsmpl->suppress_eog_after_reasoning_recovery = false;
+            }
+            return sampled;
+        }
 
-        const bool is_valid = single_token_data_array.data[0].logit != -INFINITY;
-        if (is_valid) {
-            return id;
+        // Resample with grammar before the sampling chain.
+        gsmpl->set_logits(ctx, idx);
+        llama_sampler_apply(rbudget, &cur_p);
+        if (suppress_eog) {
+            const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
+            for (size_t i = 0; i < cur_p.size; ++i) {
+                if (llama_vocab_is_eog(vocab, cur_p.data[i].id)) {
+                    cur_p.data[i].logit = -INFINITY;
+                }
+            }
+        }
+        if (grammar_should_apply(gsmpl)) {
+            llama_sampler_apply(grmr, &cur_p);
+        }
+        llama_sampler_apply(chain, &cur_p);
+        if (cur_p.selected == -1) {
+            if (suppress_eog) {
+                return suppressed_eog_fallback();
+            }
+            GGML_ASSERT(no_candidate != LLAMA_TOKEN_NULL && "no selected token during initial grammar resampling");
+            return no_candidate;
+        }
+        sampled = cur_p.data[cur_p.selected].id;
+        if (suppress_eog && has_visible_piece(sampled)) {
+            gsmpl->suppress_eog_after_reasoning_recovery = false;
+        }
+        return sampled;
+    };
+
+    id = sample_cpu(LLAMA_TOKEN_NULL);
+
+    const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
+    if (gsmpl->params.reasoning_eos_recovery &&
+        gsmpl->reasoning_eos_recoveries == 0 &&
+        llama_vocab_is_eog(vocab, id) &&
+        common_reasoning_budget_force(rbudget)) {
+        gsmpl->reasoning_eos_recoveries++;
+        gsmpl->suppress_eog_after_reasoning_recovery = true;
+        LOG_INF("%s: recovered EOG sampled inside reasoning; forcing reasoning end sequence\n", __func__);
+
+        // The discarded EOG is deliberately not accepted. Reuse the logits at the
+        // same decode position after transitioning the reasoning sampler to FORCING.
+        gsmpl->set_logits(ctx, idx);
+        id = sample_cpu(id);
+        if (llama_vocab_is_eog(vocab, id)) {
+            common_reasoning_budget_cancel_force(rbudget);
+            gsmpl->suppress_eog_after_reasoning_recovery = false;
+            LOG_ERR("%s: failed to force reasoning end after recovering EOG; ending generation\n", __func__);
         }
     }
-
-    // resampling:
-    // if the token is not valid, sample again, but first apply the grammar sampler and then the sampling chain
-    gsmpl->set_logits(ctx, idx);
-
-    llama_sampler_apply(rbudget,  &cur_p);
-
-    if (grammar_should_apply(gsmpl)) {
-        llama_sampler_apply(grmr,  &cur_p);
-    }
-
-    llama_sampler_apply(chain, &cur_p);
-
-    GGML_ASSERT(cur_p.selected != -1 && "no selected token during sampling - check your sampling configuration");
-
-    id = cur_p.data[cur_p.selected].id;
 
     return id;
 }

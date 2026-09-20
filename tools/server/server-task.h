@@ -45,6 +45,9 @@ enum stop_type {
     STOP_TYPE_EOS,
     STOP_TYPE_WORD,
     STOP_TYPE_LIMIT,
+    STOP_TYPE_CONTEXT,
+    STOP_TYPE_INDENT,
+    STOP_TYPE_TIME,
 };
 
 struct task_params {

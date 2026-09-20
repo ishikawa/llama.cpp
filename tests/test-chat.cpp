@@ -7321,6 +7321,92 @@ static void test_developer_role_to_system_workaround() {
         }
         LOG_ERR("Test 1 passed: developer role changed to system\n");
     }
+
+    // Codex may inject a developer message into existing Responses history
+    // after permissions change. Templates such as Qwen reject a system role
+    // anywhere except the beginning, so preserve it in place as a user turn.
+    {
+        const std::string strict_mock_template =
+            "{%- for message in messages -%}"
+            "{%- if (message.role == 'system' or message.role == 'developer') and not loop.first -%}"
+            "{{- raise_exception('System message must be at the beginning.') -}}"
+            "{%- endif -%}"
+            "{{- '<|' + message.role + '|>' + message.content + '<|end|>' -}}"
+            "{%- endfor -%}";
+        auto strict_tmpls = common_chat_templates_ptr(
+            common_chat_templates_init(/* model= */ nullptr, strict_mock_template));
+
+        common_chat_templates_inputs inputs;
+        common_chat_msg user_msg;      user_msg.role = "user";      user_msg.content = "first";
+        common_chat_msg assistant_msg; assistant_msg.role = "assistant"; assistant_msg.content = "answer";
+        common_chat_msg developer_msg; developer_msg.role = "developer"; developer_msg.content = "new permissions";
+        common_chat_msg next_user_msg; next_user_msg.role = "user"; next_user_msg.content = "continue";
+        inputs.messages = { user_msg, assistant_msg, developer_msg, next_user_msg };
+        inputs.add_generation_prompt = false;
+
+        const auto params = common_chat_templates_apply(strict_tmpls.get(), inputs);
+        assert_equals(
+            std::string("<|user|>first<|end|><|assistant|>answer<|end|>"
+                        "<|user|>new permissions<|end|><|user|>continue<|end|>"),
+            params.prompt);
+    }
+
+    // Existing system prompts remain unchanged while later developer messages
+    // stay at their chronological position.
+    {
+        const std::string strict_mock_template =
+            "{%- for message in messages -%}"
+            "{%- if message.role == 'system' and not loop.first -%}"
+            "{{- raise_exception('System message must be at the beginning.') -}}"
+            "{%- endif -%}"
+            "{{- '<|' + message.role + '|>' + message.content + '<|end|>' -}}"
+            "{%- endfor -%}";
+        auto strict_tmpls = common_chat_templates_ptr(
+            common_chat_templates_init(/* model= */ nullptr, strict_mock_template));
+
+        common_chat_templates_inputs inputs;
+        common_chat_msg system_msg;    system_msg.role = "system";       system_msg.content = "base";
+        common_chat_msg user_msg;      user_msg.role = "user";           user_msg.content = "first";
+        common_chat_msg developer_msg; developer_msg.role = "developer"; developer_msg.content = "updated";
+        inputs.messages = { system_msg, user_msg, developer_msg };
+        inputs.add_generation_prompt = false;
+
+        const auto params = common_chat_templates_apply(strict_tmpls.get(), inputs);
+        assert_equals(
+            std::string("<|system|>base<|end|><|user|>first<|end|><|user|>updated<|end|>"),
+            params.prompt);
+    }
+
+    // Templates without the Qwen-style restriction keep the original mapping.
+    {
+        common_chat_templates_inputs inputs;
+        common_chat_msg user_msg;      user_msg.role = "user";           user_msg.content = "first";
+        common_chat_msg developer_msg; developer_msg.role = "developer"; developer_msg.content = "updated";
+        inputs.messages = { user_msg, developer_msg };
+        inputs.add_generation_prompt = false;
+
+        const auto params = common_chat_templates_apply(tmpls.get(), inputs);
+        assert_equals(
+            std::string("<|user|>first<|end|><|system|>updated<|end|>"),
+            params.prompt);
+    }
+
+    // Exercise the actual Qwen template and its capability detection path.
+    {
+        auto qwen_tmpls = read_templates("models/templates/Qwen3.5-4B.jinja");
+        common_chat_templates_inputs inputs;
+        common_chat_msg user_msg;      user_msg.role = "user";           user_msg.content = "first";
+        common_chat_msg assistant_msg; assistant_msg.role = "assistant"; assistant_msg.content = "answer";
+        common_chat_msg developer_msg; developer_msg.role = "developer"; developer_msg.content = "new permissions";
+        common_chat_msg next_user_msg; next_user_msg.role = "user";      next_user_msg.content = "continue";
+        inputs.messages = { user_msg, assistant_msg, developer_msg, next_user_msg };
+        inputs.add_generation_prompt = true;
+
+        const auto params = common_chat_templates_apply(qwen_tmpls.get(), inputs);
+        assert_equals(
+            true,
+            params.prompt.find("<|im_start|>user\nnew permissions<|im_end|>") != std::string::npos);
+    }
 }
 
 // Verify reasoning-trace retention rules in the DeepSeek-V4 template:

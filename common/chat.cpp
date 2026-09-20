@@ -1001,12 +1001,15 @@ std::string common_chat_template_generation_prompt(
 
 namespace workaround {
 
-static void map_developer_role_to_system(json & messages) {
-    for (auto & message : messages) {
-        if (message.contains("role")) {
-            if (message["role"] == "developer") {
-                message["role"] = "system";
-            }
+static void map_developer_role(json & messages, bool system_must_be_first) {
+    for (size_t i = 0; i < messages.size(); ++i) {
+        auto & message = messages[i];
+        if (message.contains("role") && message["role"] == "developer") {
+            // Codex can inject developer messages into existing Responses
+            // history when permissions change. Qwen-style templates reject a
+            // system message anywhere except the beginning, so preserve the
+            // message at its chronological position as a user message.
+            message["role"] = system_must_be_first && i > 0 ? "user" : "system";
         }
     }
 }
@@ -1269,8 +1272,9 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
     }
 
     if (src.find("<|channel|>") == std::string::npos) {
-        // map developer to system for all models except for GPT-OSS
-        workaround::map_developer_role_to_system(params.messages);
+        // map developer to a role supported by all models except for GPT-OSS
+        const bool system_must_be_first = src.find("System message must be at the beginning") != std::string::npos;
+        workaround::map_developer_role(params.messages, system_must_be_first);
     }
 
     if (!tmpl.original_caps().supports_system_role) {

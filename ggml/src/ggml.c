@@ -1099,9 +1099,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "QSA_EXPAND",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1214,9 +1216,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    "qsa_expand(x)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5466,6 +5470,37 @@ struct ggml_tensor * ggml_top_k(
 
     result->op     = GGML_OP_TOP_K;
     result->src[0] = a;
+
+    return result;
+}
+
+// ggml_qsa_expand
+
+struct ggml_tensor * ggml_qsa_expand(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * block_ids,
+        struct ggml_tensor  * block_cells,
+        struct ggml_tensor  * tail_cells) {
+    GGML_ASSERT(block_ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(block_cells->type == GGML_TYPE_I32);
+    GGML_ASSERT(tail_cells->type == GGML_TYPE_I32);
+    GGML_ASSERT(block_ids->ne[0] > 0);
+    GGML_ASSERT(block_cells->ne[0] > 0);
+    GGML_ASSERT(tail_cells->ne[0] > 0);
+    GGML_ASSERT(block_ids->ne[1] == tail_cells->ne[1]);
+    GGML_ASSERT(block_ids->ne[2] == 1);
+    GGML_ASSERT(block_cells->ne[2] == block_ids->ne[3]);
+    GGML_ASSERT(tail_cells->ne[2] == block_ids->ne[3]);
+    GGML_ASSERT(block_cells->ne[3] == 1 && tail_cells->ne[3] == 1);
+
+    const int64_t width = block_ids->ne[0] * block_cells->ne[0] + tail_cells->ne[0];
+    struct ggml_tensor * result = ggml_new_tensor_4d(
+            ctx, GGML_TYPE_I32, width, block_ids->ne[1], 1, block_ids->ne[3]);
+
+    result->op     = GGML_OP_QSA_EXPAND;
+    result->src[0] = block_ids;
+    result->src[1] = block_cells;
+    result->src[2] = tail_cells;
 
     return result;
 }

@@ -601,6 +601,8 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_QSA_EXPAND,
+
         GGML_OP_COUNT,
     };
 
@@ -2466,6 +2468,16 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             int                   k);
+
+    // expand selected QSA block ids into cache cell ids and append the incomplete tail
+    // block_ids: [n_selected, n_queries, 1, n_stream]
+    // block_cells: [ratio, n_blocks, n_stream]
+    // tail_cells: [ratio - 1, n_queries, n_stream], negative entries are padded with a selected cell
+    GGML_API struct ggml_tensor * ggml_qsa_expand(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * block_ids,
+            struct ggml_tensor  * block_cells,
+            struct ggml_tensor  * tail_cells);
 
     GGML_API struct ggml_tensor * ggml_arange(
             struct ggml_context * ctx,

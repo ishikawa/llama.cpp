@@ -1558,6 +1558,17 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_top_k_merge(ggml
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_qsa_expand(ggml_metal_library_t lib) {
+    const char * base = "kernel_qsa_expand";
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, base);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, base, base, nullptr);
+    }
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_topk_moe(
         ggml_metal_library_t lib, int32_t n_expert, int32_t top_k, bool with_norm) {
     char base[256];

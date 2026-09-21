@@ -8611,6 +8611,48 @@ void ggml_compute_forward_top_k(
     }
 }
 
+void ggml_compute_forward_qsa_expand(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * block_ids   = dst->src[0];
+    const ggml_tensor * block_cells = dst->src[1];
+    const ggml_tensor * tail_cells  = dst->src[2];
+
+    const int64_t n_selected = block_ids->ne[0];
+    const int64_t n_queries  = block_ids->ne[1];
+    const int64_t n_stream   = block_ids->ne[3];
+    const int64_t ratio      = block_cells->ne[0];
+    const int64_t n_blocks   = block_cells->ne[1];
+    const int64_t n_tail     = tail_cells->ne[0];
+    GGML_ASSERT(block_cells->ne[2] == n_stream);
+    GGML_ASSERT(tail_cells->ne[1] == n_queries && tail_cells->ne[2] == n_stream);
+    GGML_ASSERT(dst->nb[0] == sizeof(int32_t));
+
+    for (int64_t row = params->ith; row < n_queries * n_stream; row += params->nth) {
+        const int64_t q = row % n_queries;
+        const int64_t s = row / n_queries;
+        int32_t * out = (int32_t *) ((char *) dst->data + q * dst->nb[1] + s * dst->nb[3]);
+
+        for (int64_t b = 0; b < n_selected; ++b) {
+            const int32_t block = *(const int32_t *) ((const char *) block_ids->data +
+                    b * block_ids->nb[0] + q * block_ids->nb[1] + s * block_ids->nb[3]);
+            GGML_ASSERT(block >= 0 && block < n_blocks);
+
+            for (int64_t r = 0; r < ratio; ++r) {
+                out[b * ratio + r] = *(const int32_t *) ((const char *) block_cells->data +
+                        r * block_cells->nb[0] + block * block_cells->nb[1] + s * block_cells->nb[2]);
+            }
+        }
+
+        const int32_t pad = out[0];
+        for (int64_t t = 0; t < n_tail; ++t) {
+            const int32_t cell = *(const int32_t *) ((const char *) tail_cells->data +
+                    t * tail_cells->nb[0] + q * tail_cells->nb[1] + s * tail_cells->nb[2]);
+            out[n_selected * ratio + t] = cell >= 0 ? cell : pad;
+        }
+    }
+}
+
 static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         const ggml_compute_params * params,
         ggml_tensor * dst,

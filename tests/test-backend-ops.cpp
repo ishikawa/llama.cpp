@@ -6766,6 +6766,74 @@ struct test_topk_qsa : public test_case {
     }
 };
 
+struct test_qsa_expand : public test_case {
+    const int64_t n_blocks;
+    const int64_t n_selected;
+    const int64_t n_tps;
+    const int64_t n_stream;
+    const int64_t ratio;
+
+    test_qsa_expand(int64_t n_blocks, int64_t n_selected, int64_t n_tps, int64_t n_stream, int64_t ratio) :
+        n_blocks(n_blocks), n_selected(n_selected), n_tps(n_tps), n_stream(n_stream), ratio(ratio) {}
+
+    std::string vars() override {
+        return VARS_TO_STR5(n_blocks, n_selected, n_tps, n_stream, ratio);
+    }
+
+    double max_err() override { return 0.0; }
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * blocks = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, n_selected, n_tps, 1, n_stream);
+        ggml_set_name(blocks, "blocks");
+        ggml_tensor * block_cells = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, ratio, n_blocks, n_stream);
+        ggml_set_name(block_cells, "block_cells");
+        ggml_tensor * tail_cells = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, ratio - 1, n_tps, n_stream);
+        ggml_set_name(tail_cells, "tail_cells");
+
+        ggml_tensor * out = ggml_qsa_expand(ctx, blocks, block_cells, tail_cells);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE) {
+                continue;
+            }
+
+            std::vector<int32_t> data(ggml_nelements(t));
+            if (strcmp(t->name, "blocks") == 0) {
+                for (int64_t s = 0; s < n_stream; ++s) {
+                    for (int64_t q = 0; q < n_tps; ++q) {
+                        for (int64_t k = 0; k < n_selected; ++k) {
+                            data[k + n_selected*(q + n_tps*s)] = (q*3 + k) % n_blocks;
+                        }
+                    }
+                }
+            } else if (strcmp(t->name, "block_cells") == 0) {
+                for (int64_t s = 0; s < n_stream; ++s) {
+                    for (int64_t b = 0; b < n_blocks; ++b) {
+                        for (int64_t j = 0; j < ratio; ++j) {
+                            data[j + ratio*(b + n_blocks*s)] = b*ratio + j;
+                        }
+                    }
+                }
+            } else {
+                for (int64_t s = 0; s < n_stream; ++s) {
+                    for (int64_t q = 0; q < n_tps; ++q) {
+                        for (int64_t j = 0; j < ratio - 1; ++j) {
+                            data[j + (ratio - 1)*(q + n_tps*s)] =
+                                q + 1 == n_tps || j > q % ratio ? -1 : 1000 + q*ratio + j;
+                        }
+                    }
+                }
+            }
+            ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int32_t));
+        }
+    }
+};
+
 enum MoeGatingFunc {
     GATING_FUNC_SOFTMAX,
     GATING_FUNC_SIGMOID,
@@ -10576,6 +10644,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_topk_qsa(512,  2048,  2, 1, 1500));
     test_cases.emplace_back(new test_topk_qsa(256,  2048,  4, 2, 2000));
     test_cases.emplace_back(new test_topk_qsa(64,   256,   2, 1, 200));  // small k: unfused fallback
+    test_cases.emplace_back(new test_qsa_expand(16,  4,  1, 1, 4));
+    test_cases.emplace_back(new test_qsa_expand(64, 16,  3, 2, 4));
 
     // exhaustive top_k tests
     //for (int i = 1; i < 9999; ++i) {

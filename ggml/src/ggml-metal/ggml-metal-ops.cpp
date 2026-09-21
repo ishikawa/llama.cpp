@@ -2697,6 +2697,23 @@ size_t ggml_metal_op_mul_mat_id_extra_ids(const ggml_tensor * op) {
     return ggml_type_size(GGML_TYPE_I32)*ne02*ne20*ne21;
 }
 
+static int64_t ggml_metal_op_mul_mat_id_max_tiles(const ggml_tensor * op) {
+    const int64_t ne02 = op->src[0]->ne[2]; // n_expert
+    const int64_t ne20 = op->src[2]->ne[0]; // n_expert_used
+    const int64_t ne21 = op->src[2]->ne[1]; // n_token
+    const int64_t n_rows = ne20*ne21;
+
+    return (n_rows + 31)/32 + std::min(ne02, n_rows);
+}
+
+size_t ggml_metal_op_mul_mat_id_extra_schedule(const ggml_tensor * op) {
+    assert(op->op == GGML_OP_MUL_MAT_ID);
+
+    // the first uint stores the count, followed by (expert, row-tile) pairs
+    const int64_t max_tiles = ggml_metal_op_mul_mat_id_max_tiles(op);
+    return sizeof(uint32_t)*(1 + 2*max_tiles);
+}
+
 size_t ggml_metal_op_mul_mat_id_extra_amax(const ggml_tensor * op) {
     assert(op->op == GGML_OP_MUL_MAT_ID);
 
@@ -2757,8 +2774,11 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
         ggml_metal_buffer_id bid_ids = bid_tpe;
         bid_ids.offs += ggml_metal_op_mul_mat_id_extra_tpe(op);
 
-        ggml_metal_buffer_id bid_amax = bid_ids;
-        bid_amax.offs += ggml_metal_op_mul_mat_id_extra_ids(op);
+        ggml_metal_buffer_id bid_schedule = bid_ids;
+        bid_schedule.offs += ggml_metal_op_mul_mat_id_extra_ids(op);
+
+        ggml_metal_buffer_id bid_amax = bid_schedule;
+        bid_amax.offs += ggml_metal_op_mul_mat_id_extra_schedule(op);
 
         // src1 rescale factors, computed before the matmul
         // ref: https://github.com/ggml-org/llama.cpp/pull/26223
@@ -2812,6 +2832,7 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
             ggml_metal_encoder_set_buffer  (enc, bid_src2, 1);
             ggml_metal_encoder_set_buffer  (enc, bid_tpe,  2);
             ggml_metal_encoder_set_buffer  (enc, bid_ids,  3);
+            ggml_metal_encoder_set_buffer  (enc, bid_schedule, 4);
 
             ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
 
@@ -2862,12 +2883,14 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
             ggml_metal_encoder_set_buffer  (enc, bid_ids,  4);
             ggml_metal_encoder_set_buffer  (enc, bid_dst,  5);
             ggml_metal_encoder_set_buffer  (enc, bid_amax, 6);
+            ggml_metal_encoder_set_buffer  (enc, bid_schedule, 7);
 
             const size_t smem = pipeline.smem;
 
             ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
 
-            ggml_metal_encoder_dispatch_threadgroups(enc, (ne21 + 31)/32, (ne01 + 63)/64, ne02, 128, 1, 1);
+            const int64_t max_tiles = ggml_metal_op_mul_mat_id_max_tiles(op);
+            ggml_metal_encoder_dispatch_threadgroups(enc, max_tiles, (ne01 + 63)/64, 1, 128, 1, 1);
         }
     } else {
         auto pipeline = ggml_metal_library_get_pipeline_mul_mv_id(lib, op);

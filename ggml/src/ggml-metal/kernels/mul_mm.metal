@@ -365,10 +365,18 @@ kernel void kernel_mul_mm_id_map0(
         device  const char * src2,
         device        char * htpe,
         device        char * hids,
+        device        char * schedule,
         threadgroup   char * shmem [[threadgroup(0)]],
         ushort tpitg[[thread_position_in_threadgroup]],
         ushort   ntg[[threads_per_threadgroup]]) {
     const short ide = tpitg; // expert id
+
+    device atomic_uint * tile_count = (device atomic_uint *) schedule;
+    // The counter reset requires this kernel to run as one threadgroup.
+    if (tpitg == 0) {
+        atomic_store_explicit(tile_count, 0u, memory_order_relaxed);
+    }
+    threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
 
     uint32_t n_all = 0;
 
@@ -413,6 +421,16 @@ kernel void kernel_mul_mm_id_map0(
 
     device uint32_t * tpe_u32 = (device uint32_t *) (htpe);
     tpe_u32[ide] = n_all;
+
+    const uint32_t n_tiles = (n_all + 31)/32;
+    if (n_tiles > 0) {
+        const uint32_t tile_base = atomic_fetch_add_explicit(tile_count, n_tiles, memory_order_relaxed);
+        device uint32_t * tiles = (device uint32_t *) schedule + 1;
+        for (uint32_t tile = 0; tile < n_tiles; ++tile) {
+            tiles[2*(tile_base + tile) + 0] = ide;
+            tiles[2*(tile_base + tile) + 1] = tile;
+        }
+    }
 }
 
 kernel void kernel_mul_mm_id_amax_part_f32(
@@ -515,9 +533,9 @@ kernel void kernel_mul_mm_id(
         device const char * hids,
         device       char * dst,
         device const char * amax,
+        device const char * schedule,
         threadgroup  char * shmem [[threadgroup(0)]],
         uint3  tgpig[[threadgroup_position_in_grid]],
-        uint3   tgpg[[threadgroups_per_grid]],
         ushort tiitg[[thread_index_in_threadgroup]],
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
@@ -536,7 +554,12 @@ kernel void kernel_mul_mm_id(
     constexpr int NL0 = NK/16;
     constexpr int NL1 = NK/8;
 
-    const int im = tgpig.z; // expert
+    device const uint32_t * schedule_u32 = (device const uint32_t *) schedule;
+    if (tgpig.x >= schedule_u32[0]) {
+        return;
+    }
+    const int im = schedule_u32[1 + 2*tgpig.x + 0];
+    const int r1_begin = schedule_u32[1 + 2*tgpig.x + 1]*NR1;
     const int r0 = tgpig.y*NR0;
 
     device const uint32_t * tpe_u32 = (device const uint32_t *) (htpe);
@@ -545,6 +568,9 @@ kernel void kernel_mul_mm_id(
     device const int32_t  * ids_i32 = (device const int32_t  *) (hids) + im*(args.ne20*args.ne21);
 
     const int32_t neh1 = tpe_u32[im];
+    if (r1_begin >= neh1) {
+        return;
+    }
 
     // if this block is of 64x32 shape or smaller
     const short nr0 = (args.ne0 - r0 < NR0) ? (args.ne0 - r0) : NR0;
@@ -573,10 +599,7 @@ kernel void kernel_mul_mm_id(
         execution_simdgroups<4>> mm;
 #endif
 
-    // The grid is sized for ne21 rows per expert, but duplicates can give one
-    // expert up to ne20*ne21 rows. The loop condition is uniform per
-    // threadgroup, so barriers in the body remain valid.
-    for (int r1 = tgpig.x*NR1; r1 < neh1; r1 += (int)(tgpg.x*NR1)) {
+    const int r1 = r1_begin;
 
     const short nr1 = (neh1 - r1 < NR1) ? (neh1 - r1) : NR1;
 
@@ -849,7 +872,6 @@ kernel void kernel_mul_mm_id(
         }
     }
 
-    } // grid-stride loop over r1
 }
 
 //

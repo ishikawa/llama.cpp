@@ -3115,6 +3115,8 @@ static struct llama_sampler_i llama_sampler_utf8_constrain_i = {
     /* .backend_accept    = */ nullptr,
     /* .backend_apply     = */ nullptr,
     /* .backend_set_input = */ nullptr,
+    /* .backend_reset     = */ nullptr,
+    /* .copy_state        = */ nullptr,
 };
 
 struct llama_sampler * llama_sampler_init_utf8_constrain(const struct llama_vocab * vocab) {

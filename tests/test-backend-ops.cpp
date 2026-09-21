@@ -6807,7 +6807,7 @@ struct test_qsa_expand : public test_case {
                 for (int64_t s = 0; s < n_stream; ++s) {
                     for (int64_t q = 0; q < n_tps; ++q) {
                         for (int64_t k = 0; k < n_selected; ++k) {
-                            data[k + n_selected*(q + n_tps*s)] = (q*3 + k) % n_blocks;
+                            data[k + n_selected*(q + n_tps*s)] = (q*3 + k + s) % n_blocks;
                         }
                     }
                 }
@@ -6815,7 +6815,7 @@ struct test_qsa_expand : public test_case {
                 for (int64_t s = 0; s < n_stream; ++s) {
                     for (int64_t b = 0; b < n_blocks; ++b) {
                         for (int64_t j = 0; j < ratio; ++j) {
-                            data[j + ratio*(b + n_blocks*s)] = b*ratio + j;
+                            data[j + ratio*(b + n_blocks*s)] = s*10000 + b*ratio + j;
                         }
                     }
                 }
@@ -6824,7 +6824,7 @@ struct test_qsa_expand : public test_case {
                     for (int64_t q = 0; q < n_tps; ++q) {
                         for (int64_t j = 0; j < ratio - 1; ++j) {
                             data[j + (ratio - 1)*(q + n_tps*s)] =
-                                q + 1 == n_tps || j > q % ratio ? -1 : 1000 + q*ratio + j;
+                                q + 1 == n_tps || j > q % ratio ? -1 : 1000 + (s*n_tps + q)*ratio + j;
                         }
                     }
                 }
@@ -10645,7 +10645,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_topk_qsa(256,  2048,  4, 2, 2000));
     test_cases.emplace_back(new test_topk_qsa(64,   256,   2, 1, 200));  // small k: unfused fallback
     test_cases.emplace_back(new test_qsa_expand(16,  4,  1, 1, 4));
+    test_cases.emplace_back(new test_qsa_expand(17,  1,  5, 1, 4));
+    test_cases.emplace_back(new test_qsa_expand(17,  5,  5, 2, 4));
+    test_cases.emplace_back(new test_qsa_expand(33, 16,  3, 2, 2));
     test_cases.emplace_back(new test_qsa_expand(64, 16,  3, 2, 4));
+    test_cases.emplace_back(new test_qsa_expand( 1,  1,  2, 2, 128));
 
     // exhaustive top_k tests
     //for (int i = 1; i < 9999; ++i) {

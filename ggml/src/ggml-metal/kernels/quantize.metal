@@ -321,6 +321,45 @@ template [[host_name("kernel_get_rows_i32")]]  kernel get_rows_f_t kernel_get_ro
 template [[host_name("kernel_get_rows_bf16")]] kernel get_rows_f_t kernel_get_rows_f<bfloat, float>;
 #endif
 
+kernel void kernel_qsa_expand(
+        constant ggml_metal_kargs_qsa_expand & args,
+        device const int32_t * block_ids,
+        device const int32_t * block_cells,
+        device const int32_t * tail_cells,
+        device       int32_t * dst,
+        uint gid [[thread_position_in_grid]]) {
+    const uint count = uint(args.width * args.n_queries * args.n_stream);
+    if (gid >= count) {
+        return;
+    }
+
+    const uint col = gid % uint(args.width);
+    const uint row = gid / uint(args.width);
+    const uint q   = row % uint(args.n_queries);
+    const uint s   = row / uint(args.n_queries);
+
+    const uint selected_width = uint(args.n_selected * args.ratio);
+    if (col < selected_width) {
+        const uint b = col / uint(args.ratio);
+        const uint r = col % uint(args.ratio);
+        const int32_t block = block_ids[(s * uint(args.n_queries) + q) * uint(args.n_selected) + b];
+        const uint block_idx = block >= 0 && block < args.n_blocks ? uint(block) : 0;
+        dst[gid] = block_cells[(s * uint(args.n_blocks) + block_idx) * uint(args.ratio) + r];
+        return;
+    }
+
+    const uint t = col - selected_width;
+    const int32_t cell = tail_cells[(s * uint(args.n_queries) + q) * uint(args.n_tail) + t];
+    if (cell >= 0) {
+        dst[gid] = cell;
+        return;
+    }
+
+    const int32_t block = block_ids[(s * uint(args.n_queries) + q) * uint(args.n_selected)];
+    const uint block_idx = block >= 0 && block < args.n_blocks ? uint(block) : 0;
+    dst[gid] = block_cells[(s * uint(args.n_blocks) + block_idx) * uint(args.ratio)];
+}
+
 typedef decltype(kernel_get_rows_q<block_q4_0, 2, dequantize_q4_0>) get_rows_q_t;
 
 template [[host_name("kernel_get_rows_q1_0")]]    kernel get_rows_q_t kernel_get_rows_q<block_q1_0,    8, dequantize_q1_0>;
@@ -477,4 +516,3 @@ typedef decltype(kernel_set_rows_q<float, int64_t, QK_K, block_tq2_0, quantize_t
 
 template [[host_name("kernel_set_rows_f32_i64_tq2_0")]]  kernel set_rows_qK_t kernel_set_rows_q<float, int64_t, QK_K, block_tq2_0, quantize_tq2_0>;
 template [[host_name("kernel_set_rows_f32_i32_tq2_0")]]  kernel set_rows_qK_t kernel_set_rows_q<float, int32_t, QK_K, block_tq2_0, quantize_tq2_0>;
-

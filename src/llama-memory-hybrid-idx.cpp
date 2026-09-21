@@ -10,6 +10,7 @@
 #include <cassert>
 #include <cmath>
 #include <iterator>
+#include <map>
 #include <stdexcept>
 
 //
@@ -274,17 +275,20 @@ void llama_memory_hybrid_idx::set_input_qsa(
         ggml_tensor * cell_blk,
         ggml_tensor * blk_cells,
         ggml_tensor * blk_pos,
+        ggml_tensor * tail_cells,
         ggml_tensor * bias,
         const llama_ubatch * ubatch,
         uint32_t ratio,
-        bool blk_bias) const {
+        bool blk_bias,
+        uint32_t n_kv) const {
     GGML_ASSERT(ratio > 0);
     GGML_ASSERT(get_mem_idx() != nullptr);
 
-    GGML_ASSERT(ggml_backend_buffer_is_host(cell_blk->buffer));
+    if (cell_blk) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(cell_blk->buffer));
+    }
 
-    const int64_t n_kv     = cell_blk->ne[0];
-    const int64_t n_ns     = cell_blk->ne[1];        // streams in this ubatch
+    const int64_t n_ns     = blk_cells->ne[1];       // streams in this ubatch
     const int64_t n_blocks = blk_pos->ne[0]/(4*n_ns);
     const int64_t n_tokens = ubatch->n_tokens;
     const int64_t r        = ratio;
@@ -292,10 +296,15 @@ void llama_memory_hybrid_idx::set_input_qsa(
     GGML_ASSERT(n_tokens % n_ns == 0);
     const int64_t n_tps = n_tokens/n_ns;             // tokens per stream
 
-    int32_t * dst_cell_blk  = (int32_t *) cell_blk->data;
+    int32_t * dst_cell_blk  = cell_blk ? (int32_t *) cell_blk->data : nullptr;
     int32_t * dst_blk_cells = (int32_t *) blk_cells->data;
     int32_t * dst_blk_pos   = (int32_t *) blk_pos->data;
     float   * dst_bias      = (float   *) bias->data;
+    int32_t * dst_tail_cells = tail_cells ? (int32_t *) tail_cells->data : nullptr;
+
+    if (dst_tail_cells) {
+        std::fill(dst_tail_cells, dst_tail_cells + ggml_nelements(tail_cells), -1);
+    }
 
     // a block is keyed on (sequence set, index bucket): a unified cache counts every sequence
     // from zero, so the bucket alone would pool two sequences into one block
@@ -326,7 +335,7 @@ void llama_memory_hybrid_idx::set_input_qsa(
         const llama_seq_id seq_of_stream = ubatch->seq_id[s*n_tps][0];
         const auto & cells = get_mem_idx()->get_cells(seq_of_stream);
 
-        int32_t * cur_cell_blk  = dst_cell_blk  + s*n_kv;
+        int32_t * cur_cell_blk  = dst_cell_blk ? dst_cell_blk + s*n_kv : nullptr;
         int32_t * cur_blk_cells = dst_blk_cells + s*(r*n_blocks);
 
         std::fill(cur_blk_cells, cur_blk_cells + r*n_blocks, 0);
@@ -508,7 +517,50 @@ void llama_memory_hybrid_idx::set_input_qsa(
                 cur_blk_cells[blk_of[j]*r + (idx%r)] = (int32_t) j;
             }
 
-            cur_cell_blk[j] = blk_of[j] < 0 ? dead_bid : blk_of[j];
+            if (cur_cell_blk) {
+                cur_cell_blk[j] = blk_of[j] < 0 ? dead_bid : blk_of[j];
+            }
+        }
+
+        struct tail_info {
+            int64_t first;
+            int64_t last;
+            std::vector<int32_t> cells;
+        };
+
+        std::map<llama_seq_id, tail_info> tail_order;
+        if (dst_tail_cells && !ranked) {
+            for (int64_t ii = 0; ii < n_tps; ++ii) {
+                const int64_t q = ubatch->pos[s*n_tps + ii];
+                const int64_t tail_start = (q + 1)/r*r;
+                const llama_seq_id seq_id = ubatch->seq_id[s*n_tps + ii][0];
+
+                const auto [it, inserted] = tail_order.try_emplace(seq_id, tail_info { tail_start, q, {} });
+                if (!inserted) {
+                    it->second.first = std::min(it->second.first, tail_start);
+                    it->second.last  = std::max(it->second.last, q);
+                }
+            }
+
+            for (int64_t j = 0; j < n_kv; ++j) {
+                if (cells.is_empty(j)) {
+                    continue;
+                }
+
+                const int64_t pos = cells.pos_get(j);
+                for (auto & entry : tail_order) {
+                    if (pos >= entry.second.first && pos <= entry.second.last &&
+                            cells.seq_has((uint32_t) j, entry.first)) {
+                        entry.second.cells.push_back((int32_t) j);
+                    }
+                }
+            }
+
+            for (auto & entry : tail_order) {
+                std::sort(entry.second.cells.begin(), entry.second.cells.end(), [&](int32_t a, int32_t b) {
+                    return cells.pos_get(a) < cells.pos_get(b);
+                });
+            }
         }
 
         for (int64_t ii = 0; ii < n_tps; ++ii) {
@@ -543,6 +595,26 @@ void llama_memory_hybrid_idx::set_input_qsa(
             // the tail is an incomplete block and is always visible, as in the reference
             const int64_t tail_start = (q + 1)/r*r;
 
+            if (dst_tail_cells) {
+                int32_t * cur_tail = dst_tail_cells + i*(r - 1);
+                const auto & seq_order = ranked ? order : tail_order.at(seq_id).cells;
+                int64_t n_tail = 0;
+
+                const auto first = std::lower_bound(seq_order.begin(), seq_order.end(), tail_start,
+                        [&](int32_t cell, int64_t target) {
+                            return (ranked ? rank[cell] : cells.pos_get(cell)) < target;
+                        });
+                const auto last = std::upper_bound(first, seq_order.end(), q,
+                        [&](int64_t target, int32_t cell) {
+                            return target < (ranked ? rank[cell] : cells.pos_get(cell));
+                        });
+
+                GGML_ASSERT(std::distance(first, last) <= r - 1 && "qsa: incomplete tail exceeds its block");
+                for (auto it = first; it != last && n_tail < r - 1; ++it) {
+                    cur_tail[n_tail++] = *it;
+                }
+            }
+
             if (blk_bias) {
                 // a block sits wholly inside or outside the tail, so one value covers it
                 // the caller adds the attention mask, which drops empty, foreign and future cells
@@ -554,15 +626,11 @@ void llama_memory_hybrid_idx::set_input_qsa(
                         continue;
                     }
 
-                    // finite, so it can never meet a -inf and produce a nan
-                    cur_blk_bias[b] = bid_idx[b] >= tail_start ? 1e9f : 0.0f;
+                    cur_blk_bias[b] = bid_idx[b] >= tail_start ? (r > 1 ? -INFINITY : 1e9f) : 0.0f;
                 }
 
-                // the spare block holds the unpooled cells, which are the incomplete tail, so
-                // it gets the tail value. it must stay finite: a sequence with fewer than
-                // `ratio` cells owns no full block, and a row of -inf only gives a nan.
                 if (have_dead) {
-                    cur_blk_bias[dead_bid] = 1e9f;
+                    cur_blk_bias[dead_bid] = r > 1 ? -INFINITY : 1e9f;
                 }
 
                 continue;
@@ -673,11 +741,13 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
         ggml_tensor * cell_blk,
         ggml_tensor * blk_cells,
         ggml_tensor * blk_pos,
+        ggml_tensor * tail_cells,
         ggml_tensor * bias,
         const llama_ubatch * ubatch,
         uint32_t ratio,
         bool blk_bias) const {
     GGML_ASSERT(mem != nullptr);
 
-    mem->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias);
+    mem->set_input_qsa(
+            cell_blk, blk_cells, blk_pos, tail_cells, bias, ubatch, ratio, blk_bias, get_idx()->get_n_kv());
 }

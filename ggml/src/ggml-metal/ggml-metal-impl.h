@@ -1235,6 +1235,16 @@ typedef struct {
 } ggml_metal_kargs_top_k;
 
 typedef struct {
+    int32_t n_selected;
+    int32_t n_queries;
+    int32_t n_stream;
+    int32_t ratio;
+    int32_t n_blocks;
+    int32_t n_tail;
+    int32_t width;
+} ggml_metal_kargs_qsa_expand;
+
+typedef struct {
     int32_t  ne01;      // n_tokens
     uint64_t nb01;      // logits row stride
     uint64_t nb1_ids;   // ids row stride

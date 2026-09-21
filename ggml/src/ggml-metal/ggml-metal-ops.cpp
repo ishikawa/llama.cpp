@@ -487,6 +487,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_top_k(ctx, idx);
             } break;
+        case GGML_OP_QSA_EXPAND:
+            {
+                n_fuse = ggml_metal_op_qsa_expand(ctx, idx);
+            } break;
         case GGML_OP_TRI:
             {
                 n_fuse = ggml_metal_op_tri(ctx, idx);
@@ -5605,6 +5609,46 @@ int ggml_metal_op_top_k(ggml_metal_op_t ctx, int idx) {
     } else {
         ggml_metal_op_top_k_bitonic(ctx, idx);
     }
+
+    return 1;
+}
+
+int ggml_metal_op_qsa_expand(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    const ggml_tensor * block_ids   = op->src[0];
+    const ggml_tensor * block_cells = op->src[1];
+    const ggml_tensor * tail_cells  = op->src[2];
+
+    ggml_metal_kargs_qsa_expand args = {
+        /*.n_selected =*/ (int32_t) block_ids->ne[0],
+        /*.n_queries  =*/ (int32_t) block_ids->ne[1],
+        /*.n_stream   =*/ (int32_t) block_ids->ne[3],
+        /*.ratio      =*/ (int32_t) block_cells->ne[0],
+        /*.n_blocks   =*/ (int32_t) block_cells->ne[1],
+        /*.n_tail     =*/ (int32_t) tail_cells->ne[0],
+        /*.width      =*/ (int32_t) op->ne[0],
+    };
+
+    ggml_metal_library_t lib = ctx->lib;
+    ggml_metal_encoder_t enc = ctx->enc;
+    auto pipeline = ggml_metal_library_get_pipeline_qsa_expand(lib);
+    const int nth = std::min(256, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+    const int64_t count64 = (int64_t) args.width * args.n_queries * args.n_stream;
+    GGML_ASSERT(count64 <= INT32_MAX);
+    const int count = (int) count64;
+    if (count == 0) {
+        return 1;
+    }
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(block_ids),   1);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(block_cells), 2);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(tail_cells),  3);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),          4);
+
+    ggml_metal_encoder_dispatch_threadgroups(enc, (count + nth - 1) / nth, 1, 1, nth, 1, 1);
 
     return 1;
 }

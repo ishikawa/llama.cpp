@@ -220,6 +220,9 @@ static ggml_backend_buffer_t ggml_backend_metal_buffer_type_alloc_buffer(ggml_ba
 static size_t ggml_backend_metal_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
     size_t res = ggml_nbytes(tensor);
 
+    ggml_metal_device_t ctx_dev = (ggml_metal_device_t)buft->device->context;
+    const ggml_metal_device_props * props_dev = ggml_metal_device_get_props(ctx_dev);
+
     // some operations require additional memory for fleeting data:
     switch (tensor->op) {
         case GGML_OP_MUL_MAT_ID:
@@ -236,6 +239,12 @@ static size_t ggml_backend_metal_buffer_type_get_alloc_size(ggml_backend_buffer_
                 res += ggml_metal_op_flash_attn_ext_extra_tmp(tensor);
                 res += ggml_metal_op_flash_attn_ext_extra_kv_f16(tensor);
                 res += ggml_metal_op_flash_attn_ext_extra_idx(tensor);
+            } break;
+        case GGML_OP_GATED_DELTA_NET:
+            {
+                if (ggml_metal_op_gated_delta_net_use_r4d(tensor, props_dev->has_simdgroup_mm, props_dev->max_theadgroup_memory_size)) {
+                    res += ggml_metal_op_gated_delta_net_extra_inverse(tensor);
+                }
             } break;
         case GGML_OP_CUMSUM:
         case GGML_OP_ARGSORT:

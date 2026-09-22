@@ -100,6 +100,10 @@ int ggml_metal_pipeline_max_theads_per_threadgroup(struct ggml_metal_pipeline_wi
     return pipeline.pipeline->obj.maxTotalThreadsPerThreadgroup;
 }
 
+size_t ggml_metal_pipeline_static_threadgroup_memory(struct ggml_metal_pipeline_with_params pipeline) {
+    return pipeline.pipeline->obj.staticThreadgroupMemoryLength;
+}
+
 //
 // MTLLibrary collection (one library per op-source, compiled separately)
 //

@@ -1931,6 +1931,63 @@ int ggml_metal_op_rwkv(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
+bool ggml_metal_op_gated_delta_net_use_r4d(const ggml_tensor * op, bool has_simdgroup_mm, size_t max_threadgroup_memory_size) {
+    assert(op->op == GGML_OP_GATED_DELTA_NET);
+
+    const int64_t K = ggml_get_op_params_i32(op, 0);
+    // Allocation sizing and execution must make the same choice. Treat this as a process-start
+    // option so a later setenv() cannot enable the kernel without its extra scratch allocation.
+    static const bool enabled = []() {
+        const char * env = getenv("GGML_METAL_GDN_R4D");
+        return env != nullptr && atoi(env) != 0;
+    }();
+
+    // Keep the product spike opt-in until whole-model quality and throughput gates are complete.
+    return enabled &&
+        has_simdgroup_mm &&
+        max_threadgroup_memory_size >= 32*1024 &&
+        K == 1 &&
+        op->view_src == nullptr &&
+        op->type == GGML_TYPE_F32 &&
+        ggml_is_contiguous(op) &&
+        op->src[0]->type == GGML_TYPE_F32 &&
+        op->src[1]->type == GGML_TYPE_F32 &&
+        op->src[2]->type == GGML_TYPE_F32 &&
+        op->src[3]->type == GGML_TYPE_F32 &&
+        op->src[4]->type == GGML_TYPE_F32 &&
+        op->src[5]->type == GGML_TYPE_F32 &&
+        ggml_is_contiguous(op->src[0]) &&
+        ggml_is_contiguous(op->src[1]) &&
+        ggml_is_contiguous(op->src[2]) &&
+        ggml_is_contiguous(op->src[3]) &&
+        ggml_is_contiguous(op->src[4]) &&
+        ggml_is_contiguous(op->src[5]) &&
+        op->src[0]->ne[0] == 128 && op->src[0]->ne[1] == 16 &&
+        op->src[1]->ne[0] == 128 && op->src[1]->ne[1] == 16 &&
+        op->src[2]->ne[0] == 128 && op->src[2]->ne[1] == 48 &&
+        op->src[2]->ne[2] >= 32 && op->src[2]->ne[2] % 32 == 0 &&
+        op->src[0]->ne[2] == op->src[2]->ne[2] &&
+        op->src[1]->ne[2] == op->src[2]->ne[2] &&
+        op->src[0]->ne[3] == op->src[2]->ne[3] &&
+        op->src[1]->ne[3] == op->src[2]->ne[3] &&
+        op->src[3]->ne[0] ==   1 && op->src[3]->ne[1] ==  48 &&
+        op->src[3]->ne[2] == op->src[2]->ne[2] && op->src[3]->ne[3] == op->src[2]->ne[3] &&
+        op->src[4]->ne[0] ==   1 && op->src[4]->ne[1] ==  48 &&
+        op->src[4]->ne[2] == op->src[2]->ne[2] && op->src[4]->ne[3] == op->src[2]->ne[3] &&
+        op->src[5]->ne[0] == 128 && op->src[5]->ne[1] == 128 && op->src[5]->ne[2] == 48 &&
+        op->src[5]->ne[3] == op->src[2]->ne[3];
+}
+
+size_t ggml_metal_op_gated_delta_net_extra_inverse(const ggml_tensor * op) {
+    assert(op->op == GGML_OP_GATED_DELTA_NET);
+
+    const int64_t n_chunks = op->src[2]->ne[2]/32;
+    const int64_t n_heads  = op->src[2]->ne[1];
+    const int64_t n_seqs   = op->src[2]->ne[3];
+
+    return sizeof(float)*n_chunks*n_heads*n_seqs*32*32;
+}
+
 int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 
@@ -1949,7 +2006,7 @@ int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
     GGML_TENSOR_LOCALS( int32_t, ne,  op,         ne);
     GGML_TENSOR_LOCALS(uint64_t, nb,  op,         nb);
 
-    auto pipeline = ggml_metal_library_get_pipeline_gated_delta_net(lib, op);
+    const ggml_metal_device_props * props_dev = ggml_metal_device_get_props(ctx->dev);
 
     // when fused with the trailing cache cpy, the snapshots are written straight into the
     // recurrent cache and the cpy is skipped (see GGML_METAL_FUSION_GDN_CACHE)
@@ -2016,6 +2073,55 @@ int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
         /*.nb3  =*/ nb3,
         /*.nb_out =*/ nb_out,
     };
+
+    if (ggml_metal_op_gated_delta_net_use_r4d(op, props_dev->has_simdgroup_mm, props_dev->max_theadgroup_memory_size)) {
+        auto pipeline_kkt = ggml_metal_library_get_pipeline_gated_delta_net_r4d_kkt(lib);
+        auto pipeline_scan = ggml_metal_library_get_pipeline_gated_delta_net_r4d_scan(lib);
+        const bool pipelines_supported =
+            pipeline_kkt.pipeline != nullptr &&
+            pipeline_scan.pipeline != nullptr &&
+            ggml_metal_pipeline_max_theads_per_threadgroup(pipeline_kkt) >= 512 &&
+            ggml_metal_pipeline_max_theads_per_threadgroup(pipeline_scan) >= 512 &&
+            ggml_metal_pipeline_static_threadgroup_memory(pipeline_kkt) <= props_dev->max_theadgroup_memory_size &&
+            ggml_metal_pipeline_static_threadgroup_memory(pipeline_scan) <= props_dev->max_theadgroup_memory_size;
+
+        if (pipelines_supported) {
+            ggml_metal_buffer_id bid_inverse = ggml_metal_get_buffer_id(op);
+            bid_inverse.offs += ggml_nbytes(op);
+
+            ggml_metal_encoder_set_pipeline(enc, pipeline_kkt);
+            ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args),                   0);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 1);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[3]), 2);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[4]), 3);
+            ggml_metal_encoder_set_buffer  (enc, bid_inverse,                          4);
+            ggml_metal_encoder_dispatch_threadgroups(enc, ne22/32, ne11, ne23, 512, 1, 1);
+
+            ggml_metal_op_concurrency_reset(ctx);
+
+            ggml_metal_buffer_id bid_state_out = bid_out;
+            if (nb_out == 0) {
+                bid_state_out.offs += (size_t) ne22*ne21*ne20*ne23*sizeof(float);
+            }
+
+            ggml_metal_encoder_set_pipeline(enc, pipeline_scan);
+            ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args),                   0);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[0]), 1);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[1]), 2);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[2]), 3);
+            ggml_metal_encoder_set_buffer  (enc, bid_inverse,                          4);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[3]), 5);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[4]), 6);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[5]), 7);
+            ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         8);
+            ggml_metal_encoder_set_buffer  (enc, bid_state_out,                        9);
+            ggml_metal_encoder_dispatch_threadgroups(enc, ne20/32, ne21, ne23, 512, 1, 1);
+
+            return n_fuse;
+        }
+    }
+
+    auto pipeline = ggml_metal_library_get_pipeline_gated_delta_net(lib, op);
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);
     ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args),                  ida++); // args

@@ -31,7 +31,6 @@ struct llama_cparams {
     float yarn_attn_factor;
     float yarn_beta_fast;
     float yarn_beta_slow;
-    float prefetch_gibps;
 
     bool embeddings;
     bool embeddings_nextn;        // also extract the hidden state before the final output norm

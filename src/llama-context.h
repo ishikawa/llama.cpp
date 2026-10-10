@@ -17,7 +17,6 @@
 #include <vector>
 
 struct llama_model;
-class llama_paced_prefetcher;
 class llama_batch_allocr;
 
 class llama_io_read_i;
@@ -334,8 +333,6 @@ private:
 
     // reuse the batch_allocr to avoid unnecessary memory allocations
     std::unique_ptr<llama_batch_allocr> balloc;
-
-    std::unique_ptr<llama_paced_prefetcher> prefetcher;
 
     uint32_t n_outputs = 0; // number of actually-used outputs in the current ubatch or last logical batch
 

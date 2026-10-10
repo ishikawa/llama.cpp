@@ -735,8 +735,6 @@ struct llama_model {
 
     uint32_t n_gpu_layers() const;
     llama_split_mode split_mode() const;
-    const std::vector<std::string> & file_paths() const;
-    bool use_mmap() const;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 
@@ -758,8 +756,6 @@ struct llama_model {
     float get_rope_freq_scale(const llama_cparams & cparams, int il) const;
 
     ggml_tensor * get_rope_factors(const llama_cparams & cparams, int il) const;
-
-    void set_file_paths(std::vector<std::string> paths);
 
     llama_memory_i * create_memory(const llama_memory_params & params, const llama_cparams & cparams) const;
 

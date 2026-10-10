@@ -72,7 +72,7 @@ enum llama_load_mode llama_load_mode_from_str(const char * str) {
     if (std::strcmp(str, "mlock")      == 0) { return LLAMA_LOAD_MODE_MLOCK;      }
     if (std::strcmp(str, "mmap+mlock") == 0) { return LLAMA_LOAD_MODE_MMAP_MLOCK; }
     if (std::strcmp(str, "dio")        == 0) { return LLAMA_LOAD_MODE_DIRECT_IO;  }
-    throw std::invalid_argument(std::string("unknown load mode: ") + str);
+    GGML_ABORT("unknown load mode: %s", str);
 }
 
 struct llama_sampler_chain_params llama_sampler_chain_default_params() {
@@ -370,8 +370,6 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
             return {-2, nullptr};
         }
 
-        model->set_file_paths(splits.empty() ? std::vector<std::string>{fname} : splits);
-
         return {0, model_ptr.release()};
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error loading model: %s\n", __func__, err.what());
@@ -403,6 +401,7 @@ static struct llama_model * llama_model_load_from_file_impl(
             return nullptr;
         }
     }
+    // TODO: remove
     ggml_time_init();
 
     if (!params.vocab_only && ggml_backend_reg_count() == 0) {
@@ -619,3 +618,4 @@ const char * llama_print_system_info(void) {
 
     return s.c_str();
 }
+

@@ -11,6 +11,8 @@
 #import <Foundation/Foundation.h>
 
 #import <Metal/Metal.h>
+#include <float.h>
+#include <sys/file.h>
 
 #undef MIN
 #undef MAX
@@ -82,6 +84,9 @@ struct ggml_metal {
     // error state - set when a command buffer fails during synchronize
     // once set, graph_compute will return GGML_STATUS_FAILED until the backend is recreated
     bool has_error;
+    char * stats_path;
+    bool dispatch_timing;
+    NSMutableDictionary * dispatch_stats[GGML_METAL_MAX_COMMAND_BUFFERS + 1];
 };
 
 ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
@@ -138,6 +143,11 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
         snprintf(res->name, sizeof(res->name), "%s", props_dev->name);
 
         res->d_queue = dispatch_queue_create("ggml-metal", DISPATCH_QUEUE_CONCURRENT);
+
+        const char * stats_path = getenv("GGML_METAL_DISPATCH_STATS");
+        res->stats_path = stats_path && stats_path[0] ? strdup(stats_path) : NULL;
+        const char * timing = getenv("GGML_METAL_DISPATCH_TIMING");
+        res->dispatch_timing = res->stats_path && timing && strcmp(timing, "1") == 0;
 
         res->use_concurrency = getenv("GGML_METAL_CONCURRENCY_DISABLE") == nil;
 
@@ -244,6 +254,7 @@ void ggml_metal_free(ggml_metal_t ctx) {
     ggml_metal_device_event_free(ctx->dev, ctx->ev_cpy);
     ggml_metal_device_event_free(ctx->dev, ctx->ev_sync);
 
+    free(ctx->stats_path);
     free(ctx);
 }
 
@@ -471,6 +482,157 @@ bool ggml_metal_cpy_tensor_async(ggml_metal_t ctx_src, ggml_metal_t ctx_dst, con
     }
 }
 
+static bool ggml_metal_profile_named(const char * name) {
+    return name[0] && strncmp(name, "node_", 5) != 0 && strncmp(name, "leaf_", 5) != 0 && strncmp(name, " (", 2) != 0;
+}
+
+static int64_t ggml_metal_profile_tokens(struct ggml_cgraph * gf) {
+    NSMutableArray * pending = [NSMutableArray array];
+    NSMutableSet * visited = [NSMutableSet set];
+    for (int i = 0; i < gf->n_nodes; ++i) {
+        [pending addObject:[NSValue valueWithPointer:gf->nodes[i]]];
+    }
+    while (pending.count) {
+        NSValue * ptr = [pending lastObject];
+        [pending removeLastObject];
+        if ([visited containsObject:ptr]) {
+            continue;
+        }
+        [visited addObject:ptr];
+        const struct ggml_tensor * t = ptr.pointerValue;
+        if (strncmp(t->name, "inp_tokens", 10) == 0) {
+            return t->ne[0];
+        }
+        if (strncmp(t->name, "model.input_embed", 17) == 0 || strncmp(t->name, "inp_embd", 8) == 0) {
+            return t->ne[1];
+        }
+        if (strncmp(t->name, "hc_gate-", 8) == 0 || strncmp(t->name, "linear_attn_qkv_mixed-", 22) == 0) {
+            return t->ne[1];
+        }
+        for (int i = 0; i < GGML_MAX_SRC; ++i) {
+            if (t->src[i]) {
+                [pending addObject:[NSValue valueWithPointer:t->src[i]]];
+            }
+        }
+    }
+    return -1;
+}
+
+static void ggml_metal_profile_json(ggml_metal_t ctx, NSDictionary * record) {
+    NSError * error = nil;
+    NSData * data = [NSJSONSerialization dataWithJSONObject:record options:NSJSONWritingSortedKeys error:&error];
+    if (data) {
+        FILE * file = fopen(ctx->stats_path, "a");
+        if (file) {
+            if (flock(fileno(file), LOCK_EX) == 0) {
+                fwrite(data.bytes, 1, data.length, file);
+                fputc('\n', file);
+                if (fflush(file) != 0 || ferror(file)) {
+                    GGML_LOG_ERROR("%s: cannot write %s\n", __func__, ctx->stats_path);
+                }
+                flock(fileno(file), LOCK_UN);
+            } else {
+                GGML_LOG_ERROR("%s: cannot lock %s\n", __func__, ctx->stats_path);
+            }
+            fclose(file);
+        } else {
+            GGML_LOG_ERROR("%s: cannot open %s\n", __func__, ctx->stats_path);
+        }
+    } else {
+        GGML_LOG_ERROR("%s: JSON error: %s\n", __func__, error.localizedDescription.UTF8String);
+    }
+}
+
+static void ggml_metal_profile_write(ggml_metal_t ctx, int64_t start, int64_t encode_us) {
+    NSMutableDictionary * entries = [NSMutableDictionary dictionary];
+    NSMutableArray * buffers = [NSMutableArray array];
+    NSInteger barriers = 0, encoders = 0, fused = 0, saved = 0, timed_buffers = 0;
+    NSInteger dispatched_ops = 0, additional_dispatches = 0;
+    double gpu_sum = 0, first = DBL_MAX, last = 0;
+    for (int i = 0; i <= ctx->n_cb; ++i) {
+        NSMutableDictionary * stats = ctx->dispatch_stats[i];
+        encode_us -= [stats[@"wait_us"] longLongValue];
+        barriers += [stats[@"barriers"] integerValue];
+        encoders += [stats[@"encoders"] integerValue];
+        dispatched_ops += [stats[@"dispatched_ops"] integerValue];
+        additional_dispatches += [stats[@"additional_dispatches"] integerValue];
+        fused += [stats[@"fused_nodes"] integerValue];
+        saved += [stats[@"fusion_saved_nodes"] integerValue];
+        timed_buffers += [stats[@"timed_buffers"] integerValue];
+        if ([stats[@"failed"] boolValue]) {
+            ctx->has_error = true;
+        }
+        for (NSArray * key in stats[@"dispatches"]) {
+            NSDictionary * entry = stats[@"dispatches"][key];
+            NSMutableDictionary * total = entries[key];
+            if (!total) {
+                total = [[entry mutableCopy] autorelease];
+                entries[key] = total;
+            } else {
+                total[@"count"] = @([total[@"count"] integerValue] + [entry[@"count"] integerValue]);
+                total[@"barriers"] = @([total[@"barriers"] integerValue] + [entry[@"barriers"] integerValue]);
+                total[@"gpu_ms"] = @([total[@"gpu_ms"] doubleValue] + [entry[@"gpu_ms"] doubleValue]);
+            }
+        }
+        id<MTLCommandBuffer> cb = ctx->cmd_bufs[i].obj;
+        NSMutableArray * ranges = stats[@"gpu_ranges"];
+        [ranges addObject:@[@(cb.GPUStartTime), @(cb.GPUEndTime), @(cb.status)]];
+        for (NSArray * range in ranges) {
+            double a = [range[0] doubleValue], b = [range[1] doubleValue];
+            [buffers addObject:@{@"gpu_start_s":@(a), @"gpu_end_s":@(b), @"status":range[2]}];
+            if (a > 0 && b >= a) {
+                gpu_sum += b - a;
+                first = MIN(first, a);
+                last = MAX(last, b);
+            }
+        }
+    }
+    NSMutableDictionary * dispatches = [NSMutableDictionary dictionary];
+    for (NSDictionary * entry in [entries allValues]) {
+        NSArray * key = @[entry[@"op"], entry[@"pipeline"], entry[@"node"]];
+        NSMutableDictionary * total = dispatches[key];
+        if (!total) {
+            total = [[entry mutableCopy] autorelease];
+            [total removeObjectForKey:@"component_node"];
+            dispatches[key] = total;
+        } else {
+            total[@"count"] = @([total[@"count"] integerValue] + [entry[@"count"] integerValue]);
+            total[@"barriers"] = @([total[@"barriers"] integerValue] + [entry[@"barriers"] integerValue]);
+            total[@"gpu_ms"] = @([total[@"gpu_ms"] doubleValue] + [entry[@"gpu_ms"] doubleValue]);
+        }
+    }
+    if (!ctx->dispatch_timing) {
+        for (NSMutableDictionary * entry in [[entries allValues] arrayByAddingObjectsFromArray:[dispatches allValues]]) {
+            entry[@"gpu_ms"] = [NSNull null];
+        }
+    }
+    NSInteger dispatch_candidates = 0;
+    NSMutableDictionary * node_ops = [NSMutableDictionary dictionary];
+    for (int i = 0; i < ctx->gf->n_nodes; ++i) {
+        const struct ggml_tensor * node = ctx->gf->nodes[i];
+        NSString * op = [NSString stringWithUTF8String:ggml_op_name(node->op)];
+        node_ops[op] = @([node_ops[op] integerValue] + 1);
+        if (!ggml_op_is_empty(node->op) && !ggml_is_empty(node) && (node->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+            dispatch_candidates++;
+        }
+    }
+    NSDictionary * record = @{
+        @"schema_version":@1, @"mode":ctx->dispatch_timing ? @"dispatch_timing" : @"counts",
+        @"n_tokens":@(ggml_metal_profile_tokens(ctx->gf)), @"n_nodes":@(ctx->gf->n_nodes),
+        @"node_ops":node_ops, @"dispatch_candidates":@(dispatch_candidates),
+        @"dispatched_ops":@(dispatched_ops), @"additional_dispatches":@(additional_dispatches),
+        @"barriers":@(barriers), @"encoders":@(encoders), @"command_buffers":@(ctx->n_cb + 1 + timed_buffers),
+        @"fused_nodes":@(fused), @"fusion_saved_nodes":@(saved),
+        @"wall_ms":@((ggml_time_us() - start) / 1000.0), @"encode_ms":@(encode_us / 1000.0),
+        @"gpu_sum_ms":@(1000 * gpu_sum), @"gpu_span_ms":@(last > 0 ? 1000 * (last - first) : 0),
+        @"failed":@(ctx->has_error), @"buffers":buffers, @"dispatches":[dispatches allValues], @"component_dispatches":[entries allValues]};
+    ggml_metal_profile_json(ctx, record);
+    for (int i = 0; i <= ctx->n_cb; ++i) {
+        [ctx->dispatch_stats[i] release];
+        ctx->dispatch_stats[i] = nil;
+    }
+}
+
 enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph * gf) {
     if (ctx->has_error) {
         GGML_LOG_ERROR("%s: backend is in error state from a previous command buffer failure - recreate the backend to recover\n", __func__);
@@ -478,7 +640,48 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
     }
 
     if (gf->n_nodes == 0) {
+        if (ctx->stats_path) {
+            @autoreleasepool {
+                ggml_metal_profile_json(ctx, @{
+                    @"schema_version":@1, @"mode":ctx->dispatch_timing ? @"dispatch_timing" : @"counts",
+                    @"n_tokens":@(ggml_metal_profile_tokens(gf)), @"n_nodes":@0, @"barriers":@0,
+                    @"node_ops":@{}, @"dispatch_candidates":@0, @"dispatched_ops":@0, @"additional_dispatches":@0,
+                    @"encoders":@0, @"command_buffers":@0, @"fused_nodes":@0, @"fusion_saved_nodes":@0,
+                    @"wall_ms":@0, @"encode_ms":@0, @"gpu_sum_ms":@0, @"gpu_span_ms":@0,
+                    @"failed":@NO, @"buffers":@[], @"dispatches":@[], @"component_dispatches":@[]});
+            }
+        }
         return GGML_STATUS_SUCCESS;
+    }
+
+    int64_t profile_start = 0;
+    if (ctx->stats_path) {
+        profile_start = ggml_time_us();
+        ggml_metal_synchronize(ctx);
+        if (ctx->has_error) {
+            return GGML_STATUS_FAILED;
+        }
+        for (int i = 0; i <= ctx->n_cb; ++i) {
+            NSMutableDictionary * labels = [NSMutableDictionary dictionary];
+            for (int j = gf->n_nodes - 1; j >= 0; --j) {
+                struct ggml_tensor * node = gf->nodes[j];
+                NSValue * key = [NSValue valueWithPointer:node];
+                NSString * label = ggml_metal_profile_named(node->name) ? [NSString stringWithUTF8String:node->name] : labels[key];
+                if (!label) {
+                    continue;
+                }
+                labels[key] = label;
+                for (int k = 0; k < GGML_MAX_SRC; ++k) {
+                    if (node->src[k] && !ggml_metal_profile_named(node->src[k]->name)) {
+                        NSValue * src_key = [NSValue valueWithPointer:node->src[k]];
+                        if (!labels[src_key]) {
+                            labels[src_key] = label;
+                        }
+                    }
+                }
+            }
+            ctx->dispatch_stats[i] = [@{@"dispatches":[NSMutableDictionary dictionary], @"gpu_ranges":[NSMutableArray array], @"labels":labels} mutableCopy];
+        }
     }
 
     // number of nodes encoded by the main thread (empirically determined)
@@ -551,6 +754,8 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
         // short-hand
         id<MTLCommandQueue> queue = ggml_metal_device_get_queue(ctx->dev);
 
+        const int64_t encode_start = ctx->stats_path ? ggml_time_us() : 0;
+
         // the main thread commits the first few commands immediately
         // cmd_buf[n_cb]
         {
@@ -562,7 +767,9 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
             }
             ctx->cmd_bufs[n_cb].obj = cmd_buf;
 
-            [cmd_buf enqueue];
+            if (!ctx->dispatch_timing) {
+                [cmd_buf enqueue];
+            }
 
             ctx->encode_async(n_cb);
         }
@@ -593,6 +800,30 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
         }
 
         dispatch_apply(n_cb, ctx->d_queue, ctx->encode_async);
+
+        if (ctx->stats_path) {
+            int64_t encode_us = ggml_time_us() - encode_start;
+            // Submit deferred buffers in queue order, including the abort path.
+            for (int j = 0; j <= n_cb; ++j) {
+                int i = j == 0 ? n_cb : j - 1;
+                id<MTLCommandBuffer> cb = ctx->cmd_bufs[i].obj;
+                if (cb.status == MTLCommandBufferStatusNotEnqueued) {
+                    if (ctx->abort_callback && ctx->abort_callback(ctx->abort_callback_data)) {
+                        ctx->has_error = true;
+                        break;
+                    }
+                    [cb commit];
+                }
+                [cb waitUntilCompleted];
+                if (cb.status != MTLCommandBufferStatusCompleted) {
+                    ctx->has_error = true;
+                }
+            }
+            ggml_metal_profile_write(ctx, profile_start, encode_us);
+            if (ctx->has_error) {
+                return GGML_STATUS_FAILED;
+            }
+        }
 
         // for debugging: block until graph is computed
         //[ctx->cmd_buf_last waitUntilCompleted];
@@ -708,7 +939,7 @@ ggml_metal_event_t ggml_metal_get_ev_cpy(ggml_metal_t ctx) {
 void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
     // when fusion stats are collected the graph must be encoded by a single thread so the
     // counters are race-free; override whatever the caller requested
-    if (ggml_metal_fusion_info_stats(ctx->finfo)) {
+    if (ggml_metal_fusion_info_stats(ctx->finfo) || ctx->dispatch_timing) {
         n_cb = 0;
     }
 
@@ -753,6 +984,10 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
             ctx->use_concurrency,
             ctx->capture_compute == 0,
             ctx->debug_graph);
+
+        if (ctx->stats_path) {
+            ggml_metal_op_profile(ctx_op, ctx->dispatch_stats[cb_idx], ctx->dispatch_timing);
+        }
 
         for (int idx = 0; idx < ggml_metal_op_n_nodes(ctx_op); ++idx) {
             const int res = ggml_metal_op_encode(ctx_op, idx);

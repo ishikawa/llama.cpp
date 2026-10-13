@@ -78,6 +78,7 @@ void ggml_metal_cv_set_bool(ggml_metal_cv_t cv, bool value, int32_t idx) {
 
 struct ggml_metal_pipeline {
     id<MTLComputePipelineState> obj;
+    char * name;
 };
 
 ggml_metal_pipeline_t ggml_metal_pipeline_init(void) {
@@ -85,6 +86,7 @@ ggml_metal_pipeline_t ggml_metal_pipeline_init(void) {
 
     *res = (struct ggml_metal_pipeline) {
         /*.obj  =*/ nil,
+        /*.name =*/ NULL,
     };
 
     return res;
@@ -93,6 +95,7 @@ ggml_metal_pipeline_t ggml_metal_pipeline_init(void) {
 void ggml_metal_pipeline_free(ggml_metal_pipeline_t pipeline) {
     [pipeline->obj release];
 
+    free(pipeline->name);
     free(pipeline);
 }
 
@@ -184,6 +187,7 @@ struct ggml_metal_library {
     ggml_metal_pipelines_t pipelines; // cache of compiled pipelines
 
     NSLock * lock;
+    bool dispatch_stats;
 };
 
 // Build the fn_to_lib routing table by querying each compiled library's public
@@ -452,6 +456,8 @@ ggml_metal_library_t ggml_metal_library_init(ggml_metal_device_t dev) {
     id<MTLDevice> device = ggml_metal_device_get_obj(dev);
 
     ggml_metal_library_t res = calloc(1, sizeof(struct ggml_metal_library));
+    const char * stats_path = getenv("GGML_METAL_DISPATCH_STATS");
+    res->dispatch_stats = stats_path && stats_path[0];
     res->dev       = dev;
     res->pipelines = ggml_metal_pipelines_init();
     res->lock      = [NSLock new];
@@ -664,6 +670,8 @@ ggml_metal_library_t ggml_metal_library_init_from_source(ggml_metal_device_t dev
         return NULL;
     }
 
+    const char * stats_path = getenv("GGML_METAL_DISPATCH_STATS");
+    res->dispatch_stats = stats_path && stats_path[0];
     res->objs[0]        = library;
     res->single_library = true;
     res->dev            = dev;
@@ -819,6 +827,9 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_
 
         res.pipeline = ggml_metal_pipeline_init();
         res.pipeline->obj = obj;
+        if (lib->dispatch_stats) {
+            res.pipeline->name = strdup(name);
+        }
 
         ggml_metal_pipelines_add(lib->pipelines, name, res.pipeline);
     }
@@ -834,12 +845,25 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_compile_pipeline(ggml_
 
 struct ggml_metal_encoder {
     id<MTLComputeCommandEncoder> obj;
+    NSMutableDictionary * stats;
+    NSMutableDictionary * bindings;
+    id<MTLCommandQueue> queue;
+    ggml_metal_cmd_buf_t cmd_buf;
+    id<MTLComputePipelineState> pipeline;
+    NSString * pipeline_name;
+    NSString * op;
+    NSString * node;
+    NSString * component_node;
+    NSMutableDictionary * entry_last;
+    NSInteger pending_barriers;
+    NSInteger node_dispatches;
 };
 
 ggml_metal_encoder_t ggml_metal_encoder_init(ggml_metal_cmd_buf_t cmd_buf_raw, bool concurrent) {
     ggml_metal_encoder_t res = calloc(1, sizeof(struct ggml_metal_encoder));
 
     id<MTLCommandBuffer> cmd_buf = (id<MTLCommandBuffer>) cmd_buf_raw;
+    res->cmd_buf = cmd_buf_raw;
 
     if (concurrent) {
         res->obj = [cmd_buf computeCommandEncoderWithDispatchType: MTLDispatchTypeConcurrent];
@@ -853,8 +877,45 @@ ggml_metal_encoder_t ggml_metal_encoder_init(ggml_metal_cmd_buf_t cmd_buf_raw, b
 }
 
 void ggml_metal_encoder_free(ggml_metal_encoder_t encoder) {
+    if (encoder->stats) {
+        if (encoder->bindings) {
+            [encoder->queue release];
+        }
+        [encoder->bindings release];
+        [encoder->node release];
+    }
     [encoder->obj release];
     free(encoder);
+}
+
+void ggml_metal_encoder_profile(ggml_metal_encoder_t encoder, void * stats, bool timing) {
+    encoder->stats = (NSMutableDictionary *) stats;
+    encoder->stats[@"encoders"] = @([encoder->stats[@"encoders"] integerValue] + 1);
+    if (timing) {
+        encoder->bindings = [NSMutableDictionary new];
+        encoder->queue = [((id<MTLCommandBuffer>) encoder->cmd_buf).commandQueue retain];
+    }
+}
+
+void ggml_metal_encoder_profile_node(ggml_metal_encoder_t encoder, const struct ggml_tensor * node, int fused_nodes, int saved_nodes) {
+    if (node) {
+        encoder->entry_last = nil;
+        encoder->node_dispatches = 0;
+        encoder->op = [NSString stringWithUTF8String:ggml_op_name(node->op)];
+        [encoder->node release];
+        NSString * name = [NSString stringWithUTF8String:node->name];
+        NSString * pattern = @"-[0-9]+(?= \\(|$)|_l[0-9]+(?= \\(|$)";
+        encoder->node = [[name stringByReplacingOccurrencesOfString:pattern withString:@"" options:NSRegularExpressionSearch range:NSMakeRange(0, name.length)] copy];
+        NSString * label = encoder->stats[@"labels"][[NSValue valueWithPointer:node]];
+        label = label ? label : encoder->node;
+        encoder->component_node = [label stringByReplacingOccurrencesOfString:pattern withString:@"" options:NSRegularExpressionSearch range:NSMakeRange(0, label.length)];
+    }
+    if (!node && encoder->node_dispatches) {
+        encoder->stats[@"dispatched_ops"] = @([encoder->stats[@"dispatched_ops"] integerValue] + 1);
+        encoder->stats[@"additional_dispatches"] = @([encoder->stats[@"additional_dispatches"] integerValue] + encoder->node_dispatches - 1);
+    }
+    encoder->stats[@"fused_nodes"] = @([encoder->stats[@"fused_nodes"] integerValue] + fused_nodes);
+    encoder->stats[@"fusion_saved_nodes"] = @([encoder->stats[@"fusion_saved_nodes"] integerValue] + saved_nodes);
 }
 
 void ggml_metal_encoder_debug_group_push(ggml_metal_encoder_t encoder, const char * name) {
@@ -872,14 +933,25 @@ void ggml_metal_encoder_set_pipeline(ggml_metal_encoder_t encoder, struct ggml_m
         GGML_ABORT("%s: nil Metal pipeline (missing kernel; see compile_pipeline log above)\n", __func__);
     }
 
+    if (encoder->stats) {
+        encoder->pipeline = pipeline.pipeline->obj;
+        encoder->pipeline_name = [NSString stringWithUTF8String:pipeline.pipeline->name];
+    }
     [encoder->obj setComputePipelineState:pipeline.pipeline->obj];
 }
 
 void ggml_metal_encoder_set_bytes(ggml_metal_encoder_t encoder, void * data, size_t size, int idx) {
+    if (encoder->bindings) {
+        encoder->bindings[@(idx)] = [NSData dataWithBytes:data length:size];
+    }
     [encoder->obj setBytes:data length:size atIndex:idx];
 }
 
 void ggml_metal_encoder_set_buffer(ggml_metal_encoder_t encoder, struct ggml_metal_buffer_id buffer, int idx) {
+    if (encoder->bindings) {
+        id metal = (id) buffer.metal;
+        encoder->bindings[@(idx)] = @[metal ? metal : [NSNull null], @(buffer.offs)];
+    }
     [encoder->obj setBuffer:buffer.metal offset:buffer.offs atIndex:idx];
 }
 
@@ -887,14 +959,80 @@ void ggml_metal_encoder_set_threadgroup_memory_size(ggml_metal_encoder_t encoder
     // ref: https://developer.apple.com/documentation/metal/mtlcomputecommandencoder/setthreadgroupmemorylength(_:index:)
     GGML_ASSERT(size % 16 == 0);
 
+    if (encoder->bindings) {
+        encoder->bindings[@(-idx - 1)] = @(size);
+    }
     [encoder->obj setThreadgroupMemoryLength:size atIndex:idx];
 }
 
 void ggml_metal_encoder_dispatch_threadgroups(ggml_metal_encoder_t encoder, int tg0, int tg1, int tg2, int tptg0, int tptg1, int tptg2) {
-    [encoder->obj dispatchThreadgroups:MTLSizeMake(tg0, tg1, tg2) threadsPerThreadgroup:MTLSizeMake(tptg0, tptg1, tptg2)];
+    if (!encoder->stats) {
+        [encoder->obj dispatchThreadgroups:MTLSizeMake(tg0, tg1, tg2) threadsPerThreadgroup:MTLSizeMake(tptg0, tptg1, tptg2)];
+        return;
+    }
+    @autoreleasepool {
+        encoder->node_dispatches++;
+        id<MTLCommandBuffer> timed = nil;
+        id<MTLComputeCommandEncoder> target = encoder->obj;
+        if (encoder->bindings) {
+            timed = [encoder->queue commandBuffer];
+            target = [timed computeCommandEncoder];
+            [target setComputePipelineState:encoder->pipeline];
+            for (NSNumber * key in encoder->bindings) {
+                id value = encoder->bindings[key];
+                int idx = key.intValue;
+                if (idx < 0) {
+                    [target setThreadgroupMemoryLength:[value unsignedIntegerValue] atIndex:-idx - 1];
+                } else if ([value isKindOfClass:[NSData class]]) {
+                    [target setBytes:[value bytes] length:[value length] atIndex:idx];
+                } else {
+                    id metal = value[0];
+                    [target setBuffer:metal == [NSNull null] ? nil : metal offset:[value[1] unsignedIntegerValue] atIndex:idx];
+                }
+            }
+        }
+        [target dispatchThreadgroups:MTLSizeMake(tg0, tg1, tg2) threadsPerThreadgroup:MTLSizeMake(tptg0, tptg1, tptg2)];
+        if (timed) {
+            [target endEncoding];
+            int64_t wait_start = ggml_time_us();
+            [timed commit];
+            [timed waitUntilCompleted];
+            encoder->stats[@"wait_us"] = @([encoder->stats[@"wait_us"] longLongValue] + ggml_time_us() - wait_start);
+        }
+        if (encoder->stats) {
+            NSArray * key = @[encoder->op, encoder->pipeline_name, encoder->node, encoder->component_node];
+            NSMutableDictionary * entry = encoder->stats[@"dispatches"][key];
+            if (!entry) {
+                entry = [@{@"op":key[0], @"pipeline":key[1], @"node":key[2], @"component_node":encoder->component_node, @"count":@0, @"barriers":@0, @"gpu_ms":@0} mutableCopy];
+                encoder->stats[@"dispatches"][key] = entry;
+                [entry release];
+            }
+            entry[@"count"] = @([entry[@"count"] integerValue] + 1);
+            entry[@"barriers"] = @([entry[@"barriers"] integerValue] + encoder->pending_barriers);
+            encoder->pending_barriers = 0;
+            encoder->entry_last = entry;
+            if (timed) {
+                entry[@"gpu_ms"] = @([entry[@"gpu_ms"] doubleValue] + 1000.0 * (timed.GPUEndTime - timed.GPUStartTime));
+                encoder->stats[@"encoders"] = @([encoder->stats[@"encoders"] integerValue] + 1);
+                encoder->stats[@"timed_buffers"] = @([encoder->stats[@"timed_buffers"] integerValue] + 1);
+                [encoder->stats[@"gpu_ranges"] addObject:@[@(timed.GPUStartTime), @(timed.GPUEndTime), @(timed.status)]];
+                if (timed.status != MTLCommandBufferStatusCompleted) {
+                    encoder->stats[@"failed"] = @YES;
+                }
+            }
+        }
+    }
 }
 
 void ggml_metal_encoder_memory_barrier(ggml_metal_encoder_t encoder) {
+    if (encoder->stats) {
+        encoder->stats[@"barriers"] = @([encoder->stats[@"barriers"] integerValue] + 1);
+        if (encoder->entry_last) {
+            encoder->entry_last[@"barriers"] = @([encoder->entry_last[@"barriers"] integerValue] + 1);
+        } else {
+            encoder->pending_barriers++;
+        }
+    }
     [encoder->obj memoryBarrierWithScope:MTLBarrierScopeBuffers];
 }
 

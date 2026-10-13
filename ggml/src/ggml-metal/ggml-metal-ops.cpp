@@ -3525,10 +3525,11 @@ size_t ggml_metal_op_flash_attn_ext_extra_tmp(const ggml_tensor * op) {
 size_t ggml_metal_op_flash_attn_ext_extra_kv_f16(const ggml_tensor * op) {
     assert(op->op == GGML_OP_FLASH_ATTN_EXT);
 
-    // note: always reserve the temp buffer to avoid graph reallocations
-    //if (!ggml_metal_op_flash_attn_ext_use_kv_f16(op)) {
-    //    return 0;
-    //}
+    // the f16 copy spans the whole KV, so skip it when the kernel reads the quantized KV directly
+    // (e.g. a small-ubatch draft context at long n_ctx would otherwise reserve ~1 GiB unused)
+    if (!ggml_metal_op_flash_attn_ext_use_kv_f16(op)) {
+        return 0;
+    }
 
     GGML_TENSOR_LOCALS( int32_t, ne2, op->src[2], ne);
 

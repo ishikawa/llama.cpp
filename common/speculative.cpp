@@ -2608,6 +2608,15 @@ common_speculative_init_result::common_speculative_init_result(
 
     if (spec_mtp) {
         cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+
+        // the draft decode is split per n_ubatch, so a smaller value only shrinks the draft compute buffer
+        if (const char * env = getenv("LLAMA_SPEC_DRAFT_UBATCH")) {
+            const int n_ubatch_dft = atoi(env);
+            if (n_ubatch_dft > 0) {
+                cparams.n_ubatch = std::min<uint32_t>(cparams.n_ubatch, n_ubatch_dft);
+                LOG_INF("%s: MTP draft n_ubatch = %u\n", __func__, cparams.n_ubatch);
+            }
+        }
     }
 
     // the draft context holds as many tokens per sequence as the target context

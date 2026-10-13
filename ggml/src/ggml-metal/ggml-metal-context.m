@@ -539,14 +539,73 @@ static void ggml_metal_profile_json(ggml_metal_t ctx, NSDictionary * record) {
     }
 }
 
+static NSArray * ggml_metal_profile_shared_inputs(NSDictionary * stats) {
+    NSMutableDictionary * groups = [NSMutableDictionary dictionary];
+    for (NSString * source_id in stats[@"shared_inputs"]) {
+        NSMutableArray * members = [NSMutableArray array];
+        for (NSDictionary * member in [stats[@"shared_inputs"][source_id] allValues]) {
+            if ([member[@"count"] integerValue] > 0) {
+                [members addObject:member];
+            }
+        }
+        if (members.count < 2) {
+            continue;
+        }
+        [members sortUsingComparator:^NSComparisonResult(NSDictionary * a, NSDictionary * b) {
+            NSString * ka = [NSString stringWithFormat:@"%@|%@|%@", a[@"weight"], a[@"type"], a[@"ne"]];
+            NSString * kb = [NSString stringWithFormat:@"%@|%@|%@", b[@"weight"], b[@"type"], b[@"ne"]];
+            return [ka compare:kb];
+        }];
+        NSMutableArray * signature = [NSMutableArray array];
+        NSMutableArray * descriptions = [NSMutableArray array];
+        double rows = 0;
+        NSNumber * columns = members[0][@"shape"][0];
+        NSString * type = members[0][@"type"];
+        BOOL same_type = YES, compatible_shape = YES, contiguous = YES;
+        for (NSDictionary * member in members) {
+            [signature addObject:@[member[@"weight"], member[@"type"], member[@"ne"], member[@"contiguous"]]];
+            [descriptions addObject:@{@"weight":member[@"weight"], @"type":member[@"type"], @"shape":member[@"shape"], @"ne":member[@"ne"]}];
+            rows += [member[@"shape"][1] doubleValue];
+            same_type &= [type isEqual:member[@"type"]];
+            compatible_shape &= [columns isEqual:member[@"shape"][0]] && [member[@"ne"][2] integerValue] == 1 && [member[@"ne"][3] integerValue] == 1;
+            contiguous &= [member[@"contiguous"] boolValue];
+        }
+        NSMutableDictionary * group = groups[signature];
+        if (!group) {
+            group = [@{@"members":descriptions, @"groups":@0, @"count":@0, @"gpu_ms":@0, @"read_bytes":@0, @"write_bytes":@0,
+                       @"combined_rows":@(rows), @"combined_shape":compatible_shape ? @[columns, @(rows)] : (id) [NSNull null],
+                       @"same_type":@(same_type), @"row_concat_compatible":@(same_type && compatible_shape && contiguous),
+                       @"src1_ids":[NSMutableArray array]} mutableCopy];
+            groups[signature] = group;
+            [group release];
+        }
+        group[@"groups"] = @([group[@"groups"] integerValue] + 1);
+        [group[@"src1_ids"] addObject:source_id];
+        for (NSDictionary * member in members) {
+            for (NSString * field in @[@"count", @"gpu_ms", @"read_bytes", @"write_bytes"]) {
+                group[field] = @([group[field] doubleValue] + [member[field] doubleValue]);
+            }
+        }
+    }
+    return [groups allValues];
+}
+
 static void ggml_metal_profile_write(ggml_metal_t ctx, int64_t start, int64_t encode_us) {
     NSMutableDictionary * entries = [NSMutableDictionary dictionary];
     NSMutableArray * buffers = [NSMutableArray array];
+    NSMutableArray * traffic = [NSMutableArray array];
+    NSMutableArray * sources = [NSMutableArray array];
+    NSMutableArray * shared_inputs = [NSMutableArray array];
     NSInteger barriers = 0, encoders = 0, fused = 0, saved = 0, timed_buffers = 0;
     NSInteger dispatched_ops = 0, additional_dispatches = 0;
     double gpu_sum = 0, first = DBL_MAX, last = 0;
     for (int i = 0; i <= ctx->n_cb; ++i) {
         NSMutableDictionary * stats = ctx->dispatch_stats[i];
+        if (ctx->dispatch_timing) {
+            [traffic addObjectsFromArray:[stats[@"traffic"] allValues]];
+            [sources addObjectsFromArray:[stats[@"sources"] allValues]];
+            [shared_inputs addObjectsFromArray:ggml_metal_profile_shared_inputs(stats)];
+        }
         encode_us -= [stats[@"wait_us"] longLongValue];
         barriers += [stats[@"barriers"] integerValue];
         encoders += [stats[@"encoders"] integerValue];
@@ -613,7 +672,7 @@ static void ggml_metal_profile_write(ggml_metal_t ctx, int64_t start, int64_t en
         }
     }
     NSDictionary * record = @{
-        @"schema_version":@1, @"mode":ctx->dispatch_timing ? @"dispatch_timing" : @"counts",
+        @"schema_version":@2, @"mode":ctx->dispatch_timing ? @"dispatch_timing" : @"counts",
         @"n_tokens":@(ggml_metal_profile_tokens(ctx->gf)), @"n_nodes":@(ctx->gf->n_nodes),
         @"node_ops":node_ops, @"dispatch_candidates":@(dispatch_candidates),
         @"dispatched_ops":@(dispatched_ops), @"additional_dispatches":@(additional_dispatches),
@@ -621,6 +680,8 @@ static void ggml_metal_profile_write(ggml_metal_t ctx, int64_t start, int64_t en
         @"fused_nodes":@(fused), @"fusion_saved_nodes":@(saved),
         @"wall_ms":@((ggml_time_us() - start) / 1000.0), @"encode_ms":@(encode_us / 1000.0),
         @"gpu_sum_ms":@(1000 * gpu_sum), @"gpu_span_ms":@(last > 0 ? 1000 * (last - first) : 0),
+        @"traffic":traffic, @"sources":sources, @"shared_inputs":shared_inputs,
+        @"traffic_estimate":@"logical tensor bytes per dispatch; selected experts per token; not measured DRAM transactions",
         @"failed":@(ctx->has_error), @"buffers":buffers, @"dispatches":[dispatches allValues], @"component_dispatches":[entries allValues]};
     ggml_metal_profile_json(ctx, record);
     for (int i = 0; i <= ctx->n_cb; ++i) {
@@ -639,12 +700,12 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
         if (ctx->stats_path) {
             @autoreleasepool {
                 ggml_metal_profile_json(ctx, @{
-                    @"schema_version":@1, @"mode":ctx->dispatch_timing ? @"dispatch_timing" : @"counts",
+                    @"schema_version":@2, @"mode":ctx->dispatch_timing ? @"dispatch_timing" : @"counts",
                     @"n_tokens":@(ggml_metal_profile_tokens(gf)), @"n_nodes":@0, @"barriers":@0,
                     @"node_ops":@{}, @"dispatch_candidates":@0, @"dispatched_ops":@0, @"additional_dispatches":@0,
                     @"encoders":@0, @"command_buffers":@0, @"fused_nodes":@0, @"fusion_saved_nodes":@0,
                     @"wall_ms":@0, @"encode_ms":@0, @"gpu_sum_ms":@0, @"gpu_span_ms":@0,
-                    @"failed":@NO, @"buffers":@[], @"dispatches":@[], @"component_dispatches":@[]});
+                    @"traffic":@[], @"sources":@[], @"shared_inputs":@[], @"failed":@NO, @"buffers":@[], @"dispatches":@[], @"component_dispatches":@[]});
             }
         }
         return GGML_STATUS_SUCCESS;

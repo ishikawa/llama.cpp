@@ -1,4 +1,5 @@
 #import "ggml-metal-device.h"
+#import "ggml-metal-profile.h"
 #import "ggml-metal-fusion.h"
 
 #import "ggml-impl.h"
@@ -857,6 +858,8 @@ struct ggml_metal_encoder {
     NSMutableDictionary * entry_last;
     NSInteger pending_barriers;
     NSInteger node_dispatches;
+    NSDictionary * traffic_meta;
+    NSMutableDictionary * shared_member;
 };
 
 ggml_metal_encoder_t ggml_metal_encoder_init(ggml_metal_cmd_buf_t cmd_buf_raw, bool concurrent) {
@@ -893,7 +896,95 @@ void ggml_metal_encoder_profile(ggml_metal_encoder_t encoder, void * stats, bool
     encoder->stats[@"encoders"] = @([encoder->stats[@"encoders"] integerValue] + 1);
     if (timing) {
         encoder->bindings = [NSMutableDictionary new];
+        encoder->stats[@"traffic"] = [NSMutableDictionary dictionary];
+        encoder->stats[@"sources"] = [NSMutableDictionary dictionary];
+        encoder->stats[@"shared_inputs"] = [NSMutableDictionary dictionary];
         encoder->queue = [((id<MTLCommandBuffer>) encoder->cmd_buf).commandQueue retain];
+    }
+}
+
+static NSString * ggml_metal_profile_weight_name(const struct ggml_tensor * tensor) {
+    NSString * name = [NSString stringWithUTF8String:tensor->name];
+    return [name stringByReplacingOccurrencesOfString:@"blk\\.[0-9]+\\." withString:@"blk.N." options:NSRegularExpressionSearch range:NSMakeRange(0, name.length)];
+}
+
+static NSArray * ggml_metal_profile_shape(const struct ggml_tensor * tensor) {
+    return @[@(tensor->ne[0]), @(tensor->ne[1]), @(tensor->ne[2]), @(tensor->ne[3])];
+}
+
+static void ggml_metal_encoder_profile_traffic(ggml_metal_encoder_t encoder, const struct ggml_tensor * node) {
+    const struct ggml_metal_profile_bytes bytes = ggml_metal_profile_tensor_bytes(node);
+    const bool matrix = node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID;
+    const struct ggml_tensor * weight = matrix ? node->src[0] : NULL;
+    NSString * source_id = @"none";
+    if (node->src[1]) {
+        source_id = [NSString stringWithFormat:@"%p", (const void *) node->src[1]];
+        encoder->stats[@"sources"][source_id] = @{@"id":source_id, @"name":[NSString stringWithUTF8String:node->src[1]->name], @"ne":ggml_metal_profile_shape(node->src[1])};
+    }
+    encoder->traffic_meta = @{
+        @"weight":weight ? ggml_metal_profile_weight_name(weight) : @"",
+        @"type":weight ? [NSString stringWithUTF8String:ggml_type_name(weight->type)] : @"",
+        @"shape":weight ? @[@(weight->ne[0]), @(weight->ne[1])] : @[],
+        @"src0_ne":node->src[0] ? ggml_metal_profile_shape(node->src[0]) : @[],
+        @"src1_type":node->src[1] ? [NSString stringWithUTF8String:ggml_type_name(node->src[1]->type)] : @"",
+        @"dst_type":[NSString stringWithUTF8String:ggml_type_name(node->type)], @"dst_ne":ggml_metal_profile_shape(node),
+        @"expert_bytes":node->op == GGML_OP_MUL_MAT_ID && weight ? @((double) weight->nb[2]) : @0,
+        @"selected_expert_reads":node->op == GGML_OP_MUL_MAT_ID && node->src[2] ? @((double) node->src[2]->ne[0] * node->src[2]->ne[1]) : @0,
+        @"src1_id":source_id, @"src0_bytes":@(bytes.src0), @"src1_bytes":@(bytes.src1),
+        @"other_src_bytes":@(bytes.other_src), @"dst_bytes":@(bytes.dst), @"read_bytes":@(bytes.src0 + bytes.src1 + bytes.other_src), @"write_bytes":@(bytes.dst)};
+    encoder->shared_member = nil;
+    if (node->op == GGML_OP_MUL_MAT && weight && node->src[1]) {
+        NSMutableDictionary * members = encoder->stats[@"shared_inputs"][source_id];
+        if (!members) {
+            members = [NSMutableDictionary dictionary];
+            encoder->stats[@"shared_inputs"][source_id] = members;
+        }
+        NSValue * key = [NSValue valueWithPointer:node];
+        NSMutableDictionary * member = members[key];
+        if (!member) {
+            member = [@{@"weight":encoder->traffic_meta[@"weight"], @"type":encoder->traffic_meta[@"type"],
+                        @"shape":encoder->traffic_meta[@"shape"], @"ne":ggml_metal_profile_shape(weight), @"contiguous":@(ggml_is_contiguous(weight)),
+                        @"count":@0, @"gpu_ms":@0, @"read_bytes":@0, @"write_bytes":@0} mutableCopy];
+            members[key] = member;
+            [member release];
+        }
+        encoder->shared_member = member;
+    }
+}
+
+static void ggml_metal_encoder_profile_dispatch_bytes(ggml_metal_encoder_t encoder, double gpu_ms) {
+    NSDictionary * meta = encoder->traffic_meta;
+    NSArray * key = @[encoder->op, encoder->pipeline_name, meta[@"weight"], meta[@"type"], meta[@"shape"]];
+    NSMutableDictionary * entry = encoder->stats[@"traffic"][key];
+    if (!entry) {
+        entry = [[meta mutableCopy] autorelease];
+        [entry removeObjectForKey:@"src1_id"];
+        for (NSString * field in @[@"src0_bytes", @"src1_bytes", @"other_src_bytes", @"dst_bytes", @"read_bytes", @"write_bytes", @"selected_expert_reads"]) {
+            entry[field] = @0;
+        }
+        entry[@"op"] = encoder->op;
+        entry[@"pipeline"] = encoder->pipeline_name;
+        entry[@"node"] = encoder->node;
+        entry[@"count"] = @0;
+        entry[@"gpu_ms"] = @0;
+        entry[@"src1_counts"] = [NSMutableDictionary dictionary];
+        entry[@"node_counts"] = [NSMutableDictionary dictionary];
+        encoder->stats[@"traffic"][key] = entry;
+    }
+    entry[@"count"] = @([entry[@"count"] integerValue] + 1);
+    entry[@"gpu_ms"] = @([entry[@"gpu_ms"] doubleValue] + gpu_ms);
+    entry[@"node_counts"][encoder->node] = @([entry[@"node_counts"][encoder->node] integerValue] + 1);
+    NSString * source_id = meta[@"src1_id"];
+    entry[@"src1_counts"][source_id] = @([entry[@"src1_counts"][source_id] integerValue] + 1);
+    for (NSString * field in @[@"src0_bytes", @"src1_bytes", @"other_src_bytes", @"dst_bytes", @"read_bytes", @"write_bytes", @"selected_expert_reads"]) {
+        entry[field] = @([entry[field] doubleValue] + [meta[field] doubleValue]);
+    }
+    if (encoder->shared_member) {
+        NSMutableDictionary * member = encoder->shared_member;
+        member[@"count"] = @([member[@"count"] integerValue] + 1);
+        member[@"gpu_ms"] = @([member[@"gpu_ms"] doubleValue] + gpu_ms);
+        member[@"read_bytes"] = @([member[@"read_bytes"] doubleValue] + [meta[@"read_bytes"] doubleValue]);
+        member[@"write_bytes"] = @([member[@"write_bytes"] doubleValue] + [meta[@"write_bytes"] doubleValue]);
     }
 }
 
@@ -909,6 +1000,9 @@ void ggml_metal_encoder_profile_node(ggml_metal_encoder_t encoder, const struct 
         NSString * label = encoder->stats[@"labels"][[NSValue valueWithPointer:node]];
         label = label ? label : encoder->node;
         encoder->component_node = [label stringByReplacingOccurrencesOfString:pattern withString:@"" options:NSRegularExpressionSearch range:NSMakeRange(0, label.length)];
+        if (encoder->bindings) {
+            ggml_metal_encoder_profile_traffic(encoder, node);
+        }
     }
     if (!node && encoder->node_dispatches) {
         encoder->stats[@"dispatched_ops"] = @([encoder->stats[@"dispatched_ops"] integerValue] + 1);
@@ -1012,6 +1106,7 @@ void ggml_metal_encoder_dispatch_threadgroups(ggml_metal_encoder_t encoder, int 
             encoder->pending_barriers = 0;
             encoder->entry_last = entry;
             if (timed) {
+                ggml_metal_encoder_profile_dispatch_bytes(encoder, 1000.0 * (timed.GPUEndTime - timed.GPUStartTime));
                 entry[@"gpu_ms"] = @([entry[@"gpu_ms"] doubleValue] + 1000.0 * (timed.GPUEndTime - timed.GPUStartTime));
                 encoder->stats[@"encoders"] = @([encoder->stats[@"encoders"] integerValue] + 1);
                 encoder->stats[@"timed_buffers"] = @([encoder->stats[@"timed_buffers"] integerValue] + 1);

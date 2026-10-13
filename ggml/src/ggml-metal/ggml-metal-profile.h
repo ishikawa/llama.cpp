@@ -51,3 +51,32 @@ static inline int64_t ggml_metal_profile_tensor_tokens(const struct ggml_tensor 
     }
     return -1;
 }
+
+struct ggml_metal_profile_bytes {
+    double src0;
+    double src1;
+    double other_src;
+    double dst;
+};
+
+static inline struct ggml_metal_profile_bytes ggml_metal_profile_tensor_bytes(const struct ggml_tensor * node) {
+    struct ggml_metal_profile_bytes bytes = {0, 0, 0, (double) ggml_nbytes(node)};
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        if (!node->src[i]) {
+            continue;
+        }
+        const double size = (double) ggml_nbytes(node->src[i]);
+        if (i == 0) {
+            bytes.src0 = size;
+        } else if (i == 1) {
+            bytes.src1 = size;
+        } else {
+            bytes.other_src += size;
+        }
+    }
+    if (node->op == GGML_OP_MUL_MAT_ID && node->src[0] && node->src[2]) {
+        // Count selected expert rows per token, not the whole expert bank.
+        bytes.src0 = (double) node->src[0]->nb[2] * node->src[2]->ne[0] * node->src[2]->ne[1];
+    }
+    return bytes;
+}

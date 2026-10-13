@@ -1592,6 +1592,33 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_moe_gate_up(ggml_metal_library_t lib, const ggml_tensor * op) {
+    const char * nsg_env = std::getenv("GGML_METAL_MUL_MV_ID_DECODE_NSG");
+    const char * nr0_env = std::getenv("GGML_METAL_MUL_MV_ID_DECODE_NR0");
+    const char * tg_env = std::getenv("GGML_METAL_MUL_MV_ID_IQ2_S_TG");
+    const int nsg = nsg_env && std::strcmp(nsg_env, "8") == 0 ? 8 : 4;
+    const int nr0 = nr0_env && std::strcmp(nr0_env, "4") == 0 ? 4 : 2;
+    const bool iq3 = op->src[0]->type == GGML_TYPE_IQ3_S;
+    const bool tg = iq3 || (tg_env && std::strcmp(tg_env, "1") == 0);
+
+    char base[256];
+    char name[256];
+    snprintf(base, sizeof(base), "kernel_moe_gate_up_%s_r%d_tg%d", ggml_type_name(op->src[0]->type), nr0, tg);
+    snprintf(name, sizeof(name), "%s_nsg=%d", base, nsg);
+    auto res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        ggml_metal_cv_t cv = ggml_metal_cv_init();
+        ggml_metal_cv_set_int16(cv, nsg, FC_MUL_MV + 0);
+        res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
+        ggml_metal_cv_free(cv);
+    }
+    res.nsg = nsg;
+    res.nr0 = nr0;
+    res.nr1 = 1;
+    res.smem = iq3 ? 512*sizeof(uint32_t) : tg ? 1024*sizeof(uint64_t) : 0;
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_argmax(ggml_metal_library_t lib, const ggml_tensor * op) {
     GGML_ASSERT(op->src[0]->type == GGML_TYPE_F32);
     GGML_ASSERT(ggml_is_contiguous_1(op->src[0]));

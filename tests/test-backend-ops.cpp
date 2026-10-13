@@ -5660,6 +5660,60 @@ struct test_mul_mat_id_fusion : public test_case {
     }
 };
 
+struct test_moe_gate_up_swiglu : public test_mul_mat_id {
+    const bool up_first;
+    const std::string fallback;
+
+    test_moe_gate_up_swiglu(ggml_type type, bool broadcast, bool up_first = false, std::string fallback = "none")
+        : test_mul_mat_id(type, GGML_TYPE_F32, 512, 10, broadcast, 640, 1, 2560),
+          up_first(up_first), fallback(fallback) {}
+
+    std::string vars() override {
+        return test_mul_mat_id::vars() + "," + VARS_TO_STR2(up_first, fallback);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MOE_GATE_UP_SWIGLU";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        return 2*test_mul_mat_id::op_flops(t);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * gate_w = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
+        ggml_tensor * up_w = ggml_new_tensor_3d(ctx, fallback == "mixed_type" ? GGML_TYPE_IQ3_S : type_a, k, m, n_mats);
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, type_b, k, b ? 1 : n_used, n);
+        ggml_tensor * ids_all = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
+        ggml_tensor * ids = ggml_view_2d(ctx, ids_all, n_used, n, ids_all->nb[1], 0);
+        ggml_tensor * up_x = x;
+        ggml_tensor * up_ids = ids;
+        if (fallback == "input") {
+            up_x = ggml_new_tensor_3d(ctx, type_b, k, b ? 1 : n_used, n);
+        }
+        if (fallback == "ids") {
+            ggml_tensor * up_ids_all = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
+            up_ids = ggml_view_2d(ctx, up_ids_all, n_used, n, up_ids_all->nb[1], 0);
+        }
+        ggml_tensor * gate = ggml_mul_mat_id(ctx, gate_w, x, ids);
+        ggml_tensor * up = ggml_mul_mat_id(ctx, up_w, up_x, up_ids);
+        ggml_set_name(gate, "moe_gate");
+        ggml_set_name(up, "moe_up");
+        if (up_first && mode == MODE_TEST) {
+            ggml_build_forward_expand(gf, up);
+        }
+        ggml_tensor * out = ggml_swiglu_split(ctx, gate, up);
+        ggml_set_name(out, "moe_swiglu");
+        if (fallback == "extra_use") {
+            out = ggml_add(ctx, out, gate);
+        }
+        return out;
+    }
+};
+
 struct test_mul_mat_id_shared : public test_case {
     const ggml_type type;
     const int64_t n;
@@ -11050,6 +11104,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 16, 16, b, 50, 200, 64));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_BF16, GGML_TYPE_F32, 16, 16, b, 32, 1024, 16));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_BF16, GGML_TYPE_F32, 16, 16, b, 50, 200, 64));
+    }
+
+    for (ggml_type type : {GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_S}) {
+        for (bool broadcast : {false, true}) {
+            for (bool up_first : {false, true}) {
+                test_cases.emplace_back(new test_moe_gate_up_swiglu(type, broadcast, up_first));
+            }
+        }
+    }
+    for (const char * fallback : {"input", "ids", "mixed_type", "extra_use"}) {
+        test_cases.emplace_back(new test_moe_gate_up_swiglu(GGML_TYPE_IQ2_S, true, false, fallback));
     }
 
     // For issue 27873

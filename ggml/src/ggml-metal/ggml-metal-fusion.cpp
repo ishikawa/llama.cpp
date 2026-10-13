@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
 #include <set>
 #include <string>
@@ -706,6 +707,61 @@ static bool ggml_metal_fusion_check_mul_mat_add(
         (add->data == res->data || !ggml_metal_fusion_overlap(add, res));
 }
 
+static bool ggml_metal_fusion_moe_gate_up_enabled() {
+    const char * env = std::getenv("GGML_METAL_FUSE_MOE_GATE_UP");
+    return env && std::strcmp(env, "1") == 0;
+}
+
+static bool ggml_metal_fusion_check_moe_gate_up(
+        const ggml_metal_fusion * fusion,
+        const ggml_tensor * const * nodes,
+        const ggml_cgraph * gf,
+        const int * node_idxs,
+        int idx,
+        ggml_metal_fusion_mode mode) {
+    if (!ggml_metal_fusion_moe_gate_up_enabled()) {
+        return false;
+    }
+    const ggml_tensor * a = nodes[0];
+    const ggml_tensor * b = nodes[1];
+    const ggml_tensor * out = nodes[2];
+    if (a == b || a->src[1] != b->src[1] || a->src[2] != b->src[2] ||
+        !((out->src[0] == a && out->src[1] == b) || (out->src[0] == b && out->src[1] == a)) ||
+        ggml_get_glu_op(out) != GGML_GLU_OP_SWIGLU || ggml_get_op_params_i32(out, 1) != 0) {
+        return false;
+    }
+    const ggml_tensor * wa = a->src[0];
+    const ggml_tensor * wb = b->src[0];
+    const ggml_tensor * x = a->src[1];
+    const ggml_tensor * ids = a->src[2];
+    if ((wa->type != GGML_TYPE_IQ2_S && wa->type != GGML_TYPE_IQ3_S) || wb->type != wa->type ||
+        !ggml_are_same_shape(wa, wb) || !ggml_is_contiguous_1(wa) || !ggml_is_contiguous_1(wb) ||
+        wa->ne[0] != 2560 || wa->ne[1] != 640 || wa->ne[3] != 1 ||
+        x->type != GGML_TYPE_F32 || x->ne[0] != wa->ne[0] || x->ne[2] != 1 || x->ne[3] != 1 || !ggml_is_contiguous_1(x) ||
+        ids->type != GGML_TYPE_I32 || ids->ne[0] <= 0 || ids->ne[0] > wa->ne[2] ||
+        ids->ne[1] != 1 || ids->ne[2] != 1 || ids->ne[3] != 1 || !ggml_is_contiguous_1(ids) ||
+        (x->ne[1] != 1 && x->ne[1] != ids->ne[0]) ||
+        out->type != GGML_TYPE_F32 || !ggml_is_contiguous(out) ||
+        !ggml_are_same_shape(a, b) || !ggml_are_same_shape(a, out) ||
+        out->ne[0] != wa->ne[1] || out->ne[1] != ids->ne[0] || out->ne[2] != 1 || out->ne[3] != 1) {
+        return false;
+    }
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+        if (wa->nb[i] != wb->nb[i]) {
+            return false;
+        }
+    }
+    if (mode == GGML_METAL_FUSION_FULL) {
+        for (const ggml_tensor * src : {wa, wb, x, ids}) {
+            if (ggml_metal_fusion_overlap(out, src)) {
+                return false;
+            }
+        }
+    }
+    const int output = node_idxs[idx + 2];
+    return ggml_can_fuse_subgraph_ext(gf, node_idxs + idx, 3, fusion->ops.data(), &output, 1);
+}
+
 // ---- patterns ------------------------------------------------------------
 
 static const std::vector<ggml_op> ops_norm_mul         = { GGML_OP_NORM, GGML_OP_MUL };
@@ -757,7 +813,10 @@ static const std::vector<ggml_op> ops_moe_reduce_8 = {
 
 static const std::vector<ggml_op> ops_mul_mat_add = { GGML_OP_MUL_MAT, GGML_OP_ADD };
 
+static const std::vector<ggml_op> ops_moe_gate_up = { GGML_OP_MUL_MAT_ID, GGML_OP_MUL_MAT_ID, GGML_OP_GLU };
+
 static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
+    { GGML_METAL_FUSION_MOE_GATE_UP,    ops_moe_gate_up,            {},     true,  ggml_metal_fusion_check_moe_gate_up },
     { GGML_METAL_FUSION_NORM_MUL,       ops_norm_mul,               {},     false, ggml_metal_fusion_check_norm },
     { GGML_METAL_FUSION_NORM_MUL_ADD,   ops_norm_mul_add,           {},     false, ggml_metal_fusion_check_norm },
     { GGML_METAL_FUSION_NORM_SCALE,     ops_norm_scale,             {},     false, ggml_metal_fusion_check_norm },
@@ -835,6 +894,9 @@ void ggml_metal_fusion_add_alloc_deps(
         int best_raw = 0;
 
         for (const ggml_metal_fusion & fusion : ggml_metal_fusions) {
+            if (fusion.id == GGML_METAL_FUSION_MOE_GATE_UP && !ggml_metal_fusion_moe_gate_up_enabled()) {
+                continue;
+            }
             if ((int) fusion.ops_all.size() <= best_raw) {
                 continue;
             }

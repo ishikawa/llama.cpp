@@ -6,6 +6,7 @@
 #import "ggml-metal-impl.h"
 #import "ggml-metal-common.h"
 #import "ggml-metal-ops.h"
+#import "ggml-metal-profile.h"
 #import "ggml-metal-fusion.h"
 
 #import <Foundation/Foundation.h>
@@ -500,14 +501,9 @@ static int64_t ggml_metal_profile_tokens(struct ggml_cgraph * gf) {
         }
         [visited addObject:ptr];
         const struct ggml_tensor * t = ptr.pointerValue;
-        if (strncmp(t->name, "inp_tokens", 10) == 0) {
-            return t->ne[0];
-        }
-        if (strncmp(t->name, "model.input_embed", 17) == 0 || strncmp(t->name, "inp_embd", 8) == 0) {
-            return t->ne[1];
-        }
-        if (strncmp(t->name, "hc_gate-", 8) == 0 || strncmp(t->name, "linear_attn_qkv_mixed-", 22) == 0) {
-            return t->ne[1];
+        const int64_t n_tokens = ggml_metal_profile_tensor_tokens(t);
+        if (n_tokens > 0) {
+            return n_tokens;
         }
         for (int i = 0; i < GGML_MAX_SRC; ++i) {
             if (t->src[i]) {

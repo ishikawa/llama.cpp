@@ -7,6 +7,8 @@
 #include "ggml-impl.h"
 
 #include <cassert>
+#include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -1531,6 +1533,21 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
                 GGML_ABORT("not implemented");
             }
     };
+
+    // Keep decode experiments separate from the default and prefill pipelines.
+    const char * decode = std::getenv(tsrc0 == GGML_TYPE_IQ4_NL ? "GGML_METAL_MUL_MV_ID_DECODE_IQ4_NL" : "GGML_METAL_MUL_MV_ID_DECODE_IQ2_IQ3");
+    const int mode = decode && std::strcmp(decode, "1") == 0 ? 1 : decode && std::strcmp(decode, "2") == 0 ? 2 : 0;
+    if (mode != 0 && ne12 == 1 && tsrc1 == GGML_TYPE_F32 && !split) {
+        if ((tsrc0 == GGML_TYPE_IQ2_S || tsrc0 == GGML_TYPE_IQ3_S) && ne00 == 2560 && ne01 % 4 == 0) {
+            nr0 = mode == 1 ? 1 : 2;
+            nsg = mode == 1 && tsrc0 == GGML_TYPE_IQ2_S ? 4 : 2;
+            suffix = mode == 1 ? "_decode_r1" : "_decode_r2";
+        } else if (tsrc0 == GGML_TYPE_IQ4_NL && ne00 == 640 && ne01 % 16 == 0) {
+            nr0 = mode == 1 ? 4 : 1;
+            nsg = mode == 1 ? 4 : 2;
+            suffix = mode == 1 ? "_decode_r4" : "_decode_r1";
+        }
+    }
 
     snprintf(base, 256, "kernel_mul_mv_id_%s_%s%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1), suffix);
     snprintf(name, 256, "%s_nsg=%d_split=%d", base, nsg, split);

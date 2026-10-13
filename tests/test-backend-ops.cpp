@@ -11053,6 +11053,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     // For issue 27873
+    for (bool broadcast : {false, true}) {
+        for (ggml_type type : {GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_NL}) {
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 512, 10, broadcast, 640, 1, 2560));
+        }
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 512, 10, broadcast, 2560, 1, 640));
+    }
+
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ2_XXS, GGML_TYPE_F32, 1, 1, false, 1, 8192, 4096));
 
     for (int k : {1, 63, 65}) {

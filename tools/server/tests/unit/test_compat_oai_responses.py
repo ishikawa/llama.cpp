@@ -65,7 +65,8 @@ def test_responses_stream_with_openai_library():
 
         if r.type == "response.output_text.delta":
             gathered_text += r.delta
-        if r.type == "response.completed":
+        # max_output_tokens ends the stream with response.incomplete, as in the OpenAI spec
+        if r.type in ("response.completed", "response.incomplete"):
             assert r.response.id.startswith("resp_")
             assert r.response.output[0].id is not None
             assert r.response.output[0].id.startswith("msg_")
@@ -104,12 +105,15 @@ def test_responses_stream_with_llama_telemetry():
             assert "predicted_per_second" in data["timings"]
             if data["type"] == "response.output_text.delta":
                 saw_delta_timings = True
-        if data["type"] == "response.completed":
+        # max_output_tokens ends the stream with response.incomplete, as in the OpenAI spec
+        if data["type"] in ("response.completed", "response.incomplete"):
             completed = data
 
     assert saw_progress
     assert saw_delta_timings
     assert completed is not None
+    assert completed["type"] == "response.incomplete"
+    assert completed["response"]["incomplete_details"]["reason"] == "max_output_tokens"
     assert "usage" in completed["response"]
     assert "timings" in completed
 

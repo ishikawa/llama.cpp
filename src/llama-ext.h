@@ -146,3 +146,6 @@ LLAMA_API uint32_t        llama_model_target_layer_ids_n(const struct llama_mode
 // if out is nullptr, returns the number of tokens without writing to out
 // caller must allocate enough memory for out before calling
 LLAMA_API uint32_t llama_model_get_tok_embd(const struct llama_model * model, float * out);
+
+// Shared, cached opt-in for MTP wall-clock profiling.
+LLAMA_API bool llama_spec_mtp_profile_enabled();

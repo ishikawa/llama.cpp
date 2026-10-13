@@ -17,6 +17,7 @@
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -25,6 +26,14 @@
 //
 // llama_context
 //
+
+bool llama_spec_mtp_profile_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("LLAMA_SPEC_MTP_PROFILE");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+}
 
 static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     switch (ctx_type) {
@@ -1412,6 +1421,8 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    const bool profile = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && llama_spec_mtp_profile_enabled();
+    const int64_t t_start = profile ? ggml_time_us() : 0;
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -1464,6 +1475,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         gf_res_prev_active = res;
     }
 
+    const int64_t t_graph = profile ? ggml_time_us() : 0;
+
     // set the input data for the input tensors
     {
         //const auto t_start_us = ggml_time_us();
@@ -1474,6 +1487,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    if (profile) {
+        ggml_backend_sched_synchronize(sched.get());
+    }
+    const int64_t t_inputs = profile ? ggml_time_us() : 0;
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
@@ -1481,6 +1498,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
+    if (profile) {
+        ggml_backend_sched_synchronize(sched.get());
+        const int64_t t_end = ggml_time_us();
+        LLAMA_LOG_INFO("mtp_profile_ubatch: tokens=%u pos_first=%d pos_last=%d graph_ms=%.3f inputs_ms=%.3f compute_ms=%.3f\n",
+                ubatch.n_tokens, ubatch.pos[0], ubatch.pos[ubatch.n_tokens - 1],
+                (t_graph - t_start) / 1000.0, (t_inputs - t_graph) / 1000.0, (t_end - t_inputs) / 1000.0);
+    }
     ret = GGML_STATUS_SUCCESS;
 
     return res;

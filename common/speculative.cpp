@@ -1537,6 +1537,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     bool process(const common_batch & batch_in) override {
+        return process_hidden(batch_in, nullptr);
+    }
+
+    bool process_hidden(const common_batch & batch_in, const float * replay_h) {
         if (batch_in.size() <= 0) {
             return true;
         }
@@ -1546,6 +1550,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             return true;
         }
 
+        const bool profile = !is_mem_shared && !chain_heads && llama_spec_mtp_profile_enabled();
+        const int64_t t_start = profile ? ggml_time_us() : 0;
+        int64_t t_process = 0;
         const int32_t n_tokens = batch_in.size();
 
         // remember the first and last batch index for each sequence
@@ -1578,7 +1585,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             // i.e. we cannot have seq_id like this: [0, 0, 0, 1, 1, 0, 1, 1]
             //                                                       ^--- this is a problem
             // TODO:this is generally true, but would be nice to assert it
-            const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
+            const float * h_tgt = replay_h ? replay_h : llama_get_embeddings_nextn(ctx_tgt);
 
             for (int k = 0; k < n_tokens; ++k) {
                 const llama_seq_id seq_id = batch_in.tokens[k].seq_id;
@@ -1607,7 +1614,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     llama_set_nextn_layer_offset(ctx_dft, head);
                 }
 
+                const int64_t t_call = profile ? ggml_time_us() : 0;
                 const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+                if (profile) {
+                    llama_synchronize(ctx_dft);
+                    t_process += ggml_time_us() - t_call;
+                }
                 if (rc != 0) {
                     SPC_ERR("llama_process(ctx_dft) head=%d failed rc=%d (pos=%d)\n",
                             head, (int) rc, (int) batch_in.tokens[0].pos[0]);
@@ -1634,7 +1646,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             verify_h[seq_id].resize((size_t) n_rows * n_embd);
 
             for (int32_t i = 0; i < n_rows; ++i) {
-                const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + i);
+                const float * h = replay_h
+                    ? replay_h + (size_t) (i_batch_beg[seq_id] + i) * n_embd
+                    : llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + i);
                 std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
             }
 
@@ -1642,6 +1656,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
         }
 
+        if (profile) {
+            LOG_INF("mtp_profile: tokens=%d pos_first=%d pos_last=%d host_ms=%.3f draft_ms=%.3f\n",
+                    n_tokens, batch_in.tokens.front().pos[0], batch_in.tokens.back().pos[0],
+                    (ggml_time_us() - t_start - t_process) / 1000.0, t_process / 1000.0);
+        }
         return true;
     }
 
@@ -2875,6 +2894,22 @@ bool common_speculative_process(common_speculative * spec, const common_batch & 
     }
 
     return result;
+}
+
+bool common_speculative_process_mtp_hidden(common_speculative * spec, const common_batch & batch, const std::vector<float> & hidden) {
+    if (!spec || spec->impls.size() != 1 || spec->impls[0]->type != COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
+        return false;
+    }
+    auto * impl = static_cast<common_speculative_impl_draft_mtp *>(spec->impls[0].get());
+    if (!batch.has_token() || batch.has_embd() || impl->n_embd <= 0 || impl->is_mem_shared || impl->chain_heads || hidden.size() / impl->n_embd != (size_t) batch.size() || hidden.size() % impl->n_embd) {
+        return false;
+    }
+    for (const auto & token : batch.tokens) {
+        if (token.seq_id < 0 || (uint32_t) token.seq_id >= impl->n_seq) {
+            return false;
+        }
+    }
+    return impl->process_hidden(batch, hidden.data());
 }
 
 void common_speculative_draft(common_speculative * spec) {

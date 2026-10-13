@@ -1549,6 +1549,23 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
         }
     }
 
+    const char * tg = std::getenv("GGML_METAL_MUL_MV_ID_IQ2_S_TG");
+    const bool use_tg = tg && std::strcmp(tg, "1") == 0;
+    const bool use_const = tg && std::strcmp(tg, "2") == 0;
+    if ((use_tg || use_const) && tsrc0 == GGML_TYPE_IQ2_S && tsrc1 == GGML_TYPE_F32 && ne12 == 1 && ne00 == 2560) {
+        const char * nsg_env = std::getenv("GGML_METAL_MUL_MV_ID_DECODE_NSG");
+        const char * nr0_env = std::getenv("GGML_METAL_MUL_MV_ID_DECODE_NR0");
+        const int nsg_tg = nsg_env && std::strcmp(nsg_env, "8") == 0 ? 8 : 4;
+        const int nr0_tg = nr0_env && std::strcmp(nr0_env, "4") == 0 ? 4 : 2;
+        if (ne01 % (nsg_tg*nr0_tg) == 0) {
+            nsg = nsg_tg;
+            nr0 = nr0_tg;
+            smem = use_tg ? 1024*sizeof(uint64_t) : 0;
+            suffix = use_tg ? (nr0 == 4 ? "_tg_r4" : "_tg_r2") : (nr0 == 4 ? "" : "_decode_r2");
+            split = false;
+        }
+    }
+
     snprintf(base, 256, "kernel_mul_mv_id_%s_%s%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1), suffix);
     snprintf(name, 256, "%s_nsg=%d_split=%d", base, nsg, split);
 

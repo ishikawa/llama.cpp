@@ -2417,7 +2417,7 @@ kernel void kernel_mul_mv_iq3_s_f32(
     kernel_mul_mv_iq3_s_f32_disp<constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
-template<int nr0, typename args_t>
+template<int nr0, typename args_t, bool TG = false>
 void kernel_mul_mv_iq2_s_f32_impl(
         args_t args,
         device const char * src0,
@@ -2460,13 +2460,13 @@ void kernel_mul_mv_iq2_s_f32_impl(
     float yl[32];
     float sumf[nr0]={0.f};
 
-    //threadgroup uint64_t * svalues = (threadgroup uint64_t *) shmem;
-    //{
-    //    int nval = 32;
-    //    int pos  = (32*sgitg + tiisg)*nval;
-    //    for (int i = 0; i < nval; ++i) svalues[pos + i] = iq2s_grid[pos + i];
-    //    threadgroup_barrier(mem_flags::mem_threadgroup);
-    //}
+    threadgroup uint64_t * svalues = (threadgroup uint64_t *) shmem;
+    if (TG) {
+        for (int i = 32*sgitg + tiisg; i < 1024; i += 32*NSG) {
+            svalues[i] = iq2s_grid[i];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
 
     device const float * y4 = y + 32 * ix;
 
@@ -2492,13 +2492,15 @@ void kernel_mul_mv_iq2_s_f32_impl(
 
             float2 sum = {0};
             for (short l = 0; l < 2; ++l) {
-                //const threadgroup uint8_t * grid1 = (const threadgroup uint8_t *)(svalues + (qs[l+0] | ((qh[0] << (8-2*l)) & 0x300)));
-                //const threadgroup uint8_t * grid2 = (const threadgroup uint8_t *)(svalues + (qs[l+2] | ((qh[0] << (4-2*l)) & 0x300)));
-                constant uint8_t * grid1 = (constant uint8_t *)(iq2s_grid + (qs[l+0] | ((qh[0] << (8-2*l)) & 0x300)));
-                constant uint8_t * grid2 = (constant uint8_t *)(iq2s_grid + (qs[l+2] | ((qh[0] << (4-2*l)) & 0x300)));
+                const int index1 = qs[l+0] | ((qh[0] << (8-2*l)) & 0x300);
+                const int index2 = qs[l+2] | ((qh[0] << (4-2*l)) & 0x300);
+                constant uint8_t * grid1 = (constant uint8_t *)(iq2s_grid + index1);
+                constant uint8_t * grid2 = (constant uint8_t *)(iq2s_grid + index2);
+                const threadgroup uint8_t * grid1_tg = TG ? (const threadgroup uint8_t *)(svalues + index1) : nullptr;
+                const threadgroup uint8_t * grid2_tg = TG ? (const threadgroup uint8_t *)(svalues + index2) : nullptr;
                 for (short j = 0; j < 8; ++j) {
-                    sum[0] += yl[8*l + j +  0] * grid1[j] * select(1, -1, signs[l+0] & kmask_iq2xs[j]);
-                    sum[1] += yl[8*l + j + 16] * grid2[j] * select(1, -1, signs[l+2] & kmask_iq2xs[j]);
+                    sum[0] += yl[8*l + j +  0] * (TG ? float(grid1_tg[j]) : float(grid1[j])) * select(1, -1, signs[l+0] & kmask_iq2xs[j]);
+                    sum[1] += yl[8*l + j + 16] * (TG ? float(grid2_tg[j]) : float(grid2[j])) * select(1, -1, signs[l+2] & kmask_iq2xs[j]);
                 }
             }
             sumf[row] += d1 * sum[0] + d2 * sum[1];
@@ -3404,3 +3406,6 @@ template [[host_name("kernel_mul_mv_id_iq3_s_f32_decode_r1")]] kernel kernel_mul
 template [[host_name("kernel_mul_mv_id_iq3_s_f32_decode_r2")]] kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_iq3_s_f32_impl<2>>>;
 template [[host_name("kernel_mul_mv_id_iq4_nl_f32_decode_r4")]] kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_iq4_nl_f32_impl<4>>>;
 template [[host_name("kernel_mul_mv_id_iq4_nl_f32_decode_r1")]] kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_iq4_nl_f32_impl<1>>>;
+
+template [[host_name("kernel_mul_mv_id_iq2_s_f32_tg_r2")]] kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_iq2_s_f32_impl<2, ggml_metal_kargs_mul_mv, true>>>;
+template [[host_name("kernel_mul_mv_id_iq2_s_f32_tg_r4")]] kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_iq2_s_f32_impl<4, ggml_metal_kargs_mul_mv, true>>>;

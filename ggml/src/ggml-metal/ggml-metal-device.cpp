@@ -1236,6 +1236,15 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
         }
     }
 
+    const char * few_rows = std::getenv("GGML_METAL_MUL_MV_F32_FEW_ROWS");
+    if (few_rows && std::strcmp(few_rows, "1") == 0 && tsrc0 == GGML_TYPE_F32 && tsrc1 == GGML_TYPE_F32 &&
+            ne11 == 1 && ne01 <= 4) {
+        nr0 = 1;
+        nsg = 8;
+        smem = 32*sizeof(float);
+        suffix = "_few_rows";
+    }
+
     GGML_ASSERT(ne12 <= INT16_MAX && ne13 <= INT16_MAX);
     const int16_t r2 = (int16_t) (ne12 / ne02);
     const int16_t r3 = (int16_t) (ne13 / ne03);

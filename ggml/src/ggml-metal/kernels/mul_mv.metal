@@ -1084,6 +1084,33 @@ template [[host_name("kernel_mul_mv_bf16_bf16")]] kernel mul_mv_t_t kernel_mul_m
 template [[host_name("kernel_mul_mv_f32_bf16")]]  kernel mul_mv_t_t kernel_mul_mv_t_t<float,  bfloat>;
 #endif
 
+kernel void kernel_mul_mv_f32_f32_few_rows(
+        constant ggml_metal_kargs_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    const int r0 = tgpig.x;
+    if (r0 >= args.ne01) {
+        return;
+    }
+    const uint i12 = tgpig.z%FC_mul_mv_ne12;
+    const uint i13 = tgpig.z/FC_mul_mv_ne12;
+    const uint64_t offset0 = r0*args.nb01 + (i12/FC_mul_mv_r2)*args.nb02 + (i13/FC_mul_mv_r3)*args.nb03;
+    const uint64_t offset1 = i12*args.nb12 + i13*args.nb13;
+    device const float * x = (device const float *) (src0 + offset0);
+    device const float * y = (device const float *) (src1 + offset1);
+    float sumf[1] = { 0.0f };
+    for (int i = sgitg*N_SIMDWIDTH + tiisg; i < args.ne00; i += 8*N_SIMDWIDTH) {
+        sumf[0] += x[i]*y[i];
+    }
+    device float * out = (device float *) dst + (uint64_t)tgpig.z*args.ne0*args.ne1;
+    helper_mv_reduce_and_write<1>(out, sumf, r0, args.ne01, tiisg, sgitg, shmem);
+}
+
 template<typename T0, typename T04, typename T1, typename T14, short NR0, typename args_t>
 void kernel_mul_mv_t_t_4_impl(
         args_t args,

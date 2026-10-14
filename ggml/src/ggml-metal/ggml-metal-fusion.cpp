@@ -117,6 +117,82 @@ static int ggml_metal_fusion_max_nodes() {
     return ggml_metal_fusion_moe_reduce_shared_enabled() ? 32 : GGML_METAL_FUSION_MAX;
 }
 
+static bool ggml_metal_fusion_reorder_only() {
+    static const bool enabled = [] {
+        const char * env = std::getenv("GGML_METAL_FUSION_REORDER_ONLY");
+        return env && std::strcmp(env, "1") == 0;
+    }();
+    return enabled;
+}
+
+static bool ggml_metal_fusion_delay_debug() {
+    static const bool enabled = [] {
+        const char * env = std::getenv("GGML_METAL_FUSION_DEBUG");
+        return env && std::atoi(env) > 1;
+    }();
+    return enabled;
+}
+
+static bool ggml_metal_fusion_aliases(const ggml_tensor * a, const ggml_tensor * b) {
+    const ggml_tensor * base_a = a;
+    const ggml_tensor * base_b = b;
+    while (base_a->view_src) { base_a = base_a->view_src; }
+    while (base_b->view_src) { base_b = base_b->view_src; }
+    if (base_a == base_b) {
+        return true;
+    }
+    a = a->data ? a : base_a;
+    b = b->data ? b : base_b;
+    if (!a->data || !b->data) {
+        return false;
+    }
+    const uintptr_t pa = (uintptr_t) a->data;
+    const uintptr_t pb = (uintptr_t) b->data;
+    const size_t na = a->buffer ? ggml_backend_buft_get_alloc_size(a->buffer->buft, a) : ggml_nbytes(a);
+    const size_t nb = b->buffer ? ggml_backend_buft_get_alloc_size(b->buffer->buft, b) : ggml_nbytes(b);
+    return pa <= pb ? pb - pa < na : pa - pb < nb;
+}
+
+static bool ggml_metal_fusion_can_delay(const ggml_cgraph * gf, int first, int count, int before) {
+    for (int i = first; i < first + count; ++i) {
+        const ggml_tensor * moved = gf->nodes[i];
+        if (ggml_op_is_empty(moved->op)) {
+            continue;
+        }
+        for (int j = first + count; j < before; ++j) {
+            const ggml_tensor * crossed = gf->nodes[j];
+            if (!ggml_op_is_empty(crossed->op)) {
+                if (ggml_metal_fusion_aliases(moved, crossed)) {
+                    return false;
+                }
+                for (const ggml_tensor * src : moved->src) {
+                    if (src && ggml_metal_fusion_aliases(src, crossed)) {
+                        return false;
+                    }
+                }
+            }
+            for (const ggml_tensor * src : crossed->src) {
+                if (src && ggml_metal_fusion_aliases(moved, src)) {
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
+static void ggml_metal_fusion_trace_delay(const ggml_cgraph * gf, int first, int count, int before, const char * kind, bool moved) {
+    if (!ggml_metal_fusion_delay_debug()) {
+        return;
+    }
+    for (int j = 0; j < count; ++j) {
+        const ggml_tensor * node = gf->nodes[first + j];
+        GGML_LOG_INFO("metal fusion move: %s node='%s' op=%s from=%d before='%s' status=%s tokens=%lld\n",
+                kind, node->name, ggml_op_name(node->op), first + j, gf->nodes[before]->name,
+                moved ? "moved" : "rejected-dependency", (long long) node->ne[2]);
+    }
+}
+
 static bool ggml_metal_fusion_gdn_norm_gate_enabled() {
     static const bool enabled = [] {
         const char * env = std::getenv("GGML_METAL_FUSE_GDN_NORM_GATE");
@@ -125,14 +201,7 @@ static bool ggml_metal_fusion_gdn_norm_gate_enabled() {
     return enabled;
 }
 
-static bool ggml_metal_fusion_check_gdn_norm_gate(
-        const ggml_metal_fusion * fusion, const ggml_tensor * const * nodes,
-        const ggml_cgraph * gf, const int * node_idxs, int idx, ggml_metal_fusion_mode mode) {
-    if (!ggml_metal_fusion_gdn_norm_gate_enabled() || ggml_get_unary_op(nodes[2]) != GGML_UNARY_OP_SIGMOID ||
-        nodes[1]->src[0] != nodes[0] || nodes[3]->src[0] != nodes[1] || nodes[3]->src[1] != nodes[2]) { return false; }
-    if (mode == GGML_METAL_FUSION_STRUCTURAL) {
-        return true;
-    }
+static bool ggml_metal_fusion_check_gdn_norm_gate_shape(const ggml_tensor * const * nodes) {
     const ggml_tensor * x = nodes[0]->src[0];
     const ggml_tensor * w = nodes[1]->src[1];
     const ggml_tensor * z = nodes[2]->src[0];
@@ -145,6 +214,23 @@ static bool ggml_metal_fusion_check_gdn_norm_gate(
     }
     for (int j = 0; j < 4; ++j) {
         if (!ggml_are_same_shape(x, nodes[j])) { return false; }
+    }
+    return true;
+}
+
+static bool ggml_metal_fusion_check_gdn_norm_gate(
+        const ggml_metal_fusion * fusion, const ggml_tensor * const * nodes,
+        const ggml_cgraph * gf, const int * node_idxs, int idx, ggml_metal_fusion_mode mode) {
+    if (mode == GGML_METAL_FUSION_FULL && ggml_metal_fusion_reorder_only()) {
+        return false;
+    }
+    if (!ggml_metal_fusion_gdn_norm_gate_enabled() || ggml_get_unary_op(nodes[2]) != GGML_UNARY_OP_SIGMOID ||
+        nodes[1]->src[0] != nodes[0] || nodes[3]->src[0] != nodes[1] || nodes[3]->src[1] != nodes[2]) { return false; }
+    if (mode == GGML_METAL_FUSION_STRUCTURAL) {
+        return true;
+    }
+    if (!ggml_metal_fusion_check_gdn_norm_gate_shape(nodes)) {
+        return false;
     }
     const int output = node_idxs[idx + 3];
     return ggml_can_fuse_subgraph_ext(gf, node_idxs + idx, 4, fusion->ops.data(), &output, 1);
@@ -797,6 +883,9 @@ static bool ggml_metal_fusion_match_moe_shared(
 static bool ggml_metal_fusion_check_moe_reduce_shared(
         const ggml_metal_fusion * fusion, const ggml_tensor * const * nodes,
         const ggml_cgraph * gf, const int * node_idxs, int idx, ggml_metal_fusion_mode mode) {
+    if (mode == GGML_METAL_FUSION_FULL && ggml_metal_fusion_reorder_only()) {
+        return false;
+    }
     GGML_UNUSED(fusion);
     GGML_UNUSED(nodes);
     if (!ggml_metal_fusion_moe_reduce_shared_enabled()) { return false; }
@@ -822,7 +911,13 @@ static void ggml_metal_fusion_reorder_moe_shared(ggml_cgraph * gf) {
             int raw_idxs[23];
             for (int k = 0; k < 20; ++k) { raw_idxs[k] = i + k; }
             for (int k = 20; k < 23; ++k) { raw_idxs[k] = j + k - 20; }
-            if (!ggml_metal_fusion_match_moe_shared(gf, raw_idxs, GGML_METAL_FUSION_STRUCTURAL)) { continue; }
+            if (!ggml_metal_fusion_match_moe_shared(gf, raw_idxs, GGML_METAL_FUSION_FULL)) {
+                if (ggml_metal_fusion_delay_debug()) {
+                    GGML_LOG_INFO("metal fusion move: MOE_REDUCE_SHARED node='%s' status=rejected-shape tokens=%lld\n",
+                            gf->nodes[i]->name, (long long) match.experts->ne[2]);
+                }
+                continue;
+            }
             bool pure = true;
             for (int k = i + 20; k < j; ++k) {
                 const ggml_tensor * t = gf->nodes[k];
@@ -833,7 +928,9 @@ static void ggml_metal_fusion_reorder_moe_shared(ggml_cgraph * gf) {
                     break;
                 }
             }
-            if (!pure) { continue; }
+            const bool safe = pure && ggml_metal_fusion_can_delay(gf, i, 20, j);
+            ggml_metal_fusion_trace_delay(gf, i, 20, j, "MOE_REDUCE_SHARED", safe);
+            if (!safe) { continue; }
             std::rotate(gf->nodes + i, gf->nodes + i + 20, gf->nodes + j);
             i = j + 2;
             break;
@@ -859,6 +956,14 @@ static void ggml_metal_fusion_reorder_gdn_norm_gate(ggml_cgraph * gf) {
                 out->op != GGML_OP_MUL || out->src[0] != weighted || out->src[1] != sigmoid) {
                 continue;
             }
+            const ggml_tensor * nodes[] = { norm, weighted, sigmoid, out };
+            if (!ggml_metal_fusion_check_gdn_norm_gate_shape(nodes)) {
+                if (ggml_metal_fusion_delay_debug()) {
+                    GGML_LOG_INFO("metal fusion move: GDN_NORM_GATE node='%s' status=rejected-shape tokens=%lld\n",
+                            norm->name, (long long) norm->ne[2]);
+                }
+                break;
+            }
             const int indices[] = { i, i + 1, j, j + 1 };
             const int output = j + 1;
             if (!ggml_can_fuse_subgraph_ext(gf, indices, 4, ops, &output, 1)) {
@@ -876,7 +981,9 @@ static void ggml_metal_fusion_reorder_gdn_norm_gate(ggml_cgraph * gf) {
                     break;
                 }
             }
-            if (pure) {
+            const bool safe = pure && ggml_metal_fusion_can_delay(gf, i, 2, j);
+            ggml_metal_fusion_trace_delay(gf, i, 2, j, "GDN_NORM_GATE", safe);
+            if (safe) {
                 std::rotate(gf->nodes + i, gf->nodes + i + 2, gf->nodes + j);
                 i = j + 1;
             }

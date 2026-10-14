@@ -14,6 +14,8 @@
 #include <algorithm>
 #include <limits>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
 
 static int32_t ggml_metal_flash_attn_ext_vec_nwg(int64_t ne11) {
     const int32_t default_nwg = ne11 >= 8192 && ne11 <= 24576 ? 64 : 32;
@@ -246,6 +248,33 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
     }
 
     int n_fuse = 1;
+
+    if (ctx->use_fusion() && ggml_metal_fusion_info_debug(ctx->finfo) > 1) {
+        const char * env = nullptr;
+        ggml_metal_fusion_id expected = GGML_METAL_FUSION_NONE;
+        const char * kind = nullptr;
+        if (node->op == GGML_OP_MUL && node->src[0]->ne[1] == 10 && node->src[1]->ne[0] == 1) {
+            env = std::getenv("GGML_METAL_FUSE_MOE_REDUCE_SHARED");
+            expected = GGML_METAL_FUSION_MOE_REDUCE_SHARED;
+            kind = "MOE_REDUCE_SHARED";
+        } else if (node->op == GGML_OP_RMS_NORM && node->ne[0] <= 1024 && node->ne[1] > 1) {
+            env = std::getenv("GGML_METAL_FUSE_GDN_NORM_GATE");
+            expected = GGML_METAL_FUSION_GDN_NORM_GATE;
+            kind = "GDN_NORM_GATE";
+        }
+        if (env && std::strcmp(env, "1") == 0) {
+            int count = 1;
+            const ggml_metal_fusion * fusion = ctx->can_fuse(idx, GGML_METAL_FUSION_FULL, &count);
+            const bool matched = fusion && ggml_metal_fusion_get_id(fusion) == expected;
+            const char * reorder_only = std::getenv("GGML_METAL_FUSION_REORDER_ONLY");
+            const char * reason = matched ? "accepted" :
+                (reorder_only && std::strcmp(reorder_only, "1") == 0) ? "reorder-only" :
+                ctx->n_nodes() - idx < (expected == GGML_METAL_FUSION_GDN_NORM_GATE ? 4 : 13) ? "encoder-boundary" : "full-check";
+            GGML_LOG_INFO("metal fusion encode: %s node='%s' src0='%s' status=%s shape=[%lld,%lld,%lld,%lld] remaining=%d reason=%s\n",
+                    kind, node->name, node->src[0]->name, matched ? "fused" : "fallback",
+                    (long long) node->ne[0], (long long) node->ne[1], (long long) node->ne[2], (long long) node->ne[3], ctx->n_nodes() - idx, reason);
+        }
+    }
 
     // check if the current node can run concurrently with other nodes before it
     // the condition is that:

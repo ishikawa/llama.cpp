@@ -333,7 +333,8 @@ kernel void kernel_gdn_norm_gate_f32(
     }
     const float scale = 1.0f/sqrt(simd_sum(sum)/args.width + args.eps);
     for (int i = lane; i < args.width; i += 32) {
-        const float normalized = (x[offset + i]*scale)*w[i];
+        // Keep the F32 output of RMS_NORM + MUL before the gate.
+        volatile float normalized = (x[offset + i]*scale)*w[i];
         const float gate = 1.0f/(1.0f + exp(-z[offset + i]));
         dst[offset + i] = normalized*gate;
     }

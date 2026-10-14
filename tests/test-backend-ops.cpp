@@ -7610,7 +7610,10 @@ struct test_topk_moe : public test_case {
 struct test_gdn_norm_gate : public test_case {
     const char * metal_fusion_env() override { return "GGML_METAL_FUSE_GDN_NORM_GATE"; }
     const char * metal_fusion_label() override { return "RMS_NORM+MUL+UNARY+MUL"; }
-    bool metal_fusion_expected() override { return tokens == 1 && !external && !per_head_weight; }
+    bool metal_fusion_expected() override {
+        const char * env = std::getenv("GGML_METAL_FUSION_REORDER_ONLY");
+        return !(env && std::strcmp(env, "1") == 0) && tokens == 1 && !external && !per_head_weight;
+    }
     const int64_t width;
     const int64_t heads;
     const int64_t tokens;
@@ -7739,7 +7742,10 @@ struct test_moe_reduce : public test_case {
 struct test_moe_reduce_shared : public test_moe_reduce {
     const char * metal_fusion_env() override { return "GGML_METAL_FUSE_MOE_REDUCE_SHARED"; }
     const char * metal_fusion_label() override { return "MUL+ADD+ADD+ADD+ADD+ADD+ADD+ADD+ADD+ADD+UNARY+MUL+ADD"; }
-    bool metal_fusion_expected() override { return n_tokens == 1 && !external && !interleaved_views_adds; }
+    bool metal_fusion_expected() override {
+        const char * env = std::getenv("GGML_METAL_FUSION_REORDER_ONLY");
+        return !(env && std::strcmp(env, "1") == 0) && n_tokens == 1 && !external && !interleaved_views_adds;
+    }
     const bool external;
     const bool matmul_shared;
     test_moe_reduce_shared(int64_t n, int64_t tokens = 1, bool external = false, bool interleaved = false, bool matmul_shared = false) :
@@ -7764,6 +7770,59 @@ struct test_moe_reduce_shared : public test_moe_reduce {
         }
         auto * out = ggml_add(ctx, reduce, ggml_mul(ctx, x, ggml_sigmoid(ctx, gate)));
         return external ? ggml_add(ctx, out, reduce) : out;
+    }
+};
+
+struct test_moe_reduce_shared_rounding : public test_moe_reduce_shared {
+    ggml_tensor * shared_input = nullptr;
+    test_moe_reduce_shared_rounding(int64_t n) : test_moe_reduce_shared(n) {}
+    std::string op_desc(ggml_tensor *) override { return "MOE_REDUCE_SHARED_ROUNDING"; }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * out = test_moe_reduce_shared::build_graph(ctx);
+        shared_input = out->src[1]->src[0]->src[0];
+        return out;
+    }
+    void initialize_tensors(ggml_context * ctx) override {
+        test_case::initialize_tensors(ctx);
+        std::vector<float> experts(n_embd*10, 0.0f);
+        for (int64_t i = 0; i < n_embd; ++i) {
+            experts[i] = -100000000.0f;
+            experts[n_embd + i] = 100000000.0f;
+        }
+        const float weights[10] = { 1.0f, 1.00000011920928955078125f };
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (std::strcmp(t->name, "experts") == 0) {
+                ggml_backend_tensor_set(t, experts.data(), 0, experts.size()*sizeof(float));
+            } else if (std::strcmp(t->name, "weights") == 0) {
+                ggml_backend_tensor_set(t, weights, 0, sizeof(weights));
+            }
+        }
+        const std::vector<float> zero(n_embd, 0.0f);
+        ggml_backend_tensor_set(shared_input, zero.data(), 0, zero.size()*sizeof(float));
+    }
+};
+
+struct test_moe_reduce_shared_alias : public test_moe_reduce_shared {
+    test_moe_reduce_shared_alias() : test_moe_reduce_shared(2560, 1, false, false, true) {}
+    std::string op_desc(ggml_tensor *) override { return "MOE_REDUCE_SHARED_ALIAS"; }
+    bool metal_fusion_expected() override { return false; }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * out = test_moe_reduce_shared::build_graph(ctx);
+        ggml_tensor * reduce = out->src[0];
+        ggml_tensor * alias = ggml_view_2d(ctx, reduce, n_embd, n_tokens, reduce->nb[1], 0);
+        return ggml_add(ctx, out, alias);
+    }
+};
+
+struct test_gdn_norm_gate_alias : public test_gdn_norm_gate {
+    test_gdn_norm_gate_alias() : test_gdn_norm_gate(128, 48, 1, false, false, true) {}
+    std::string op_desc(ggml_tensor *) override { return "GDN_NORM_GATE_ALIAS"; }
+    bool metal_fusion_expected() override { return false; }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * out = test_gdn_norm_gate::build_graph(ctx);
+        ggml_tensor * norm = out->src[0];
+        ggml_tensor * alias = ggml_view_3d(ctx, norm, width, heads, tokens, norm->nb[1], norm->nb[2], 0);
+        return ggml_add(ctx, out, alias);
     }
 };
 
@@ -12200,9 +12259,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     // Cover the supported boundaries, common k = 8 shapes, interleaved views and adds, and k = 16 fallback.
+    test_cases.emplace_back(new test_moe_reduce_shared_rounding(2560));
+    test_cases.emplace_back(new test_moe_reduce_shared_rounding(2559));
+    test_cases.emplace_back(new test_moe_reduce_shared_alias());
+    test_cases.emplace_back(new test_gdn_norm_gate_alias());
     test_cases.emplace_back(new test_moe_reduce_shared(2560));
     test_cases.emplace_back(new test_moe_reduce_shared(2560, 1, false, false, true));
     test_cases.emplace_back(new test_moe_reduce_shared(2559, 1, false, false, true));
+    test_cases.emplace_back(new test_moe_reduce_shared(2560, 2, false, false, true));
     test_cases.emplace_back(new test_moe_reduce_shared(2559));
     test_cases.emplace_back(new test_moe_reduce_shared(63));
     test_cases.emplace_back(new test_moe_reduce_shared(2561));
@@ -12212,6 +12276,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gdn_norm_gate(128, 48));
     test_cases.emplace_back(new test_gdn_norm_gate(128, 48, 1, false, false, true));
     test_cases.emplace_back(new test_gdn_norm_gate(127, 47, 1, false, false, true));
+    test_cases.emplace_back(new test_gdn_norm_gate(128, 48, 2, false, false, true));
     test_cases.emplace_back(new test_gdn_norm_gate(127, 47));
     test_cases.emplace_back(new test_gdn_norm_gate(128, 48, 1, false, true));
     test_cases.emplace_back(new test_gdn_norm_gate(128, 48, 2));

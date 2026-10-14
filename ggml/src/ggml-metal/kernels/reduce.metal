@@ -245,16 +245,17 @@ kernel void kernel_moe_reduce_shared_f32(
     }
     device const char * experts_row = experts + token*args.nb_experts2 + i*args.nb_experts0;
     device const char * weights_row = weights + token*args.nb_weights2;
-    float sum = *(device const float *) experts_row * *(device const float *) weights_row;
+    // Keep the F32 stores of the separate MUL and ADD nodes.
+    volatile float sum = *(device const float *) experts_row * *(device const float *) weights_row;
     for (uint e = 1; e < 10; ++e) {
         const float expert = *(device const float *) (experts_row + ulong(e)*args.nb_experts1);
         const float weight = *(device const float *) (weights_row + ulong(e)*args.nb_weights1);
-        const float weighted = expert*weight;
+        volatile float weighted = expert*weight;
         sum = sum + weighted;
     }
     const float gate_value = *(device const float *) (gate + token*args.nb_gate1);
     const float sigmoid = 1.0f/(1.0f + exp(-gate_value));
     const float shared_value = *(device const float *) (shared + token*args.nb_shared1 + i*args.nb_shared0);
-    const float gated = shared_value*sigmoid;
+    volatile float gated = shared_value*sigmoid;
     *(device float *) (dst + token*args.nb_dst1 + i*args.nb_dst0) = sum + gated;
 }

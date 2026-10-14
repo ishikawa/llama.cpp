@@ -3396,3 +3396,121 @@ template [[host_name("kernel_mul_mv_id_iq2_s_f32")]]   kernel kernel_mul_mv_id_t
 template [[host_name("kernel_mul_mv_id_iq4_nl_f32")]]  kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_iq4_nl_f32_impl <N_R0_IQ4_NL>>>;
 template [[host_name("kernel_mul_mv_id_iq4_xs_f32")]]  kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_iq4_xs_f32_impl <N_R0_IQ4_XS>>>;
 template [[host_name("kernel_mul_mv_id_tq2_0_f32")]]   kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_tq2_0_f32_impl  <N_R0_TQ2_0>>>;
+
+template [[host_name("kernel_mul_mv_id_iq4_nl_f32_decode_r4")]] kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_iq4_nl_f32_impl<4>>>;
+
+inline float moe_gate_up_dot_iq2_s(device const block_iq2_s * xb, int ib, thread const float * yl) {
+    device const block_iq2_s * xr = xb;
+    device const uint8_t * qs = xr->qs + 4 * ib;
+    device const uint8_t * qh = xr->qh + ib;
+    device const uint8_t * sc = xr->scales + ib;
+    device const uint8_t * signs = qs + QK_K/8;
+    device const half * dh = &xr->d;
+
+    const float db = dh[0];
+    const float d1 = db * (0.5f + (sc[0] & 0xf));
+    const float d2 = db * (0.5f + (sc[0] >>  4));
+
+    float2 sum = {0};
+    for (short l = 0; l < 2; ++l) {
+        const int index1 = qs[l+0] | ((qh[0] << (8-2*l)) & 0x300);
+        const int index2 = qs[l+2] | ((qh[0] << (4-2*l)) & 0x300);
+        constant uint8_t * grid1 = (constant uint8_t *)(iq2s_grid + index1);
+        constant uint8_t * grid2 = (constant uint8_t *)(iq2s_grid + index2);
+        for (short j = 0; j < 8; ++j) {
+            sum[0] += yl[8*l + j +  0] * float(grid1[j]) * select(1, -1, signs[l+0] & kmask_iq2xs[j]);
+            sum[1] += yl[8*l + j + 16] * float(grid2[j]) * select(1, -1, signs[l+2] & kmask_iq2xs[j]);
+        }
+    }
+    return d1 * sum[0] + d2 * sum[1];
+}
+
+inline float moe_gate_up_dot_iq3_s(device const block_iq3_s * xb, int ib, thread const float * yl, threadgroup char * shmem) {
+    threadgroup uint32_t * svalues = (threadgroup uint32_t *) shmem;
+    device const block_iq3_s * xr = xb;
+    device const uint8_t * qs = xr->qs + 8 * ib;
+    device const uint8_t * qh = xr->qh + ib;
+    device const uint8_t * sc = xr->scales + (ib/2);
+    device const uint8_t * signs = xr->signs + 4 * ib;
+    device const half * dh = &xr->d;
+
+    const float db = dh[0];
+    const float d = db * (1 + 2*((sc[0] >> 4*(ib%2)) & 0xf));
+
+    float2 sum = {0};
+    for (short l = 0; l < 4; ++l) {
+        const threadgroup uint32_t * table1 = qh[0] & kmask_iq2xs[2*l+0] ? svalues + 256 : svalues;
+        const threadgroup uint32_t * table2 = qh[0] & kmask_iq2xs[2*l+1] ? svalues + 256 : svalues;
+        const threadgroup uint8_t * grid1 = (const threadgroup uint8_t *)(table1 + qs[2*l+0]);
+        const threadgroup uint8_t * grid2 = (const threadgroup uint8_t *)(table2 + qs[2*l+1]);
+        for (short j = 0; j < 4; ++j) {
+            sum[0] += yl[8*l + j + 0] * grid1[j] * select(1, -1, signs[l] & kmask_iq2xs[j+0]);
+            sum[1] += yl[8*l + j + 4] * grid2[j] * select(1, -1, signs[l] & kmask_iq2xs[j+4]);
+        }
+    }
+    return d * (sum[0] + sum[1]);
+}
+
+template<typename block_t, int NR0, bool IQ3>
+kernel void kernel_moe_gate_up(
+        constant ggml_metal_kargs_mul_mv_id & args,
+    device const char * gate,
+    device const char * up,
+    device const char * src1,
+    device const int32_t * ids,
+        device float * dst,
+        threadgroup char * shmem [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    const int first_row = (tgpig.x*FC_mul_mv_nsg + sgitg)*NR0;
+    const int idx = tgpig.z;
+    const int expert = ids[idx];
+    const uint64_t offset = (uint64_t)expert*args.nb02 + (uint64_t)first_row*args.nb01;
+    device const char * weights[2] = {gate + offset, up + offset};
+    device const float * y = (device const float *)(src1 + (idx % args.ne11)*args.nb11);
+
+    if (IQ3) {
+        threadgroup uint32_t * table = (threadgroup uint32_t *) shmem;
+        for (int i = 32*sgitg + tiisg; i < 512; i += 32*FC_mul_mv_nsg) {
+            table[i] = iq3s_grid[i];
+        }
+    }
+    if (IQ3) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    float sum_gate[NR0] = {0.f};
+    float sum_up[NR0] = {0.f};
+    float yl[32];
+    for (int ib32 = tiisg; ib32 < args.ne00/32; ib32 += 32) {
+        for (short i = 0; i < 32; ++i) {
+            yl[i] = y[32*ib32 + i];
+        }
+        const int ibl = ib32/8;
+        const int ib = ib32%8;
+        for (short row = 0; row < NR0; ++row) {
+            device const block_t * g = (device const block_t *)(weights[0] + row*args.nb01) + ibl;
+            device const block_t * u = (device const block_t *)(weights[1] + row*args.nb01) + ibl;
+            if (IQ3) {
+                sum_gate[row] += moe_gate_up_dot_iq3_s((device const block_iq3_s *)g, ib, yl, shmem);
+                sum_up[row]   += moe_gate_up_dot_iq3_s((device const block_iq3_s *)u, ib, yl, shmem);
+            } else {
+                sum_gate[row] += moe_gate_up_dot_iq2_s((device const block_iq2_s *)g, ib, yl);
+                sum_up[row]   += moe_gate_up_dot_iq2_s((device const block_iq2_s *)u, ib, yl);
+            }
+        }
+    }
+
+    for (short row = 0; row < NR0; ++row) {
+        const float g = simd_sum(sum_gate[row]) * (IQ3 ? 1.f : 0.25f);
+        const float u = simd_sum(sum_up[row])   * (IQ3 ? 1.f : 0.25f);
+        if (tiisg == 0) {
+            dst[(uint64_t)idx*args.ne0 + first_row + row] = (g / (1.f + exp(-g))) * u;
+        }
+    }
+}
+
+typedef decltype(kernel_moe_gate_up<block_iq2_s, 2, false>) kernel_moe_gate_up_t;
+template [[host_name("kernel_moe_gate_up_iq2_s_r2_tg0")]] kernel kernel_moe_gate_up_t kernel_moe_gate_up<block_iq2_s, 2, false>;
+template [[host_name("kernel_moe_gate_up_iq3_s_r2_tg1")]] kernel kernel_moe_gate_up_t kernel_moe_gate_up<block_iq3_s, 2, true>;

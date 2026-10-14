@@ -1473,11 +1473,28 @@ struct test_case {
         }
 
         ggml_backend_buffer_ptr buf(nullptr);
+        ggml_backend_ptr sched_cpu(nullptr);
         ggml_backend_sched_ptr sched(nullptr);
         if (metal_fusion_env()) {
-            ggml_backend_t backends[] = { backend1 };
-            sched.reset(ggml_backend_sched_new(backends, nullptr, 1, ggml_graph_size(gf), false, false));
-            if (!sched || !ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+            // the scheduler requires a CPU backend last; every op here is supported by backend1
+            sched_cpu.reset(ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr));
+            if (!sched_cpu) {
+                printf("failed to initialize scheduler CPU backend ");
+                return test_status_t::FAIL;
+            }
+            ggml_backend_t backends[] = { backend1, sched_cpu.get() };
+            sched.reset(ggml_backend_sched_new(backends, nullptr, 2, ggml_graph_size(gf), false, false));
+            if (!sched) {
+                printf("failed to initialize graph scheduler [%s] ", ggml_backend_name(backend1));
+                return test_status_t::FAIL;
+            }
+            // A leaf used only through a view cannot inherit a backend from its first consumer.
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t; t = ggml_get_next_tensor(ctx.get(), t)) {
+                if (t->op == GGML_OP_NONE && !t->view_src) {
+                    ggml_backend_sched_set_tensor_backend(sched.get(), t, backend1);
+                }
+            }
+            if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
                 printf("failed to allocate optimized graph [%s] ", ggml_backend_name(backend1));
                 return test_status_t::FAIL;
             }
@@ -12171,6 +12188,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // Cover the supported boundaries, common k = 8 shapes, interleaved views and adds, and k = 16 fallback.
     test_cases.emplace_back(new test_moe_reduce_shared(2560));
     test_cases.emplace_back(new test_moe_reduce_shared(2559));
+    test_cases.emplace_back(new test_moe_reduce_shared(63));
+    test_cases.emplace_back(new test_moe_reduce_shared(2561));
     test_cases.emplace_back(new test_moe_reduce_shared(2560, 2));
     test_cases.emplace_back(new test_moe_reduce_shared(2560, 1, true));
     test_cases.emplace_back(new test_moe_reduce_shared(2559, 1, false, true));

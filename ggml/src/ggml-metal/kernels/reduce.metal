@@ -229,23 +229,32 @@ template [[host_name("kernel_cumsum_add_f32")]] kernel kernel_cumsum_add_t kerne
 
 
 kernel void kernel_moe_reduce_shared_f32(
-        constant ggml_metal_kargs_moe_reduce & args [[buffer(0)]],
-        device const float * experts [[buffer(1)]],
-        device const float * weights [[buffer(2)]],
-        device float * dst [[buffer(3)]],
-        device const float * shared [[buffer(4)]],
-        device const float * gate [[buffer(5)]],
+        constant ggml_metal_kargs_moe_reduce_shared & args [[buffer(0)]],
+        device const char * experts [[buffer(1)]],
+        device const char * weights [[buffer(2)]],
+        device char * dst [[buffer(3)]],
+        device const char * shared [[buffer(4)]],
+        device const char * gate [[buffer(5)]],
         uint3 group [[threadgroup_position_in_grid]],
         uint3 tpitg [[thread_position_in_threadgroup]],
         uint3 ntg [[threads_per_threadgroup]]) {
-    const uint i = group.y*ntg.x + tpitg.x;
-    if (i >= uint(args.ne00)) { return; }
-    float sum = experts[i]*weights[0];
+    const ulong token = group.x;
+    const ulong i = ulong(group.y)*ntg.x + tpitg.x;
+    if (token >= ulong(args.ne02) || i >= ulong(args.ne00)) {
+        return;
+    }
+    device const char * experts_row = experts + token*args.nb_experts2 + i*args.nb_experts0;
+    device const char * weights_row = weights + token*args.nb_weights2;
+    float sum = *(device const float *) experts_row * *(device const float *) weights_row;
     for (uint e = 1; e < 10; ++e) {
-        const float weighted = experts[e*args.ne00 + i]*weights[e];
+        const float expert = *(device const float *) (experts_row + ulong(e)*args.nb_experts1);
+        const float weight = *(device const float *) (weights_row + ulong(e)*args.nb_weights1);
+        const float weighted = expert*weight;
         sum = sum + weighted;
     }
-    const float sigmoid = 1.0f/(1.0f + exp(-gate[0]));
-    const float gated = shared[i]*sigmoid;
-    dst[i] = sum + gated;
+    const float gate_value = *(device const float *) (gate + token*args.nb_gate1);
+    const float sigmoid = 1.0f/(1.0f + exp(-gate_value));
+    const float shared_value = *(device const float *) (shared + token*args.nb_shared1 + i*args.nb_shared0);
+    const float gated = shared_value*sigmoid;
+    *(device float *) (dst + token*args.nb_dst1 + i*args.nb_dst0) = sum + gated;
 }

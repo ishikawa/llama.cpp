@@ -6066,14 +6066,33 @@ int ggml_metal_op_moe_reduce(ggml_metal_op_t ctx, int idx) {
     const int n_col_tiles = (args.ne00 + nth - 1) / nth;
 
     ggml_metal_encoder_set_pipeline(enc, pipeline);
-    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    if (!shared) {
+        ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 0);
+    }
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(experts), 1);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(weights), 2);
     ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(dst),     3);
 
     if (shared) {
-        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(ctx->node(idx + 11)->src[0]), 4);
-        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(ctx->node(idx + 10)->src[0]), 5);
+        const ggml_tensor * shared_out = ctx->node(idx + 11)->src[0];
+        const ggml_tensor * gate = ctx->node(idx + 10)->src[0];
+        ggml_metal_kargs_moe_reduce_shared args_shared = {
+            /*.ne00        =*/ args.ne00,
+            /*.ne02        =*/ args.ne02,
+            /*.nb_experts0 =*/ experts->nb[0],
+            /*.nb_experts1 =*/ experts->nb[1],
+            /*.nb_experts2 =*/ experts->nb[2],
+            /*.nb_weights1 =*/ weights->nb[1],
+            /*.nb_weights2 =*/ weights->nb[2],
+            /*.nb_shared0  =*/ shared_out->nb[0],
+            /*.nb_shared1  =*/ shared_out->nb[1],
+            /*.nb_gate1    =*/ gate->nb[1],
+            /*.nb_dst0     =*/ dst->nb[0],
+            /*.nb_dst1     =*/ dst->nb[1],
+        };
+        ggml_metal_encoder_set_bytes(enc, &args_shared, sizeof(args_shared), 0);
+        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(shared_out), 4);
+        ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(gate), 5);
     }
     ggml_metal_encoder_dispatch_threadgroups(enc, (uint32_t) args.ne02, (uint32_t) n_col_tiles, 1, nth, 1, 1);
 

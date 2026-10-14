@@ -226,3 +226,26 @@ kernel void kernel_cumsum_add(
 typedef decltype(kernel_cumsum_add<float>) kernel_cumsum_add_t;
 
 template [[host_name("kernel_cumsum_add_f32")]] kernel kernel_cumsum_add_t kernel_cumsum_add<float>;
+
+
+kernel void kernel_moe_reduce_shared_f32(
+        constant ggml_metal_kargs_moe_reduce & args [[buffer(0)]],
+        device const float * experts [[buffer(1)]],
+        device const float * weights [[buffer(2)]],
+        device float * dst [[buffer(3)]],
+        device const float * shared [[buffer(4)]],
+        device const float * gate [[buffer(5)]],
+        uint3 group [[threadgroup_position_in_grid]],
+        uint lane [[thread_position_in_threadgroup]],
+        uint3 ntg [[threads_per_threadgroup]]) {
+    const uint i = group.y*ntg.x + lane;
+    if (i >= uint(args.ne00)) { return; }
+    float sum = experts[i]*weights[0];
+    for (uint e = 1; e < 10; ++e) {
+        const float weighted = experts[e*args.ne00 + i]*weights[e];
+        sum = sum + weighted;
+    }
+    const float sigmoid = 1.0f/(1.0f + exp(-gate[0]));
+    const float gated = shared[i]*sigmoid;
+    dst[i] = sum + gated;
+}

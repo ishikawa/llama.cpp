@@ -316,3 +316,25 @@ kernel void kernel_group_norm_f32(
         dst[j] *= scale;
     }
 }
+
+
+kernel void kernel_gdn_norm_gate_f32(
+        constant ggml_metal_kargs_gdn_norm_gate & args [[buffer(0)]],
+        device const float * x [[buffer(1)]],
+        device const float * w [[buffer(2)]],
+        device const float * z [[buffer(3)]],
+        device float * dst [[buffer(4)]],
+        uint row [[threadgroup_position_in_grid]],
+        ushort lane [[thread_index_in_simdgroup]]) {
+    const uint offset = row*args.width;
+    float sum = 0.0f;
+    for (int i = lane; i < args.width; i += 32) {
+        sum += x[offset + i]*x[offset + i];
+    }
+    const float scale = 1.0f/sqrt(simd_sum(sum)/args.width + args.eps);
+    for (int i = lane; i < args.width; i += 32) {
+        const float normalized = (x[offset + i]*scale)*w[i];
+        const float gate = 1.0f/(1.0f + exp(-z[offset + i]));
+        dst[offset + i] = normalized*gate;
+    }
+}

@@ -4461,6 +4461,7 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
     const int64_t n_tokens;
     const bool    identity;
     const bool    gated;
+    const bool    external;
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -4468,14 +4469,14 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
     }
 
     std::string vars() override {
-        return VARS_TO_STR4(n_embd, n_tokens, identity, gated);
+        return VARS_TO_STR5(n_embd, n_tokens, identity, gated, external);
     }
 
     // gated: post = 2*sigmoid(post/hc), as qwen4exp builds it, so backends can fuse the chain
     bool run_whole_graph() override { return gated; }
 
-    test_dsv4_hc_post(int64_t n_embd = 31, int64_t n_tokens = 17, bool identity = false, bool gated = false)
-        : n_embd(n_embd), n_tokens(n_tokens), identity(identity), gated(gated) {}
+    test_dsv4_hc_post(int64_t n_embd = 31, int64_t n_tokens = 17, bool identity = false, bool gated = false, bool external = false)
+        : n_embd(n_embd), n_tokens(n_tokens), identity(identity), gated(gated), external(external) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
@@ -4487,8 +4488,10 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
         ggml_tensor * post = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, n_tokens);
         ggml_set_name(post, "post");
 
+        ggml_tensor * sigmoid = nullptr;
         if (gated) {
-            post = ggml_scale(ctx, ggml_sigmoid(ctx, ggml_scale(ctx, post, 1.0f / (float) hc)), 2.0f);
+            sigmoid = ggml_sigmoid(ctx, ggml_scale(ctx, post, 1.0f / (float) hc));
+            post = ggml_scale(ctx, sigmoid, 2.0f);
         }
 
         ggml_tensor * comb = nullptr;
@@ -4499,7 +4502,7 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
 
         out = ggml_dsv4_hc_post(ctx, x, residual, post, comb);
         ggml_set_name(out, "out");
-        return out;
+        return external && sigmoid ? ggml_add(ctx, out, ggml_reshape_3d(ctx, sigmoid, 1, hc, n_tokens)) : out;
     }
 };
 
@@ -7523,6 +7526,44 @@ struct test_topk_moe : public test_case {
     }
 };
 
+struct test_gdn_norm_gate : public test_case {
+    const int64_t width;
+    const int64_t heads;
+    const int64_t tokens;
+    const bool external;
+    const bool per_head_weight;
+    test_gdn_norm_gate(int64_t width, int64_t heads, int64_t tokens = 1, bool external = false, bool per_head_weight = false) :
+        width(width), heads(heads), tokens(tokens), external(external), per_head_weight(per_head_weight) {}
+    std::string vars() override { return VARS_TO_STR5(width, heads, tokens, external, per_head_weight); }
+    std::string op_desc(ggml_tensor *) override { return "GDN_NORM_GATE"; }
+    bool run_whole_graph() override { return true; }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        auto * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, width, heads, tokens);
+        auto * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, width, per_head_weight ? heads : 1);
+        auto * z = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, width, heads, tokens);
+        auto * norm = ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), w);
+        auto * out = ggml_mul(ctx, norm, ggml_sigmoid(ctx, z));
+        return external ? ggml_add(ctx, out, norm) : out;
+    }
+};
+
+struct test_hc_lowrank : public test_case {
+    const int64_t n;
+    const int64_t tokens;
+    const bool external;
+    const bool bias;
+    test_hc_lowrank(int64_t n, int64_t tokens = 1, bool external = false, bool bias = false) : n(n), tokens(tokens), external(external), bias(bias) {}
+    std::string vars() override { return VARS_TO_STR4(n, tokens, external, bias); }
+    std::string op_desc(ggml_tensor *) override { return "HC_LOWRANK"; }
+    bool run_whole_graph() override { return true; }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        auto * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, tokens);
+        auto * scale = ggml_scale_bias(ctx, x, 0.25f, bias ? 0.1f : 0.0f);
+        auto * out = ggml_silu(ctx, scale);
+        return external ? ggml_add(ctx, out, scale) : out;
+    }
+};
+
 struct test_moe_reduce : public test_case {
     const int64_t n_embd;
     const int64_t n_expert_used;
@@ -7593,6 +7634,24 @@ struct test_moe_reduce : public test_case {
         }
         ggml_set_name(out, "moe_reduce");
         return out;
+    }
+};
+
+struct test_moe_reduce_shared : public test_moe_reduce {
+    const bool external;
+    test_moe_reduce_shared(int64_t n, int64_t tokens = 1, bool external = false, bool interleaved = false) :
+        test_moe_reduce(n, 10, tokens, false, false, interleaved), external(external) {}
+    std::string vars() override { return test_moe_reduce::vars() + ",external=" + std::to_string(external); }
+    std::string op_desc(ggml_tensor *) override { return "MOE_REDUCE_SHARED"; }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        auto * reduce = test_moe_reduce::build_graph(ctx);
+        auto * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        auto * gate = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, n_tokens);
+        // Put independent producers between the reduction and the merge, as in the model graph.
+        x = ggml_scale(ctx, x, 0.5f);
+        gate = ggml_scale(ctx, gate, 0.5f);
+        auto * out = ggml_add(ctx, reduce, ggml_mul(ctx, x, ggml_sigmoid(ctx, gate)));
+        return external ? ggml_add(ctx, out, reduce) : out;
     }
 };
 
@@ -9833,6 +9892,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_dsv4_hc_pre(128, n_hc, 17, true));
     }
 
+    test_cases.emplace_back(new test_dsv4_hc_post(2560, 1, true, true));
+    test_cases.emplace_back(new test_dsv4_hc_post(2560, 1, true, true, true));
+    test_cases.emplace_back(new test_dsv4_hc_post(31, 1, true, true));
+    test_cases.emplace_back(new test_dsv4_hc_post(31, 1, false, true));
     test_cases.emplace_back(new test_dsv4_hc_post(1, 1));
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17));
     test_cases.emplace_back(new test_dsv4_hc_post(128, 257));
@@ -12025,6 +12088,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     // Cover the supported boundaries, common k = 8 shapes, interleaved views and adds, and k = 16 fallback.
+    test_cases.emplace_back(new test_moe_reduce_shared(2560));
+    test_cases.emplace_back(new test_moe_reduce_shared(2559));
+    test_cases.emplace_back(new test_moe_reduce_shared(2560, 2));
+    test_cases.emplace_back(new test_moe_reduce_shared(2560, 1, true));
+    test_cases.emplace_back(new test_moe_reduce_shared(2559, 1, false, true));
+    test_cases.emplace_back(new test_gdn_norm_gate(128, 48));
+    test_cases.emplace_back(new test_gdn_norm_gate(127, 47));
+    test_cases.emplace_back(new test_gdn_norm_gate(128, 48, 1, false, true));
+    test_cases.emplace_back(new test_gdn_norm_gate(128, 48, 2));
+    test_cases.emplace_back(new test_gdn_norm_gate(128, 48, 1, true));
+    test_cases.emplace_back(new test_hc_lowrank(320));
+    test_cases.emplace_back(new test_hc_lowrank(319));
+    test_cases.emplace_back(new test_hc_lowrank(320, 1, false, true));
+    test_cases.emplace_back(new test_hc_lowrank(320, 2));
+    test_cases.emplace_back(new test_hc_lowrank(320, 1, true));
     test_cases.emplace_back(new test_moe_reduce(63,  2, 17));
     test_cases.emplace_back(new test_moe_reduce(2048, 8, 128));
     test_cases.emplace_back(new test_moe_reduce(2048, 8, 128, false, true));

@@ -1407,4 +1407,9 @@ typedef struct {
     int64_t ne;
 } ggml_metal_kargs_silu_back;
 
+typedef struct {
+    int32_t width;
+    float eps;
+} ggml_metal_kargs_gdn_norm_gate;
+
 #endif // GGML_METAL_IMPL

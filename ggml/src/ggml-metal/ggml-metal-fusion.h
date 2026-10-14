@@ -19,7 +19,7 @@ extern "C" {
 struct ggml_metal_device_props;
 
 // the maximum number of nodes that can be fused in a single kernel
-// (also the maximum length of a packed fusion group during graph optimization)
+// (the opt-in MoE shared merge permits a raw packed span of 32 nodes, including views)
 #define GGML_METAL_FUSION_MAX 16
 
 typedef enum ggml_metal_fusion_mode {
@@ -33,6 +33,10 @@ typedef enum ggml_metal_fusion_mode {
 // identifier of each fusion pattern so the op encoders know which kernel to use
 typedef enum ggml_metal_fusion_id {
     GGML_METAL_FUSION_NONE = 0,
+    GGML_METAL_FUSION_HC_LOWRANK,
+    GGML_METAL_FUSION_HC_POST_GATE,
+    GGML_METAL_FUSION_GDN_NORM_GATE,
+    GGML_METAL_FUSION_MOE_REDUCE_SHARED,
     GGML_METAL_FUSION_NORM_MUL,     // NORM/RMS_NORM + MUL
     GGML_METAL_FUSION_NORM_MUL_ADD, // NORM/RMS_NORM + MUL + ADD
     GGML_METAL_FUSION_NORM_SCALE,   // NORM/RMS_NORM + SCALE

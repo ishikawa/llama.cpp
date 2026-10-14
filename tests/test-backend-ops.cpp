@@ -1288,6 +1288,9 @@ struct test_case {
         return 0;
     }
 
+    virtual const char * metal_fusion_env() { return nullptr; }
+    virtual const char * metal_fusion_label() { return nullptr; }
+    virtual bool metal_fusion_expected() { return false; }
     virtual bool run_whole_graph() { return false; }
     virtual std::vector<ggml_tensor *> fusion_test_nodes() { return {}; }
     virtual bool use_weight_context() { return false; }
@@ -1436,6 +1439,12 @@ struct test_case {
             return test_status_t::NOT_SUPPORTED;
         }
 
+        static std::mutex fusion_mutex;
+        std::unique_lock<std::mutex> fusion_lock(fusion_mutex, std::defer_lock);
+        if (metal_fusion_env()) {
+            fusion_lock.lock();
+        }
+
         // post-graph sentinel
         add_sentinel(ctx.get());
         if (ctx_weights) {
@@ -1452,20 +1461,49 @@ struct test_case {
             ggml_backend_buffer_set_usage(buf_weights.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
         }
 
-        // allocate
-        ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors(ctx.get(), backend1));
-
-        if (buf == NULL) {
-            printf("failed to allocate tensors [%s] ", ggml_backend_name(backend1));
-            return test_status_t::FAIL;
-        }
-
         // build graph
         ggml_build_forward_expand(gf, out);
 
         // add sentinels as graph nodes so that they are checked in the callback
         for (ggml_tensor * sentinel : sentinels) {
+            if (metal_fusion_env()) {
+                ggml_set_output(sentinel);
+            }
             ggml_graph_add_node(gf, sentinel);
+        }
+
+        ggml_backend_buffer_ptr buf(nullptr);
+        ggml_backend_ptr sched_cpu(nullptr);
+        ggml_backend_sched_ptr sched(nullptr);
+        if (metal_fusion_env()) {
+            // the scheduler requires a CPU backend last; every op here is supported by backend1
+            sched_cpu.reset(ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr));
+            if (!sched_cpu) {
+                printf("failed to initialize scheduler CPU backend ");
+                return test_status_t::FAIL;
+            }
+            ggml_backend_t backends[] = { backend1, sched_cpu.get() };
+            sched.reset(ggml_backend_sched_new(backends, nullptr, 2, ggml_graph_size(gf), false, false));
+            if (!sched) {
+                printf("failed to initialize graph scheduler [%s] ", ggml_backend_name(backend1));
+                return test_status_t::FAIL;
+            }
+            // A leaf used only through a view cannot inherit a backend from its first consumer.
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t; t = ggml_get_next_tensor(ctx.get(), t)) {
+                if (t->op == GGML_OP_NONE && !t->view_src) {
+                    ggml_backend_sched_set_tensor_backend(sched.get(), t, backend1);
+                }
+            }
+            if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+                printf("failed to allocate optimized graph [%s] ", ggml_backend_name(backend1));
+                return test_status_t::FAIL;
+            }
+        } else {
+            buf.reset(ggml_backend_alloc_ctx_tensors(ctx.get(), backend1));
+            if (!buf) {
+                printf("failed to allocate tensors [%s] ", ggml_backend_name(backend1));
+                return test_status_t::FAIL;
+            }
         }
 
         // randomize tensors
@@ -1549,6 +1587,39 @@ struct test_case {
             GGML_UNUSED(index);
         };
 
+        using fusion_get_t = void * (*)(ggml_backend_dev_t);
+        using fusion_init_t = void (*)(void *);
+        using fusion_stats_t = int (*)(void *, const char **, uint64_t *, int);
+        void * finfo = nullptr;
+        fusion_stats_t stats_get = nullptr;
+        auto fusion_count = [&]() {
+            const int n = stats_get(finfo, nullptr, nullptr, 0);
+            std::vector<const char *> labels(n);
+            std::vector<uint64_t> counts(n);
+            stats_get(finfo, labels.data(), counts.data(), n);
+            uint64_t count = 0;
+            for (int i = 0; i < n; ++i) {
+                if (std::strcmp(labels[i], metal_fusion_label()) == 0) {
+                    count += counts[i];
+                }
+            }
+            return count;
+        };
+        uint64_t before = 0;
+        const char * env = metal_fusion_env() ? std::getenv(metal_fusion_env()) : nullptr;
+        if (env && std::strcmp(env, "1") == 0 && !std::getenv("GGML_METAL_FUSION_DISABLE")) {
+            auto dev = ggml_backend_get_device(backend1);
+            auto reg = ggml_backend_dev_backend_reg(dev);
+            auto get = (fusion_get_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_fusion_get");
+            auto init = (fusion_init_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_fusion_stats_init");
+            stats_get = (fusion_stats_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_fusion_stats_get");
+            if (get && init && stats_get) {
+                finfo = get(dev);
+                init(finfo);
+                before = fusion_count();
+            }
+        }
+
         std::vector<ggml_tensor *> fused_nodes_to_verify = fusion_test_nodes();
         if (fused_nodes_to_verify.size() == 0 && run_whole_graph()) {
             fused_nodes_to_verify.push_back(out);
@@ -1558,6 +1629,14 @@ struct test_case {
                                                                fused_nodes_to_verify.size());
 
         // Create test result
+        if (finfo) {
+            const bool fused = fusion_count() > before;
+            if (fused != metal_fusion_expected()) {
+                const char * label = metal_fusion_label();
+                printf("fusion %s: observed=%d expected=%d ", label ? label : "?", fused, metal_fusion_expected());
+                ud.ok = false;
+            }
+        }
         bool        test_passed = ud.ok && cmp_ok;
         std::string error_msg   = test_passed ? "" : (!cmp_ok ? "compare failed" : "test failed");
         test_result result(ggml_backend_name(backend1), current_op_name, vars(), "test", supported, test_passed,
@@ -4457,10 +4536,14 @@ struct test_dsv4_hc_pre : public test_dsv4_hc {
 };
 
 struct test_dsv4_hc_post : public test_dsv4_hc {
+    const char * metal_fusion_env() override { return "GGML_METAL_FUSE_HC_POST_GATE"; }
+    const char * metal_fusion_label() override { return "SCALE+UNARY+SCALE+DSV4_HC_POST"; }
+    bool metal_fusion_expected() override { return n_tokens == 1 && identity && gated && !external; }
     const int64_t n_embd;
     const int64_t n_tokens;
     const bool    identity;
     const bool    gated;
+    const bool    external;
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -4468,14 +4551,14 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
     }
 
     std::string vars() override {
-        return VARS_TO_STR4(n_embd, n_tokens, identity, gated);
+        return VARS_TO_STR5(n_embd, n_tokens, identity, gated, external);
     }
 
     // gated: post = 2*sigmoid(post/hc), as qwen4exp builds it, so backends can fuse the chain
     bool run_whole_graph() override { return gated; }
 
-    test_dsv4_hc_post(int64_t n_embd = 31, int64_t n_tokens = 17, bool identity = false, bool gated = false)
-        : n_embd(n_embd), n_tokens(n_tokens), identity(identity), gated(gated) {}
+    test_dsv4_hc_post(int64_t n_embd = 31, int64_t n_tokens = 17, bool identity = false, bool gated = false, bool external = false)
+        : n_embd(n_embd), n_tokens(n_tokens), identity(identity), gated(gated), external(external) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
@@ -4487,8 +4570,10 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
         ggml_tensor * post = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, n_tokens);
         ggml_set_name(post, "post");
 
+        ggml_tensor * sigmoid = nullptr;
         if (gated) {
-            post = ggml_scale(ctx, ggml_sigmoid(ctx, ggml_scale(ctx, post, 1.0f / (float) hc)), 2.0f);
+            sigmoid = ggml_sigmoid(ctx, ggml_scale(ctx, post, 1.0f / (float) hc));
+            post = ggml_scale(ctx, sigmoid, 2.0f);
         }
 
         ggml_tensor * comb = nullptr;
@@ -4499,7 +4584,7 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
 
         out = ggml_dsv4_hc_post(ctx, x, residual, post, comb);
         ggml_set_name(out, "out");
-        return out;
+        return external && sigmoid ? ggml_add(ctx, out, ggml_reshape_3d(ctx, sigmoid, 1, hc, n_tokens)) : out;
     }
 };
 
@@ -5657,6 +5742,63 @@ struct test_mul_mat_id_fusion : public test_case {
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
         return "MUL_MAT_ID_FUSION";
+    }
+};
+
+struct test_moe_gate_up_swiglu : public test_mul_mat_id {
+    const char * metal_fusion_env() override { return "GGML_METAL_FUSE_MOE_GATE_UP"; }
+    const char * metal_fusion_label() override { return "MUL_MAT_ID+MUL_MAT_ID+GLU"; }
+    bool metal_fusion_expected() override { return fallback == "none"; }
+    const bool up_first;
+    const std::string fallback;
+
+    test_moe_gate_up_swiglu(ggml_type type, bool broadcast, bool up_first = false, std::string fallback = "none")
+        : test_mul_mat_id(type, GGML_TYPE_F32, 512, 10, broadcast, 640, 1, 2560),
+          up_first(up_first), fallback(fallback) {}
+
+    std::string vars() override {
+        return test_mul_mat_id::vars() + "," + VARS_TO_STR2(up_first, fallback);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MOE_GATE_UP_SWIGLU";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        return 2*test_mul_mat_id::op_flops(t);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * gate_w = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
+        ggml_tensor * up_w = ggml_new_tensor_3d(ctx, fallback == "mixed_type" ? GGML_TYPE_IQ3_S : type_a, k, m, n_mats);
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, type_b, k, b ? 1 : n_used, n);
+        ggml_tensor * ids_all = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
+        ggml_tensor * ids = ggml_view_2d(ctx, ids_all, n_used, n, ids_all->nb[1], 0);
+        ggml_tensor * up_x = x;
+        ggml_tensor * up_ids = ids;
+        if (fallback == "input") {
+            up_x = ggml_new_tensor_3d(ctx, type_b, k, b ? 1 : n_used, n);
+        }
+        if (fallback == "ids") {
+            ggml_tensor * up_ids_all = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
+            up_ids = ggml_view_2d(ctx, up_ids_all, n_used, n, up_ids_all->nb[1], 0);
+        }
+        ggml_tensor * gate = ggml_mul_mat_id(ctx, gate_w, x, ids);
+        ggml_tensor * up = ggml_mul_mat_id(ctx, up_w, up_x, up_ids);
+        ggml_set_name(gate, "moe_gate");
+        ggml_set_name(up, "moe_up");
+        if (up_first && mode == MODE_TEST) {
+            ggml_build_forward_expand(gf, up);
+        }
+        ggml_tensor * out = ggml_swiglu_split(ctx, gate, up);
+        ggml_set_name(out, "moe_swiglu");
+        if (fallback == "extra_use") {
+            out = ggml_add(ctx, out, gate);
+        }
+        return out;
     }
 };
 
@@ -7469,6 +7611,26 @@ struct test_topk_moe : public test_case {
     }
 };
 
+struct test_hc_lowrank : public test_case {
+    const char * metal_fusion_env() override { return "GGML_METAL_FUSE_HC_LOWRANK"; }
+    const char * metal_fusion_label() override { return "SCALE+UNARY"; }
+    bool metal_fusion_expected() override { return tokens == 1 && !external && !bias; }
+    const int64_t n;
+    const int64_t tokens;
+    const bool external;
+    const bool bias;
+    test_hc_lowrank(int64_t n, int64_t tokens = 1, bool external = false, bool bias = false) : n(n), tokens(tokens), external(external), bias(bias) {}
+    std::string vars() override { return VARS_TO_STR4(n, tokens, external, bias); }
+    std::string op_desc(ggml_tensor *) override { return "HC_LOWRANK"; }
+    bool run_whole_graph() override { return true; }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        auto * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n, tokens);
+        auto * scale = ggml_scale_bias(ctx, x, 0.25f, bias ? 0.1f : 0.0f);
+        auto * out = ggml_silu(ctx, scale);
+        return external ? ggml_add(ctx, out, scale) : out;
+    }
+};
+
 struct test_moe_reduce : public test_case {
     const int64_t n_embd;
     const int64_t n_expert_used;
@@ -7539,6 +7701,80 @@ struct test_moe_reduce : public test_case {
         }
         ggml_set_name(out, "moe_reduce");
         return out;
+    }
+};
+
+struct test_moe_reduce_shared : public test_moe_reduce {
+    const char * metal_fusion_env() override { return "GGML_METAL_FUSE_MOE_REDUCE_SHARED"; }
+    const char * metal_fusion_label() override { return "MUL+ADD+ADD+ADD+ADD+ADD+ADD+ADD+ADD+ADD+UNARY+MUL+ADD"; }
+    bool metal_fusion_expected() override {
+        return n_tokens == 1 && !external && !interleaved_views_adds;
+    }
+    const bool external;
+    const bool matmul_shared;
+    test_moe_reduce_shared(int64_t n, int64_t tokens = 1, bool external = false, bool interleaved = false, bool matmul_shared = false) :
+        test_moe_reduce(n, 10, tokens, false, false, interleaved), external(external), matmul_shared(matmul_shared) {}
+    std::string vars() override { return test_moe_reduce::vars() + ",external=" + std::to_string(external) + ",matmul_shared=" + std::to_string(matmul_shared); }
+    std::string op_desc(ggml_tensor *) override { return matmul_shared ? "MOE_REDUCE_SHARED_MATMUL" : "MOE_REDUCE_SHARED"; }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        auto * reduce = test_moe_reduce::build_graph(ctx);
+        if (mode == MODE_TEST) {
+            ggml_build_forward_expand(gf, reduce);
+        }
+        ggml_tensor * x;
+        ggml_tensor * gate;
+        // Put independent producers between the reduction and the merge, as in the model graph.
+        if (matmul_shared) {
+            auto * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4096, n_tokens);
+            x = ggml_mul_mat(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4096, n_embd), input);
+            gate = ggml_mul_mat(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4096, 1), input);
+        } else {
+            x = ggml_scale(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens), 0.5f);
+            gate = ggml_scale(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, n_tokens), 0.5f);
+        }
+        auto * out = ggml_add(ctx, reduce, ggml_mul(ctx, x, ggml_sigmoid(ctx, gate)));
+        return external ? ggml_add(ctx, out, reduce) : out;
+    }
+};
+
+struct test_moe_reduce_shared_rounding : public test_moe_reduce_shared {
+    ggml_tensor * shared_input = nullptr;
+    test_moe_reduce_shared_rounding(int64_t n) : test_moe_reduce_shared(n) {}
+    std::string op_desc(ggml_tensor *) override { return "MOE_REDUCE_SHARED_ROUNDING"; }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * out = test_moe_reduce_shared::build_graph(ctx);
+        shared_input = out->src[1]->src[0]->src[0];
+        return out;
+    }
+    void initialize_tensors(ggml_context * ctx) override {
+        test_case::initialize_tensors(ctx);
+        std::vector<float> experts(n_embd*10, 0.0f);
+        for (int64_t i = 0; i < n_embd; ++i) {
+            experts[i] = -100000000.0f;
+            experts[n_embd + i] = 100000000.0f;
+        }
+        const float weights[10] = { 1.0f, 1.00000011920928955078125f };
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (std::strcmp(t->name, "experts") == 0) {
+                ggml_backend_tensor_set(t, experts.data(), 0, experts.size()*sizeof(float));
+            } else if (std::strcmp(t->name, "weights") == 0) {
+                ggml_backend_tensor_set(t, weights, 0, sizeof(weights));
+            }
+        }
+        const std::vector<float> zero(n_embd, 0.0f);
+        ggml_backend_tensor_set(shared_input, zero.data(), 0, zero.size()*sizeof(float));
+    }
+};
+
+struct test_moe_reduce_shared_alias : public test_moe_reduce_shared {
+    test_moe_reduce_shared_alias() : test_moe_reduce_shared(2560, 1, false, false, true) {}
+    std::string op_desc(ggml_tensor *) override { return "MOE_REDUCE_SHARED_ALIAS"; }
+    bool metal_fusion_expected() override { return false; }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * out = test_moe_reduce_shared::build_graph(ctx);
+        ggml_tensor * reduce = out->src[0];
+        ggml_tensor * alias = ggml_view_2d(ctx, reduce, n_embd, n_tokens, reduce->nb[1], 0);
+        return ggml_add(ctx, out, alias);
     }
 };
 
@@ -9779,6 +10015,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_dsv4_hc_pre(128, n_hc, 17, true));
     }
 
+    test_cases.emplace_back(new test_dsv4_hc_post(2560, 1, true, true));
+    test_cases.emplace_back(new test_dsv4_hc_post(2560, 1, true, true, true));
+    test_cases.emplace_back(new test_dsv4_hc_post(31, 1, true, true));
+    test_cases.emplace_back(new test_dsv4_hc_post(31, 1, false, true));
     test_cases.emplace_back(new test_dsv4_hc_post(1, 1));
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17));
     test_cases.emplace_back(new test_dsv4_hc_post(128, 257));
@@ -11052,7 +11292,25 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_BF16, GGML_TYPE_F32, 16, 16, b, 50, 200, 64));
     }
 
+    for (ggml_type type : {GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_S}) {
+        for (bool broadcast : {false, true}) {
+            for (bool up_first : {false, true}) {
+                test_cases.emplace_back(new test_moe_gate_up_swiglu(type, broadcast, up_first));
+            }
+        }
+    }
+    for (const char * fallback : {"input", "ids", "mixed_type", "extra_use"}) {
+        test_cases.emplace_back(new test_moe_gate_up_swiglu(GGML_TYPE_IQ2_S, true, false, fallback));
+    }
+
     // For issue 27873
+    for (bool broadcast : {false, true}) {
+        for (ggml_type type : {GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_NL}) {
+            test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 512, 10, broadcast, 640, 1, 2560));
+        }
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 512, 10, broadcast, 2560, 1, 640));
+    }
+
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ2_XXS, GGML_TYPE_F32, 1, 1, false, 1, 8192, 4096));
 
     for (int k : {1, 63, 65}) {
@@ -11953,6 +12211,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     // Cover the supported boundaries, common k = 8 shapes, interleaved views and adds, and k = 16 fallback.
+    test_cases.emplace_back(new test_moe_reduce_shared_rounding(2560));
+    test_cases.emplace_back(new test_moe_reduce_shared_rounding(2559));
+    test_cases.emplace_back(new test_moe_reduce_shared_alias());
+    test_cases.emplace_back(new test_moe_reduce_shared(2560));
+    test_cases.emplace_back(new test_moe_reduce_shared(2560, 1, false, false, true));
+    test_cases.emplace_back(new test_moe_reduce_shared(2559, 1, false, false, true));
+    test_cases.emplace_back(new test_moe_reduce_shared(2560, 2, false, false, true));
+    test_cases.emplace_back(new test_moe_reduce_shared(2559));
+    test_cases.emplace_back(new test_moe_reduce_shared(63));
+    test_cases.emplace_back(new test_moe_reduce_shared(2561));
+    test_cases.emplace_back(new test_moe_reduce_shared(2560, 2));
+    test_cases.emplace_back(new test_moe_reduce_shared(2560, 1, true));
+    test_cases.emplace_back(new test_moe_reduce_shared(2559, 1, false, true));
+    test_cases.emplace_back(new test_hc_lowrank(320));
+    test_cases.emplace_back(new test_hc_lowrank(319));
+    test_cases.emplace_back(new test_hc_lowrank(320, 1, false, true));
+    test_cases.emplace_back(new test_hc_lowrank(320, 2));
+    test_cases.emplace_back(new test_hc_lowrank(320, 1, true));
     test_cases.emplace_back(new test_moe_reduce(63,  2, 17));
     test_cases.emplace_back(new test_moe_reduce(2048, 8, 128));
     test_cases.emplace_back(new test_moe_reduce(2048, 8, 128, false, true));

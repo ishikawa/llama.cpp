@@ -398,3 +398,15 @@ typedef decltype(kernel_geglu_quick<float>) kernel_geglu_quick_t;
 
 template [[host_name("kernel_geglu_quick_f32")]] kernel kernel_geglu_quick_t kernel_geglu_quick<float>;
 template [[host_name("kernel_geglu_quick_f16")]] kernel kernel_geglu_quick_t kernel_geglu_quick<half>;
+
+
+kernel void kernel_hc_lowrank_f32(
+        constant int & n [[buffer(0)]],
+        device const float * src [[buffer(1)]],
+        device float * dst [[buffer(2)]],
+        uint i [[thread_position_in_grid]]) {
+    if (i < uint(n)) {
+        const float x = src[i]*0.25f;
+        dst[i] = x/(1.0f + exp(-x));
+    }
+}

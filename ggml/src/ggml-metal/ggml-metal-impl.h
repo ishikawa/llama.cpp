@@ -1277,6 +1277,21 @@ typedef struct {
 } ggml_metal_kargs_moe_reduce;
 
 typedef struct {
+    int32_t ne00;
+    int32_t ne02;
+    uint64_t nb_experts0;
+    uint64_t nb_experts1;
+    uint64_t nb_experts2;
+    uint64_t nb_weights1;
+    uint64_t nb_weights2;
+    uint64_t nb_shared0;
+    uint64_t nb_shared1;
+    uint64_t nb_gate1;
+    uint64_t nb_dst0;
+    uint64_t nb_dst1;
+} ggml_metal_kargs_moe_reduce_shared;
+
+typedef struct {
     int32_t nrows;
 } ggml_metal_kargs_fwht;
 

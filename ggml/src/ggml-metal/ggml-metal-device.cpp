@@ -7,6 +7,8 @@
 #include "ggml-impl.h"
 
 #include <cassert>
+#include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -1532,6 +1534,14 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
             }
     };
 
+    const char * decode = std::getenv("GGML_METAL_MUL_MV_ID_DECODE_IQ4_NL");
+    if (decode && std::strcmp(decode, "1") == 0 && tsrc0 == GGML_TYPE_IQ4_NL &&
+        ne12 == 1 && tsrc1 == GGML_TYPE_F32 && !split && ne00 == 640 && ne01 % 16 == 0) {
+        nr0 = 4;
+        nsg = 4;
+        suffix = "_decode_r4";
+    }
+
     snprintf(base, 256, "kernel_mul_mv_id_%s_%s%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1), suffix);
     snprintf(name, 256, "%s_nsg=%d_split=%d", base, nsg, split);
 
@@ -1555,6 +1565,30 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
     res.nsg  = nsg;
     res.smem = smem;
 
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_moe_gate_up(ggml_metal_library_t lib, const ggml_tensor * op) {
+    const int nsg = 4;
+    const int nr0 = 2;
+    const bool iq3 = op->src[0]->type == GGML_TYPE_IQ3_S;
+    const bool tg = iq3;
+
+    char base[256];
+    char name[256];
+    snprintf(base, sizeof(base), "kernel_moe_gate_up_%s_r%d_tg%d", ggml_type_name(op->src[0]->type), nr0, tg);
+    snprintf(name, sizeof(name), "%s_nsg=%d", base, nsg);
+    auto res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        ggml_metal_cv_t cv = ggml_metal_cv_init();
+        ggml_metal_cv_set_int16(cv, nsg, FC_MUL_MV + 0);
+        res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
+        ggml_metal_cv_free(cv);
+    }
+    res.nsg = nsg;
+    res.nr0 = nr0;
+    res.nr1 = 1;
+    res.smem = iq3 ? 512*sizeof(uint32_t) : 0;
     return res;
 }
 
@@ -2768,5 +2802,13 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_count_equal(ggml
     res.smem = 32 * sizeof(int32_t);
     res.nsg  = nsg;
 
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_small_fusion(ggml_metal_library_t lib, const char * name) {
+    auto res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
     return res;
 }

@@ -12,7 +12,9 @@
 #import <Foundation/Foundation.h>
 
 #import <Metal/Metal.h>
+#include <errno.h>
 #include <float.h>
+#include <limits.h>
 #include <sys/file.h>
 
 #undef MIN
@@ -55,6 +57,7 @@ struct ggml_metal {
     id<MTLCaptureScope> capture_scope;
 
     // command buffer state
+    int n_main;
     int n_cb;           // number of extra threads used to submit the command buffers
     int n_nodes_0;      // number of nodes submitted by the main thread
     int n_nodes_1;      // remaining number of nodes submitted by the n_cb threads
@@ -89,6 +92,23 @@ struct ggml_metal {
     bool dispatch_timing;
     NSMutableDictionary * dispatch_stats[GGML_METAL_MAX_COMMAND_BUFFERS + 1];
 };
+
+static int ggml_metal_env_int(const char * name, int max_value) {
+    const char * val = getenv(name);
+    if (val == NULL) {
+        return 0;
+    }
+
+    char * end;
+    errno = 0;
+    const long value = strtol(val, &end, 10);
+    if (errno == ERANGE || val[0] < '0' || val[0] > '9' || *end != '\0' || value < 1 || value > max_value) {
+        GGML_LOG_WARN("ggml_metal_init: invalid %s = '%s', expected an integer from 1 to %d; using default\n", name, val, max_value);
+        return 0;
+    }
+
+    return (int) value;
+}
 
 ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
     GGML_LOG_INFO("%s: allocating\n", __func__);
@@ -145,6 +165,9 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
 
         res->d_queue = dispatch_queue_create("ggml-metal", DISPATCH_QUEUE_CONCURRENT);
 
+        const int n_cb = ggml_metal_env_int("GGML_METAL_N_CB", GGML_METAL_MAX_COMMAND_BUFFERS);
+        res->n_main = ggml_metal_env_int("GGML_METAL_N_MAIN", INT_MAX);
+
         const char * stats_path = getenv("GGML_METAL_DISPATCH_STATS");
         res->stats_path = stats_path && stats_path[0] ? strdup(stats_path) : NULL;
         const char * timing = getenv("GGML_METAL_DISPATCH_TIMING");
@@ -198,6 +221,15 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
         res->cmd_buf_last = nil;
 
         res->pipelines_ext = ggml_metal_pipelines_init();
+
+        ggml_metal_set_n_cb(res, n_cb ? n_cb : 1);
+        if (n_cb || res->n_main) {
+            if (res->n_main) {
+                GGML_LOG_INFO("%s: GGML_METAL_N_CB = %d, GGML_METAL_N_MAIN = %d\n", __func__, res->n_cb, res->n_main);
+            } else {
+                GGML_LOG_INFO("%s: GGML_METAL_N_CB = %d, GGML_METAL_N_MAIN = default\n", __func__, res->n_cb);
+            }
+        }
 
         return res;
     }
@@ -742,7 +774,7 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
     }
 
     // number of nodes encoded by the main thread (empirically determined)
-    const int n_main = MAX(64, 0.1*gf->n_nodes);
+    const int n_main = ctx->n_main ? ctx->n_main : MAX(64, 0.1*gf->n_nodes);
 
     // number of threads in addition to the main thread
     const int n_cb = ctx->n_cb;

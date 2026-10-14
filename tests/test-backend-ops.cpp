@@ -1288,6 +1288,9 @@ struct test_case {
         return 0;
     }
 
+    virtual const char * metal_fusion_env() { return nullptr; }
+    virtual const char * metal_fusion_label() { return nullptr; }
+    virtual bool metal_fusion_expected() { return false; }
     virtual bool run_whole_graph() { return false; }
     virtual std::vector<ggml_tensor *> fusion_test_nodes() { return {}; }
     virtual bool use_weight_context() { return false; }
@@ -1436,6 +1439,12 @@ struct test_case {
             return test_status_t::NOT_SUPPORTED;
         }
 
+        static std::mutex fusion_mutex;
+        std::unique_lock<std::mutex> fusion_lock(fusion_mutex, std::defer_lock);
+        if (metal_fusion_env()) {
+            fusion_lock.lock();
+        }
+
         // post-graph sentinel
         add_sentinel(ctx.get());
         if (ctx_weights) {
@@ -1452,20 +1461,32 @@ struct test_case {
             ggml_backend_buffer_set_usage(buf_weights.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
         }
 
-        // allocate
-        ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors(ctx.get(), backend1));
-
-        if (buf == NULL) {
-            printf("failed to allocate tensors [%s] ", ggml_backend_name(backend1));
-            return test_status_t::FAIL;
-        }
-
         // build graph
         ggml_build_forward_expand(gf, out);
 
         // add sentinels as graph nodes so that they are checked in the callback
         for (ggml_tensor * sentinel : sentinels) {
+            if (metal_fusion_env()) {
+                ggml_set_output(sentinel);
+            }
             ggml_graph_add_node(gf, sentinel);
+        }
+
+        ggml_backend_buffer_ptr buf(nullptr);
+        ggml_backend_sched_ptr sched(nullptr);
+        if (metal_fusion_env()) {
+            ggml_backend_t backends[] = { backend1 };
+            sched.reset(ggml_backend_sched_new(backends, nullptr, 1, ggml_graph_size(gf), false, false));
+            if (!sched || !ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+                printf("failed to allocate optimized graph [%s] ", ggml_backend_name(backend1));
+                return test_status_t::FAIL;
+            }
+        } else {
+            buf.reset(ggml_backend_alloc_ctx_tensors(ctx.get(), backend1));
+            if (!buf) {
+                printf("failed to allocate tensors [%s] ", ggml_backend_name(backend1));
+                return test_status_t::FAIL;
+            }
         }
 
         // randomize tensors
@@ -1549,6 +1570,39 @@ struct test_case {
             GGML_UNUSED(index);
         };
 
+        using fusion_get_t = void * (*)(ggml_backend_dev_t);
+        using fusion_init_t = void (*)(void *);
+        using fusion_stats_t = int (*)(void *, const char **, uint64_t *, int);
+        void * finfo = nullptr;
+        fusion_stats_t stats_get = nullptr;
+        auto fusion_count = [&]() {
+            const int n = stats_get(finfo, nullptr, nullptr, 0);
+            std::vector<const char *> labels(n);
+            std::vector<uint64_t> counts(n);
+            stats_get(finfo, labels.data(), counts.data(), n);
+            uint64_t count = 0;
+            for (int i = 0; i < n; ++i) {
+                if (std::strcmp(labels[i], metal_fusion_label()) == 0) {
+                    count += counts[i];
+                }
+            }
+            return count;
+        };
+        uint64_t before = 0;
+        const char * env = metal_fusion_env() ? std::getenv(metal_fusion_env()) : nullptr;
+        if (env && std::strcmp(env, "1") == 0 && !std::getenv("GGML_METAL_FUSION_DISABLE")) {
+            auto dev = ggml_backend_get_device(backend1);
+            auto reg = ggml_backend_dev_backend_reg(dev);
+            auto get = (fusion_get_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_fusion_get");
+            auto init = (fusion_init_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_fusion_stats_init");
+            stats_get = (fusion_stats_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_fusion_stats_get");
+            if (get && init && stats_get) {
+                finfo = get(dev);
+                init(finfo);
+                before = fusion_count();
+            }
+        }
+
         std::vector<ggml_tensor *> fused_nodes_to_verify = fusion_test_nodes();
         if (fused_nodes_to_verify.size() == 0 && run_whole_graph()) {
             fused_nodes_to_verify.push_back(out);
@@ -1558,6 +1612,13 @@ struct test_case {
                                                                fused_nodes_to_verify.size());
 
         // Create test result
+        if (finfo) {
+            const bool fused = fusion_count() > before;
+            if (fused != metal_fusion_expected()) {
+                printf("fusion %s: observed=%d expected=%d ", metal_fusion_label(), fused, metal_fusion_expected());
+                ud.ok = false;
+            }
+        }
         bool        test_passed = ud.ok && cmp_ok;
         std::string error_msg   = test_passed ? "" : (!cmp_ok ? "compare failed" : "test failed");
         test_result result(ggml_backend_name(backend1), current_op_name, vars(), "test", supported, test_passed,
@@ -4457,6 +4518,9 @@ struct test_dsv4_hc_pre : public test_dsv4_hc {
 };
 
 struct test_dsv4_hc_post : public test_dsv4_hc {
+    const char * metal_fusion_env() override { return "GGML_METAL_FUSE_HC_POST_GATE"; }
+    const char * metal_fusion_label() override { return "SCALE+UNARY+SCALE+DSV4_HC_POST"; }
+    bool metal_fusion_expected() override { return n_tokens == 1 && identity && gated && !external; }
     const int64_t n_embd;
     const int64_t n_tokens;
     const bool    identity;
@@ -7527,6 +7591,9 @@ struct test_topk_moe : public test_case {
 };
 
 struct test_gdn_norm_gate : public test_case {
+    const char * metal_fusion_env() override { return "GGML_METAL_FUSE_GDN_NORM_GATE"; }
+    const char * metal_fusion_label() override { return "RMS_NORM+MUL+UNARY+MUL"; }
+    bool metal_fusion_expected() override { return tokens == 1 && !external && !per_head_weight; }
     const int64_t width;
     const int64_t heads;
     const int64_t tokens;
@@ -7538,16 +7605,24 @@ struct test_gdn_norm_gate : public test_case {
     std::string op_desc(ggml_tensor *) override { return "GDN_NORM_GATE"; }
     bool run_whole_graph() override { return true; }
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        auto * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, width, heads, tokens);
+        auto * storage = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, width*heads*tokens + width*width*heads);
+        auto * x = ggml_view_3d(ctx, storage, width, heads, tokens, width*sizeof(float), width*heads*sizeof(float), 0);
         auto * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, width, per_head_weight ? heads : 1);
         auto * z = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, width, heads, tokens);
         auto * norm = ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), w);
+        if (mode == MODE_TEST) {
+            ggml_build_forward_expand(gf, norm);
+        }
+        z = ggml_scale(ctx, z, 0.5f);
         auto * out = ggml_mul(ctx, norm, ggml_sigmoid(ctx, z));
         return external ? ggml_add(ctx, out, norm) : out;
     }
 };
 
 struct test_hc_lowrank : public test_case {
+    const char * metal_fusion_env() override { return "GGML_METAL_FUSE_HC_LOWRANK"; }
+    const char * metal_fusion_label() override { return "SCALE+UNARY"; }
+    bool metal_fusion_expected() override { return tokens == 1 && !external && !bias; }
     const int64_t n;
     const int64_t tokens;
     const bool external;
@@ -7638,6 +7713,9 @@ struct test_moe_reduce : public test_case {
 };
 
 struct test_moe_reduce_shared : public test_moe_reduce {
+    const char * metal_fusion_env() override { return "GGML_METAL_FUSE_MOE_REDUCE_SHARED"; }
+    const char * metal_fusion_label() override { return "MUL+ADD+ADD+ADD+ADD+ADD+ADD+ADD+ADD+ADD+UNARY+MUL+ADD"; }
+    bool metal_fusion_expected() override { return n_tokens == 1 && !external && !interleaved_views_adds; }
     const bool external;
     test_moe_reduce_shared(int64_t n, int64_t tokens = 1, bool external = false, bool interleaved = false) :
         test_moe_reduce(n, 10, tokens, false, false, interleaved), external(external) {}
@@ -7645,6 +7723,9 @@ struct test_moe_reduce_shared : public test_moe_reduce {
     std::string op_desc(ggml_tensor *) override { return "MOE_REDUCE_SHARED"; }
     ggml_tensor * build_graph(ggml_context * ctx) override {
         auto * reduce = test_moe_reduce::build_graph(ctx);
+        if (mode == MODE_TEST) {
+            ggml_build_forward_expand(gf, reduce);
+        }
         auto * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
         auto * gate = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, n_tokens);
         // Put independent producers between the reduction and the merge, as in the model graph.

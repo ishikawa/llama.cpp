@@ -236,9 +236,9 @@ kernel void kernel_moe_reduce_shared_f32(
         device const float * shared [[buffer(4)]],
         device const float * gate [[buffer(5)]],
         uint3 group [[threadgroup_position_in_grid]],
-        uint lane [[thread_position_in_threadgroup]],
+        uint3 tpitg [[thread_position_in_threadgroup]],
         uint3 ntg [[threads_per_threadgroup]]) {
-    const uint i = group.y*ntg.x + lane;
+    const uint i = group.y*ntg.x + tpitg.x;
     if (i >= uint(args.ne00)) { return; }
     float sum = experts[i]*weights[0];
     for (uint e = 1; e < 10; ++e) {

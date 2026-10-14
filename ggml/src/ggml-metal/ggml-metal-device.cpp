@@ -1224,16 +1224,12 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
     };
 
     const char * shortk = std::getenv("GGML_METAL_MUL_MV_Q8_0_SHORTK");
-    if (shortk && tsrc0 == GGML_TYPE_Q8_0 && tsrc1 == GGML_TYPE_F32 && ne11 == 1 && ne00 <= 512 &&
-            ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1) {
-        if (std::strcmp(shortk, "1") == 0) {
-            nsg = 1;
-        } else if (std::strcmp(shortk, "2") == 0) {
-            nr0 = 8;
-            nsg = 4;
-            smem = 0;
-            suffix = "_shortk";
-        }
+    if (shortk && std::strcmp(shortk, "2") == 0 && tsrc0 == GGML_TYPE_Q8_0 && tsrc1 == GGML_TYPE_F32 &&
+            ne11 == 1 && ne00 <= 512 && ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1) {
+        nr0 = 8;
+        nsg = 4;
+        smem = 0;
+        suffix = "_shortk";
     }
 
     GGML_ASSERT(ne12 <= INT16_MAX && ne13 <= INT16_MAX);

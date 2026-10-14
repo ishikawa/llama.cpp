@@ -566,6 +566,12 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv(
         suffix = "_4";
     }
 
+    const char * channels = std::getenv("GGML_METAL_SSM_CONV_DECODE_CHANNELS");
+    const bool use_channels = channels && std::strcmp(channels, "1") == 0 && nc == 4 && op->ne[1] == 1;
+    if (use_channels) {
+        suffix = "_decode_channels";
+    }
+
     snprintf(base, 256, "kernel_ssm_conv_%s_%s%s", ggml_type_name(op->src[0]->type), ggml_type_name(op->src[1]->type), suffix);
     snprintf(name, 256, "%s_nc=%d_silu=%d", base, nc, use_silu ? 1 : 0);
 
@@ -579,6 +585,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_ssm_conv(
 
         ggml_metal_cv_free(cv);
     }
+
+    res.nr0 = use_channels ? 128 : 1;
 
     return res;
 }

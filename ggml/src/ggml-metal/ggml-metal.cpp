@@ -589,14 +589,6 @@ static void ggml_backend_metal_graph_optimize(ggml_backend_t backend, ggml_cgrap
     ggml_metal_graph_optimize(ctx, cgraph);
 }
 
-static void ggml_backend_metal_set_n_cb(ggml_backend_t backend, int n_cb) {
-    GGML_ASSERT(ggml_backend_is_metal(backend));
-
-    ggml_metal_t ctx = (ggml_metal_t)backend->context;
-
-    ggml_metal_set_n_cb(ctx, n_cb);
-}
-
 static ggml_backend_i ggml_backend_metal_i = {
     /* .get_name                = */ ggml_backend_metal_name,
     /* .free                    = */ ggml_backend_metal_free,
@@ -639,8 +631,6 @@ ggml_backend_t ggml_backend_metal_init(void) {
         /* .device    = */ dev,
         /* .context   = */ ctx,
     };
-
-    ggml_backend_metal_set_n_cb(backend, 1);
 
     return backend;
 }
@@ -734,8 +724,6 @@ static ggml_backend_t ggml_backend_metal_device_init_backend(ggml_backend_dev_t 
         /* .device    = */ dev,
         /* .context   = */ ctx,
     };
-
-    ggml_backend_metal_set_n_cb(backend, 1);
 
     return backend;
 

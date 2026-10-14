@@ -597,6 +597,44 @@ kernel void kernel_mul_mv_q8_0_f32(
     kernel_mul_mv_q8_0_f32_impl<N_R0_Q8_0, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
+kernel void kernel_mul_mv_q8_0_f32_shortk(
+        constant ggml_metal_kargs_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    const int r0 = tgpig.x*8 + sgitg*2;
+    const int nb = args.ne00/QK8_0;
+    const short ix = tiisg/4;
+    const short il = tiisg%4;
+    device const float * y = (device const float *) src1;
+    device float * out = (device float *) dst;
+
+    float sumf[2] = { 0.0f, 0.0f };
+    for (int ib = ix; ib < nb; ib += 8) {
+        float yl[8];
+        FOR_UNROLL (short i = 0; i < 8; ++i) {
+            yl[i] = y[ib*QK8_0 + il*8 + i];
+        }
+        for (short row = 0; row < 2 && r0 + row < args.ne01; ++row) {
+            device const block_q8_0 * x = (device const block_q8_0 *) (src0 + (r0 + row)*args.nb01);
+            float sumq = 0.0f;
+            FOR_UNROLL (short i = 0; i < 8; ++i) {
+                sumq += x[ib].qs[il*8 + i] * yl[i];
+            }
+            sumf[row] += sumq*x[ib].d;
+        }
+    }
+    for (short row = 0; row < 2 && r0 + row < args.ne01; ++row) {
+        const float tot = simd_sum(sumf[row]);
+        if (tiisg == 0) {
+            out[r0 + row] = tot;
+        }
+    }
+}
+
 // mat-vec kernel processing in chunks of float4
 // chpb - chunks per quantization block
 template<short r1ptg, typename q_t, short chpb, void (*deq_t4)(device const q_t *, short, thread float4 &) >

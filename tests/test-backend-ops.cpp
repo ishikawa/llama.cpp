@@ -1632,7 +1632,8 @@ struct test_case {
         if (finfo) {
             const bool fused = fusion_count() > before;
             if (fused != metal_fusion_expected()) {
-                printf("fusion %s: observed=%d expected=%d ", metal_fusion_label(), fused, metal_fusion_expected());
+                const char * label = metal_fusion_label();
+                printf("fusion %s: observed=%d expected=%d ", label ? label : "?", fused, metal_fusion_expected());
                 ud.ok = false;
             }
         }

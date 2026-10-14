@@ -12833,6 +12833,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    for (int64_t channels : {10240, 3329}) {
+        test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {4, channels, 1, 1}, {4, channels, 1, 1}));
+        test_cases.emplace_back(new test_ssm_conv_bias_silu(GGML_TYPE_F32, {4, channels, 1, 1}, {4, channels, 1, 1}, false));
+    }
+    test_cases.emplace_back(new test_ssm_conv_bias_silu(GGML_TYPE_F32, {4, 3329, 2, 1}, {4, 3329, 1, 1}, false));
+
     // Examples from granite-4.0-h-1b/ggml-model-Q8_0.gguf
     test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {515, 3328, 1, 1}, {4, 3328, 1, 1})); // prefill
     test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {937, 8192, 1, 1}, {4, 8192, 1, 1})); // prefill

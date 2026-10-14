@@ -66,6 +66,26 @@ kernel void kernel_ssm_conv_f32_f32_4(
     x[0] = FC_ssm_conv_silu ? sumf/(1.0f + exp(-sumf)) : sumf;
 }
 
+kernel void kernel_ssm_conv_f32_f32_decode_channels(
+        constant ggml_metal_kargs_ssm_conv & args,
+        device const  void * src0,
+        device const  void * src1,
+        device       float * dst,
+        uint3 tgpig[[threadgroup_position_in_grid]],
+        uint3 tpitg[[thread_position_in_threadgroup]]) {
+    const int64_t ir = tgpig.x*128 + tpitg.x;
+    const int64_t i3 = tgpig.z;
+    if (ir >= args.ne01) {
+        return;
+    }
+
+    device const float4 * s = (device const float4 *) ((device const char *) src0 + ir*args.nb01 + i3*args.nb02);
+    device const float4 * c = (device const float4 *) ((device const char *) src1 + ir*args.nb11);
+    device float * x = (device float *) ((device char *) dst + ir*args.nb0 + i3*args.nb2);
+    const float sumf = dot(s[0], c[0]);
+    x[0] = FC_ssm_conv_silu ? sumf/(1.0f + exp(-sumf)) : sumf;
+}
+
 constant short FC_ssm_conv_bs   [[function_constant(FC_SSM_CONV + 0)]];
 
 // Batched version: each threadgroup processes multiple tokens for better efficiency

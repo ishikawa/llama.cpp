@@ -7616,21 +7616,28 @@ struct test_gdn_norm_gate : public test_case {
     const int64_t tokens;
     const bool external;
     const bool per_head_weight;
-    test_gdn_norm_gate(int64_t width, int64_t heads, int64_t tokens = 1, bool external = false, bool per_head_weight = false) :
-        width(width), heads(heads), tokens(tokens), external(external), per_head_weight(per_head_weight) {}
-    std::string vars() override { return VARS_TO_STR5(width, heads, tokens, external, per_head_weight); }
-    std::string op_desc(ggml_tensor *) override { return "GDN_NORM_GATE"; }
+    const bool matmul_gate;
+    test_gdn_norm_gate(int64_t width, int64_t heads, int64_t tokens = 1, bool external = false, bool per_head_weight = false, bool matmul_gate = false) :
+        width(width), heads(heads), tokens(tokens), external(external), per_head_weight(per_head_weight), matmul_gate(matmul_gate) {}
+    std::string vars() override { return VARS_TO_STR6(width, heads, tokens, external, per_head_weight, matmul_gate); }
+    std::string op_desc(ggml_tensor *) override { return matmul_gate ? "GDN_NORM_GATE_MATMUL" : "GDN_NORM_GATE"; }
     bool run_whole_graph() override { return true; }
     ggml_tensor * build_graph(ggml_context * ctx) override {
         auto * storage = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, width*heads*tokens + width*width*heads);
         auto * x = ggml_view_3d(ctx, storage, width, heads, tokens, width*sizeof(float), width*heads*sizeof(float), 0);
         auto * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, width, per_head_weight ? heads : 1);
-        auto * z = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, width, heads, tokens);
         auto * norm = ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), w);
         if (mode == MODE_TEST) {
             ggml_build_forward_expand(gf, norm);
         }
-        z = ggml_scale(ctx, z, 0.5f);
+        ggml_tensor * z;
+        if (matmul_gate) {
+            auto * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4096, tokens);
+            auto * weight = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4096, width*heads);
+            z = ggml_reshape_3d(ctx, ggml_mul_mat(ctx, weight, input), width, heads, tokens);
+        } else {
+            z = ggml_scale(ctx, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, width, heads, tokens), 0.5f);
+        }
         auto * out = ggml_mul(ctx, norm, ggml_sigmoid(ctx, z));
         return external ? ggml_add(ctx, out, norm) : out;
     }
@@ -7734,20 +7741,27 @@ struct test_moe_reduce_shared : public test_moe_reduce {
     const char * metal_fusion_label() override { return "MUL+ADD+ADD+ADD+ADD+ADD+ADD+ADD+ADD+ADD+UNARY+MUL+ADD"; }
     bool metal_fusion_expected() override { return n_tokens == 1 && !external && !interleaved_views_adds; }
     const bool external;
-    test_moe_reduce_shared(int64_t n, int64_t tokens = 1, bool external = false, bool interleaved = false) :
-        test_moe_reduce(n, 10, tokens, false, false, interleaved), external(external) {}
-    std::string vars() override { return test_moe_reduce::vars() + ",external=" + std::to_string(external); }
-    std::string op_desc(ggml_tensor *) override { return "MOE_REDUCE_SHARED"; }
+    const bool matmul_shared;
+    test_moe_reduce_shared(int64_t n, int64_t tokens = 1, bool external = false, bool interleaved = false, bool matmul_shared = false) :
+        test_moe_reduce(n, 10, tokens, false, false, interleaved), external(external), matmul_shared(matmul_shared) {}
+    std::string vars() override { return test_moe_reduce::vars() + ",external=" + std::to_string(external) + ",matmul_shared=" + std::to_string(matmul_shared); }
+    std::string op_desc(ggml_tensor *) override { return matmul_shared ? "MOE_REDUCE_SHARED_MATMUL" : "MOE_REDUCE_SHARED"; }
     ggml_tensor * build_graph(ggml_context * ctx) override {
         auto * reduce = test_moe_reduce::build_graph(ctx);
         if (mode == MODE_TEST) {
             ggml_build_forward_expand(gf, reduce);
         }
-        auto * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
-        auto * gate = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, n_tokens);
+        ggml_tensor * x;
+        ggml_tensor * gate;
         // Put independent producers between the reduction and the merge, as in the model graph.
-        x = ggml_scale(ctx, x, 0.5f);
-        gate = ggml_scale(ctx, gate, 0.5f);
+        if (matmul_shared) {
+            auto * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4096, n_tokens);
+            x = ggml_mul_mat(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4096, n_embd), input);
+            gate = ggml_mul_mat(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4096, 1), input);
+        } else {
+            x = ggml_scale(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens), 0.5f);
+            gate = ggml_scale(ctx, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 1, n_tokens), 0.5f);
+        }
         auto * out = ggml_add(ctx, reduce, ggml_mul(ctx, x, ggml_sigmoid(ctx, gate)));
         return external ? ggml_add(ctx, out, reduce) : out;
     }
@@ -12187,6 +12201,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // Cover the supported boundaries, common k = 8 shapes, interleaved views and adds, and k = 16 fallback.
     test_cases.emplace_back(new test_moe_reduce_shared(2560));
+    test_cases.emplace_back(new test_moe_reduce_shared(2560, 1, false, false, true));
+    test_cases.emplace_back(new test_moe_reduce_shared(2559, 1, false, false, true));
     test_cases.emplace_back(new test_moe_reduce_shared(2559));
     test_cases.emplace_back(new test_moe_reduce_shared(63));
     test_cases.emplace_back(new test_moe_reduce_shared(2561));
@@ -12194,6 +12210,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_moe_reduce_shared(2560, 1, true));
     test_cases.emplace_back(new test_moe_reduce_shared(2559, 1, false, true));
     test_cases.emplace_back(new test_gdn_norm_gate(128, 48));
+    test_cases.emplace_back(new test_gdn_norm_gate(128, 48, 1, false, false, true));
+    test_cases.emplace_back(new test_gdn_norm_gate(127, 47, 1, false, false, true));
     test_cases.emplace_back(new test_gdn_norm_gate(127, 47));
     test_cases.emplace_back(new test_gdn_norm_gate(128, 48, 1, false, true));
     test_cases.emplace_back(new test_gdn_norm_gate(128, 48, 2));

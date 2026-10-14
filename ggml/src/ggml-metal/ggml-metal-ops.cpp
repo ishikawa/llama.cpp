@@ -264,6 +264,13 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             if (fusion) {
                 // fused kernels write to the last node of the group, not necessarily to the first node's dst
                 is_concurrent = ggml_mem_ranges_check(ctx->mem_ranges, ctx->node(idx + n_fuse - 1));
+                const ggml_metal_fusion_id id = ggml_metal_fusion_get_id(fusion);
+                if (id == GGML_METAL_FUSION_GDN_NORM_GATE || id == GGML_METAL_FUSION_MOE_REDUCE_SHARED) {
+                    // The raw gates and shared output are inputs of intermediate nodes, not of the endpoints.
+                    for (int j = 1; is_concurrent && j < n_fuse - 1; ++j) {
+                        is_concurrent = ggml_metal_op_concurrency_check(ctx, ctx->node(idx + j));
+                    }
+                }
             }
         }
 

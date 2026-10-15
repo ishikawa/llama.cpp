@@ -384,6 +384,14 @@ bool llm_graph_gdn_state_view_enabled() {
     return enabled;
 }
 
+bool llm_graph_gdn_conv_inplace_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("LLAMA_GDN_CONV_INPLACE");
+        return env && atoi(env) != 0;
+    }();
+    return enabled;
+}
+
 bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
     const auto * mctx = static_cast<const llama_memory_recurrent_context *>(params.mctx);
 
@@ -397,6 +405,7 @@ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
 
     res &= head == mctx->get_head();
     res &= rs_z == mctx->get_rs_z();
+    res &= conv_identity == (llm_graph_gdn_conv_inplace_enabled() && mctx->is_s_copy_identity());
     res &= s_identity == (llm_graph_gdn_state_view_enabled() && mctx->is_s_copy_identity());
 
     return res;
@@ -3742,6 +3751,7 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
     inp->head = mctx_cur->get_head();
     inp->rs_z = mctx_cur->get_rs_z();
 
+    inp->conv_identity = llm_graph_gdn_conv_inplace_enabled() && mctx_cur->is_s_copy_identity();
     inp->s_identity = llm_graph_gdn_state_view_enabled() && mctx_cur->is_s_copy_identity();
 
     return inp;

@@ -394,6 +394,10 @@ static ggml_backend_buffer_t ggml_backend_blas_device_buffer_from_host_ptr(ggml_
 }
 
 static bool ggml_backend_blas_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
+    if (op->op == GGML_OP_SSM_CONV_INPLACE) {
+        return false;
+    }
+
     const struct ggml_tensor * src0 = op->src[0];
     const struct ggml_tensor * src1 = op->src[1];
 

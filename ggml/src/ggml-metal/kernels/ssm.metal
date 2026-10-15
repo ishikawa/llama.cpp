@@ -494,3 +494,31 @@ kernel void kernel_ssm_scan_ssd_mma_f32(
         threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
     }
 }
+
+kernel void kernel_ssm_conv_inplace_f32(
+        constant ggml_metal_kargs_ssm_conv_inplace & args,
+        device void * state,
+        device const void * x,
+        device const void * conv_w,
+        device float * dst,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        uint3 tpitg [[thread_position_in_threadgroup]]) {
+    const int64_t channel = tgpig.x*128 + tpitg.x;
+    const int64_t seq = tgpig.z;
+    if (channel >= args.channels) {
+        return;
+    }
+    device float * h = (device float *) ((device char *) state + channel*args.state_nb1 + seq*args.state_nb2);
+    device const float * w = (device const float *) ((device const char *) conv_w + channel*args.kernel_nb1);
+    const float token = ((device const float *) ((device const char *) x + seq*args.x_nb1))[channel];
+    float sum = 0.0f;
+    for (int64_t j = 0; j < args.history; ++j) {
+        sum += h[j]*w[j];
+    }
+    sum += token*w[args.history];
+    for (int64_t j = 0; j + 1 < args.history; ++j) {
+        h[j] = h[j + 1];
+    }
+    h[args.history - 1] = token;
+    dst[seq*args.channels + channel] = FC_ssm_conv_silu ? sum/(1.0f + exp(-sum)) : sum;
+}

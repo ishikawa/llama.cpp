@@ -1070,6 +1070,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "FLASH_ATTN_EXT",
     "FLASH_ATTN_BACK",
     "SSM_CONV",
+    "SSM_CONV_INPLACE",
     "SSM_SCAN",
     "WIN_PART",
     "WIN_UNPART",
@@ -1103,7 +1104,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "QSA_EXPAND",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1187,6 +1188,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "flash_attn_ext(x)",
     "flash_attn_back(x)",
     "ssm_conv(x)",
+    "ssm_conv_inplace(state,x,kernel)",
     "ssm_scan(x)",
     "win_part(x)",
     "win_unpart(x)",
@@ -1220,7 +1222,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "qsa_expand(x)",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5724,6 +5726,33 @@ struct ggml_tensor * ggml_ssm_conv(
     result->src[0] = sx;
     result->src[1] = c;
 
+    return result;
+}
+
+struct ggml_tensor * ggml_ssm_conv_inplace(
+        struct ggml_context * ctx,
+        struct ggml_tensor * state,
+        struct ggml_tensor * x,
+        struct ggml_tensor * kernel) {
+    GGML_ASSERT(state->type == GGML_TYPE_F32 && x->type == GGML_TYPE_F32 && kernel->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_3d(state) && ggml_is_matrix(x) && ggml_is_matrix(kernel));
+    GGML_ASSERT(state->ne[0] > 0 && state->ne[0] == kernel->ne[0] - 1);
+    GGML_ASSERT(state->ne[1] == x->ne[0] && state->ne[1] == kernel->ne[1]);
+    GGML_ASSERT(state->ne[2] == x->ne[1]);
+    GGML_ASSERT(state->nb[0] == sizeof(float) && x->nb[0] == sizeof(float) && kernel->nb[0] == sizeof(float));
+    GGML_ASSERT(state->nb[1] >= state->ne[0]*sizeof(float));
+    GGML_ASSERT(state->nb[2] >= state->ne[1]*state->nb[1]);
+
+    // The cache must survive after its last graph reader and cannot become scratch storage.
+    ggml_set_output(state);
+    if (state->view_src) {
+        ggml_set_output(state->view_src);
+    }
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, x->ne[0], x->ne[1]);
+    result->op = GGML_OP_SSM_CONV_INPLACE;
+    result->src[0] = state;
+    result->src[1] = x;
+    result->src[2] = kernel;
     return result;
 }
 

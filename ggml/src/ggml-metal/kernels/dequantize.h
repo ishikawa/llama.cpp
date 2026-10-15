@@ -660,6 +660,11 @@ void dequantize_iq2_s_ep(device const char * expert, ulong block, ulong blocks, 
     }
 }
 
+#if defined(GGML_METAL_HAS_BF16)
+// kernel_mul_mm_id instantiates the EP branch for bfloat tiles too; IQ2_S_EP never uses them.
+inline void dequantize_iq2_s_ep(device const char *, ulong, ulong, short, thread bfloat4x4 &) {}
+#endif
+
 template <typename type4x4>
 void dequantize_iq1_s(device const block_iq1_s * xb, short il, thread type4x4 & reg) {
     // il is 0...15 for QK_K = 256 => index of block of 32 is il/2

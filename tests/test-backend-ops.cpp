@@ -13470,6 +13470,22 @@ static int test_iq2_s_ep(const char * backend_name) {
             std::vector<float> reference(ggml_nelements(out[output][0])), candidate(reference.size());
             ggml_backend_tensor_get(out[output][0], reference.data(), 0, ggml_nbytes(out[output][0]));
             ggml_backend_tensor_get(out[output][1], candidate.data(), 0, ggml_nbytes(out[output][1]));
+            if (fused) {
+                for (int layout = 0; layout < 2; ++layout) {
+                    const auto & values = layout == 0 ? reference : candidate;
+                    size_t n_nan = 0, n_inf = 0;
+                    for (float value : values) {
+                        n_nan += std::isnan(value);
+                        n_inf += std::isinf(value);
+                    }
+                    printf("IQ2_S_EP fused diagnostic type=%s output=%d count=%zu nan=%zu inf=%zu first=",
+                           layout == 0 ? "iq2_s" : "iq2_s_ep", output, values.size(), n_nan, n_inf);
+                    for (size_t i = 0; i < std::min<size_t>(8, values.size()); ++i) {
+                        printf(" %g", values[i]);
+                    }
+                    printf("\n");
+                }
+            }
             double error = 0, norm = 0;
             bool finite = true;
             for (size_t i = 0; i < reference.size(); ++i) {

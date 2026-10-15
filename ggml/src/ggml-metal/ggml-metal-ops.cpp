@@ -3054,6 +3054,7 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
         auto pipeline = ggml_metal_library_get_pipeline_moe_gate_up(lib, gate);
         ggml_metal_kargs_mul_mv_id args = {};
         args.ne00 = gate->src[0]->ne[0];
+        args.ne01 = gate->src[0]->ne[1];
         args.nb01 = gate->src[0]->nb[1];
         args.nb02 = gate->src[0]->nb[2];
         args.ne11 = gate->src[1]->ne[1];

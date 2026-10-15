@@ -59,3 +59,22 @@ GGML_METAL_FUSE_MOE_GATE_UP=1 build-decode-dev/bin/test-backend-ops -b MTL0 -o M
 ```
 
 These GPU checks and real-model conversion are deliberately not part of the CPU-only implementation validation.
+
+## Fused variant-1 diagnostics
+
+`GGML_DIAG_IQ2S_EP` selects the following timing diagnostics only when `GGML_METAL_FUSE_MOE_GATE_UP=1` and `GGML_METAL_MOE_GATE_UP_IQ2_S_EP` is unset or exactly `1`. Other values leave the real candidate selected. These diagnostics intentionally produce incorrect model results and are excluded from the correctness test. Unset this variable before correctness runs.
+
+| Value | Kernel | Change from variant 1 |
+| --- | --- | --- |
+| `nolut` | `kernel_moe_gate_up_iq2_s_ep_diag_nolut` | Replace LUT reads with finite byte patterns derived from qs/qh indices; retain signs and activation products |
+| `nosign` | `kernel_moe_gate_up_iq2_s_ep_diag_nosign` | Skip element sign application; retain sign loads with one cheap packed-value contribution to the accumulator |
+| `nolut_nosign` | `kernel_moe_gate_up_iq2_s_ep_diag_nolut_nosign` | Combine those changes |
+| `nofma` | `kernel_moe_gate_up_iq2_s_ep_diag_nofma` | Retain LUT/sign decoding but sum weights without activation products; retain the original per-iteration y loads using volatile reads |
+
+For example, prefix the existing model timing command with:
+
+```sh
+GGML_METAL_FUSE_MOE_GATE_UP=1 GGML_METAL_MOE_GATE_UP_IQ2_S_EP=1 GGML_DIAG_IQ2S_EP=nolut <timing-command>
+```
+
+All diagnostic kernels retain variant 1's lane mapping, NR0=2, nsg=4, scale loads, float accumulation, final factor of 0.25, and SwiGLU output.

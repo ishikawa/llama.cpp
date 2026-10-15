@@ -1675,6 +1675,13 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_moe_gate_up(ggml
     if (ep) {
         const char * suffix[] = { "", "", "_v2", "_lanes16", "_half", "_lanes16_half" };
         snprintf(base, sizeof(base), "kernel_moe_gate_up_iq2_s_ep%s", suffix[ep_variant]);
+        const char * diag = std::getenv("GGML_DIAG_IQ2S_EP");
+        const char * fuse = std::getenv("GGML_METAL_FUSE_MOE_GATE_UP");
+        if ((!ep_env || std::strcmp(ep_env, "1") == 0) && fuse && std::strcmp(fuse, "1") == 0 && diag &&
+            (std::strcmp(diag, "nolut") == 0 || std::strcmp(diag, "nosign") == 0 ||
+             std::strcmp(diag, "nolut_nosign") == 0 || std::strcmp(diag, "nofma") == 0)) {
+            snprintf(base, sizeof(base), "kernel_moe_gate_up_iq2_s_ep_diag_%s", diag);
+        }
     }
     if (decode != 0) {
         snprintf(base, sizeof(base), "kernel_moe_gate_up_iq2_s_r%d_tg%d_v%d", nr0, tg, decode);

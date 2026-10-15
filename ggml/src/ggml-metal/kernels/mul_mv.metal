@@ -3383,12 +3383,57 @@ inline float iq2_s_ep_dot32(uint q, uint sign, uchar qh, uchar sc, float db, y_t
     return d1*sum[0] + d2*sum[1];
 }
 
-template<bool ALIGNED = false>
+template<int DIAG>
+inline float iq2_s_ep_dot32_diag(uint q, uint sign, uchar qh, uchar sc, float db, thread const float * yl) {
+    const uchar4 qs = as_type<uchar4>(q);
+    const uchar4 signs = as_type<uchar4>(sign);
+    const float d1 = db * (0.5f + (sc & 0xf));
+    const float d2 = db * (0.5f + (sc >> 4));
+    float2 sum = {0.f};
+    for (short l = 0; l < 2; ++l) {
+        const int index1 = qs[l] | ((qh << (8-2*l)) & 0x300);
+        const int index2 = qs[l+2] | ((qh << (4-2*l)) & 0x300);
+        // Mix every index bit into finite synthetic grid bytes without a lookup.
+        const uchar4 pattern1 = as_type<uchar4>(0x2b2b2b2bu ^ ((uint(index1)*0x9e3779b9u) & 0x01010101u));
+        const uchar4 pattern2 = as_type<uchar4>(0x2b2b2b2bu ^ ((uint(index2)*0x9e3779b9u) & 0x01010101u));
+        for (short j = 0; j < 8; ++j) {
+            float w1, w2;
+            if (DIAG == 1 || DIAG == 3) {
+                w1 = float(pattern1[j%4]);
+                w2 = float(pattern2[j%4]);
+            } else {
+                w1 = float(((constant uchar *)(iq2s_grid + index1))[j]);
+                w2 = float(((constant uchar *)(iq2s_grid + index2))[j]);
+            }
+            if (DIAG != 2 && DIAG != 3) {
+                w1 *= select(1, -1, signs[l] & kmask_iq2xs[j]);
+                w2 *= select(1, -1, signs[l+2] & kmask_iq2xs[j]);
+            }
+            if (DIAG == 4) {
+                sum[0] += w1;
+                sum[1] += w2;
+            } else {
+                sum[0] += yl[8*l+j]*w1;
+                sum[1] += yl[8*l+j+16]*w2;
+            }
+        }
+    }
+    float result = d1*sum[0] + d2*sum[1];
+    if (DIAG == 2 || DIAG == 3) {
+        result += float(sign)*0x1p-32f;
+    }
+    return result;
+}
+
+template<bool ALIGNED = false, int DIAG = 0>
 inline float moe_gate_up_dot_iq2_s_ep(device const char * expert, ulong block, ulong blocks, short ib, thread const float * yl) {
     device const uchar * payload = (device const uchar *)expert + 80*block;
     const uint qs = iq2_s_ep_load32(payload + 4*ib, ALIGNED || blocks%2 == 0);
     const uint signs = iq2_s_ep_load32(payload + 32 + 4*ib, ALIGNED || blocks%2 == 0);
     const float d = ((device const half *)(expert + 80*blocks))[block];
+    if (DIAG != 0) {
+        return iq2_s_ep_dot32_diag<DIAG>(qs, signs, payload[64+ib], payload[72+ib], d, yl);
+    }
     return iq2_s_ep_dot32(qs, signs, payload[64+ib], payload[72+ib], d, yl);
 }
 
@@ -3829,7 +3874,7 @@ kernel void kernel_moe_gate_up(
 }
 
 // Fusion admits complete eight-row tiles, so every expert base is 16-byte aligned.
-template<int VARIANT>
+template<int VARIANT, int DIAG = 0>
 kernel void kernel_moe_gate_up_iq2_s_ep(
         constant ggml_metal_kargs_mul_mv_id & args,
         device const char * gate,
@@ -3862,12 +3907,17 @@ kernel void kernel_moe_gate_up_iq2_s_ep(
         float yl[32];
         for (int ib32 = tiisg; ib32 < args.ne00/32; ib32 += 32) {
             for (short i = 0; i < 32; ++i) {
-                yl[i] = y[32*ib32+i];
+                if (DIAG == 4) {
+                    // Keep activation loads even though nofma does not multiply by y.
+                    yl[i] = ((device const volatile float *)y)[32*ib32+i];
+                } else {
+                    yl[i] = y[32*ib32+i];
+                }
             }
             for (short row = 0; row < 2; ++row) {
                 const ulong block = ulong(first_row + row)*nb + ib32/8;
-                sum_gate[row] += moe_gate_up_dot_iq2_s_ep<true>(ge, block, blocks, ib32%8, yl);
-                sum_up[row] += moe_gate_up_dot_iq2_s_ep<true>(ue, block, blocks, ib32%8, yl);
+                sum_gate[row] += moe_gate_up_dot_iq2_s_ep<true, DIAG>(ge, block, blocks, ib32%8, yl);
+                sum_up[row] += moe_gate_up_dot_iq2_s_ep<true, DIAG>(ue, block, blocks, ib32%8, yl);
             }
         }
     } else if (VARIANT == 2) {
@@ -3924,6 +3974,10 @@ template [[host_name("kernel_moe_gate_up_iq2_s_ep_v2")]] kernel kernel_moe_gate_
 template [[host_name("kernel_moe_gate_up_iq2_s_ep_lanes16")]] kernel kernel_moe_gate_up_iq2_s_ep_t kernel_moe_gate_up_iq2_s_ep<3>;
 template [[host_name("kernel_moe_gate_up_iq2_s_ep_half")]] kernel kernel_moe_gate_up_iq2_s_ep_t kernel_moe_gate_up_iq2_s_ep<4>;
 template [[host_name("kernel_moe_gate_up_iq2_s_ep_lanes16_half")]] kernel kernel_moe_gate_up_iq2_s_ep_t kernel_moe_gate_up_iq2_s_ep<5>;
+template [[host_name("kernel_moe_gate_up_iq2_s_ep_diag_nolut")]] kernel kernel_moe_gate_up_iq2_s_ep_t kernel_moe_gate_up_iq2_s_ep<1, 1>;
+template [[host_name("kernel_moe_gate_up_iq2_s_ep_diag_nosign")]] kernel kernel_moe_gate_up_iq2_s_ep_t kernel_moe_gate_up_iq2_s_ep<1, 2>;
+template [[host_name("kernel_moe_gate_up_iq2_s_ep_diag_nolut_nosign")]] kernel kernel_moe_gate_up_iq2_s_ep_t kernel_moe_gate_up_iq2_s_ep<1, 3>;
+template [[host_name("kernel_moe_gate_up_iq2_s_ep_diag_nofma")]] kernel kernel_moe_gate_up_iq2_s_ep_t kernel_moe_gate_up_iq2_s_ep<1, 4>;
 
 typedef decltype(kernel_moe_gate_up<block_iq2_s, 2, false, false>) kernel_moe_gate_up_t;
 template [[host_name("kernel_moe_gate_up_iq2_s_r2_tg0")]] kernel kernel_moe_gate_up_t kernel_moe_gate_up<block_iq2_s, 2, false, false>;

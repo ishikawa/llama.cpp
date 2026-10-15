@@ -26,6 +26,28 @@ The same environment variable selects these additional fused candidates (no extr
 For variants 3 and 5, 2560 input elements produce 160 units per row: five iterations with all 32 lanes active. Each unit reads two grid indices and two sign bytes from the payload, selects the correct qh and scale nibbles, and reads the original half d from its plane. Variant 3 retains float activations; variants 4 and 5 convert activations to half4 once per iteration and reuse them across gate/up and both rows. Grid entries are small integers represented exactly in half. Signs are applied by XOR of half sign bits using ushort4 masks, without per-element `select`. Half4 dot results are converted separately to float; scales, accumulation, the final factor of 0.25 and SwiGLU remain float. These are compute candidates; their speed and Metal correctness must be measured before choosing a winner.
 
 
+## Compact IQ2_S lookup table
+
+The grid has exactly 8192 bytes, all in `{0x08, 0x19, 0x2b}`. A generated 1024-entry ushort table stores eight 2-bit codes per entry (2048 bytes). Each four-code group is spread into separate bytes with integer masks/shifts, then decoded with `8 + 17*c + (c >> 1)`. The decoded values match the original grid exactly. Signs, FP32 dot accumulation, NR0=2, nsg=4, and the final factor of 0.25 are retained. No half arithmetic is used.
+
+| Layout | Environment | Kernel |
+| --- | --- | --- |
+| IQ2_S | `GGML_METAL_MOE_GATE_UP_IQ2_S_LUT=c` | `kernel_moe_gate_up_iq2_s_lut_c` |
+| IQ2_S | `GGML_METAL_MOE_GATE_UP_IQ2_S_LUT=tg` | `kernel_moe_gate_up_iq2_s_lut_tg` |
+| IQ2_S_EP | `GGML_METAL_MOE_GATE_UP_IQ2_S_EP=6` | `kernel_moe_gate_up_iq2_s_ep_lut_c` |
+| IQ2_S_EP | `GGML_METAL_MOE_GATE_UP_IQ2_S_EP=7` | `kernel_moe_gate_up_iq2_s_ep_lut_tg` |
+
+These variants require `GGML_METAL_FUSE_MOE_GATE_UP=1`. The original-layout LUT environment variable fixes the default nr0=2/nsg=4 configuration and overrides its decode/TG tuning variants. EP 6/7 use variant 1's lane mapping and register activations. Constant variants read the compact table directly; threadgroup variants copy its 2048 bytes once per threadgroup and synchronize before decoding. If the device's threadgroup memory limit is below 2048 bytes, the corresponding constant variant is selected. Unset the LUT variable to retain the original IQ2_S default.
+
+Generate or check the inline Metal table without a GPU:
+
+```sh
+python3 ggml/src/ggml-metal/generate_iq2s_grid.py
+python3 ggml/src/ggml-metal/generate_iq2s_grid.py --check
+```
+
+The script rejects an unexpected source grid size or value, verifies all 8192 reconstructed bytes, checks the packed expansion for all 256 four-code inputs, and checks that the generated source is current with `--check`. The table is inline in `mul_mv.metal`, so the existing embedded-source build dependencies include it.
+
 ## Conversion
 
 Run from the repository root, with NumPy installed:
@@ -49,7 +71,7 @@ cmake --build build-decode-dev --config Release -j
 build-decode-dev/bin/test-backend-ops --iq2-s-ep MTL0
 ```
 
-The dedicated comparison mode builds IQ2_S and EP graphs on the same Metal backend, with identical deterministic random weights and activations. It uses `(2560,640,512)`, ten distinct selected experts per token, and token counts 1 (unfused, fused variants 1 through 5), 7, and 512. It compares both individual `MUL_MAT_ID` outputs and SwiGLU outputs in unfused cases; fused cases compare the final SwiGLU output. It also checks the 512-token F16 activation path. Each comparison rejects non-finite results and requires NMSE below `5e-7`, except fused half variants 4 and 5, which allow `5e-6`. The half threshold permits 0.224% relative RMS output error: activations and four-term dot results incur half rounding (unit roundoff about 0.049%), and the two matmul errors propagate through SwiGLU. This tolerance is limited to those two candidates; it is not a guarantee for arbitrary activation ranges. It needs approximately 1 GiB for the four weight tensors. Clear IQ2_S tuning environment overrides for the default comparison. The mode sets `GGML_METAL_FUSE_MOE_GATE_UP` and `GGML_METAL_MOE_GATE_UP_IQ2_S_EP` before initializing a backend for each case, so one invocation covers all five fused variants. The result lines report `ep_variant`.
+The dedicated comparison mode builds IQ2_S and EP graphs on the same Metal backend, with identical deterministic random weights and activations. It uses `(2560,640,512)`, ten distinct selected experts per token, and token counts 1 (unfused, fused variants 1 through 7), 7, and 512. It compares both individual `MUL_MAT_ID` outputs and SwiGLU outputs in unfused cases; fused cases compare the final SwiGLU output. It also checks the 512-token F16 activation path. Each comparison rejects non-finite results and requires NMSE below `5e-7`, except fused half variants 4 and 5, which allow `5e-6`. The half threshold permits 0.224% relative RMS output error: activations and four-term dot results incur half rounding (unit roundoff about 0.049%), and the two matmul errors propagate through SwiGLU. This tolerance is limited to those two candidates; it is not a guarantee for arbitrary activation ranges. It needs approximately 1 GiB for the four weight tensors. Clear IQ2_S tuning environment overrides for the default comparison. The mode sets `GGML_METAL_FUSE_MOE_GATE_UP` and `GGML_METAL_MOE_GATE_UP_IQ2_S_EP` before initializing a backend for each case, so one invocation covers all seven fused EP variants. It also compares original-layout compact constant/threadgroup kernels against plain default IQ2_S using identical weights on the same backend. The reference and candidate run as separate graphs so the original-layout LUT environment can change between dispatches. This dedicated mode clears diagnostics and IQ2_S decode/NR0/NSG/TG overrides, and reports the original LUT choice in `original_lut`. The result lines report `ep_variant`.
 
 Use `GGML_METAL_DISPATCH_STATS=1` to inspect kernel dispatches, including the fused kernel names above and `kernel_mul_mm_id_iq2_s_ep_f32`. Also run the existing regressions:
 

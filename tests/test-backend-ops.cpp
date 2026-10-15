@@ -13390,12 +13390,21 @@ static int test_iq2_s_ep(const char * backend_name) {
         fprintf(stderr, "IQ2_S_EP comparison requires a Metal backend\n");
         return 1;
     }
+    // This mode compares against the plain IQ2_S fused pipeline, independent of tuning overrides.
+    for (const char * name : { "GGML_DIAG_IQ2S_EP", "GGML_METAL_MOE_GATE_UP_IQ2_S_DECODE",
+                              "GGML_METAL_MUL_MV_ID_IQ2_S_TG", "GGML_METAL_MUL_MV_ID_DECODE_NR0",
+                              "GGML_METAL_MUL_MV_ID_DECODE_NSG" }) {
+        unsetenv(name);
+    }
     bool ok = true;
-    for (int test = 0; test < 9; ++test) {
-        const int64_t tokens = test < 6 ? 1 : test == 6 ? 7 : 512;
-        const bool fused = test >= 1 && test <= 5;
-        const int ep_variant = fused ? test : 1;
-        const bool f16 = test == 8;
+    for (int test = 0; test < 13; ++test) {
+        const bool original_lut = test >= 11;
+        const char * lut = original_lut ? (test == 11 ? "c" : "tg") : "none";
+        const int64_t tokens = test < 8 || original_lut ? 1 : test == 8 ? 7 : 512;
+        const bool fused = (test >= 1 && test <= 7) || original_lut;
+        const int ep_variant = fused && !original_lut ? test : 1;
+        const bool f16 = test == 10;
+        unsetenv("GGML_METAL_MOE_GATE_UP_IQ2_S_LUT");
         setenv("GGML_METAL_FUSE_MOE_GATE_UP", fused ? "1" : "0", 1);
         const char ep_env[] = { char('0' + ep_variant), '\0' };
         setenv("GGML_METAL_MOE_GATE_UP_IQ2_S_EP", ep_env, 1);
@@ -13403,23 +13412,23 @@ static int test_iq2_s_ep(const char * backend_name) {
         if (!backend) {
             return 1;
         }
-        ggml_init_params params = { 128*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
+        ggml_init_params params = { 128*ggml_tensor_overhead() + 2*ggml_graph_overhead(), nullptr, true };
         ggml_context_ptr ctx(ggml_init(params));
         ggml_tensor * weights[2][2];
         ggml_tensor * x = ggml_new_tensor_3d(ctx.get(), f16 ? GGML_TYPE_F16 : GGML_TYPE_F32, 2560, 1, tokens);
         ggml_tensor * ids = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, 10, tokens);
         ggml_tensor * out[3][2];
-        ggml_cgraph * graph = ggml_new_graph(ctx.get());
+        ggml_cgraph * graph[2] = { ggml_new_graph(ctx.get()), ggml_new_graph(ctx.get()) };
         for (int layout = 0; layout < 2; ++layout) {
             for (int w = 0; w < 2; ++w) {
-                weights[layout][w] = ggml_new_tensor_3d(ctx.get(), layout ? GGML_TYPE_IQ2_S_EP : GGML_TYPE_IQ2_S, 2560, 640, 512);
+                weights[layout][w] = ggml_new_tensor_3d(ctx.get(), layout && !original_lut ? GGML_TYPE_IQ2_S_EP : GGML_TYPE_IQ2_S, 2560, 640, 512);
             }
             ggml_tensor * gate = ggml_mul_mat_id(ctx.get(), weights[layout][0], x, ids);
             ggml_tensor * up = ggml_mul_mat_id(ctx.get(), weights[layout][1], x, ids);
             out[0][layout] = ggml_swiglu_split(ctx.get(), gate, up);
             out[1][layout] = gate;
             out[2][layout] = up;
-            ggml_build_forward_expand(graph, out[0][layout]);
+            ggml_build_forward_expand(graph[layout], out[0][layout]);
             if (!ggml_backend_dev_supports_op(dev, gate)) {
                 fprintf(stderr, "unsupported IQ2_S_EP test case\n");
                 return 1;
@@ -13445,7 +13454,7 @@ static int test_iq2_s_ep(const char * backend_name) {
                     memcpy(planar.data() + blocks*80 + b*2, &d, 2);
                 }
                 ggml_backend_tensor_set(weights[0][w], original.data(), expert*original.size(), original.size());
-                ggml_backend_tensor_set(weights[1][w], planar.data(), expert*planar.size(), planar.size());
+                ggml_backend_tensor_set(weights[1][w], original_lut ? original.data() : planar.data(), expert*planar.size(), planar.size());
             }
         }
         std::vector<float> input(ggml_nelements(x));
@@ -13466,8 +13475,15 @@ static int test_iq2_s_ep(const char * backend_name) {
             }
         }
         ggml_backend_tensor_set(ids, selected.data(), 0, ggml_nbytes(ids));
-        if (ggml_backend_graph_compute(backend.get(), graph) != GGML_STATUS_SUCCESS) {
-            return 1;
+        for (int layout = 0; layout < 2; ++layout) {
+            if (layout == 1 && original_lut) {
+                setenv("GGML_METAL_MOE_GATE_UP_IQ2_S_LUT", lut, 1);
+            } else {
+                unsetenv("GGML_METAL_MOE_GATE_UP_IQ2_S_LUT");
+            }
+            if (ggml_backend_graph_compute(backend.get(), graph[layout]) != GGML_STATUS_SUCCESS) {
+                return 1;
+            }
         }
         for (int output = 0; output < (fused ? 1 : 3); ++output) {
             std::vector<float> reference(ggml_nelements(out[output][0])), candidate(reference.size());
@@ -13482,7 +13498,7 @@ static int test_iq2_s_ep(const char * backend_name) {
                         n_inf += std::isinf(value);
                     }
                     printf("IQ2_S_EP fused diagnostic type=%s output=%d count=%zu nan=%zu inf=%zu first=",
-                           layout == 0 ? "iq2_s" : "iq2_s_ep", output, values.size(), n_nan, n_inf);
+                           layout == 0 || original_lut ? "iq2_s" : "iq2_s_ep", output, values.size(), n_nan, n_inf);
                     for (size_t i = 0; i < std::min<size_t>(8, values.size()); ++i) {
                         printf(" %g", values[i]);
                     }
@@ -13500,7 +13516,7 @@ static int test_iq2_s_ep(const char * backend_name) {
             // Half dots round both activations and four-term sums; allow 0.224% relative RMS error.
             const double max_nmse = fused && (ep_variant == 4 || ep_variant == 5) ? 5e-6 : 5e-7;
             const bool pass = finite && nmse < max_nmse;
-            printf("IQ2_S_EP tokens=%lld fused=%d ep_variant=%d f16=%d output=%d nmse=%g %s\n", (long long)tokens, fused, ep_variant, f16, output, nmse, pass ? "OK" : "FAIL");
+            printf("IQ2_S_EP tokens=%lld fused=%d ep_variant=%d original_lut=%s f16=%d output=%d nmse=%g %s\n", (long long)tokens, fused, ep_variant, lut, f16, output, nmse, pass ? "OK" : "FAIL");
             ok = ok && pass;
         }
     }

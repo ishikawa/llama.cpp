@@ -1635,8 +1635,11 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_moe_gate_up(ggml
     int nr0 = nr0_env && std::strcmp(nr0_env, "4") == 0 ? 4 : 2;
     const bool ep = op->src[0]->type == GGML_TYPE_IQ2_S_EP;
     const char * ep_env = std::getenv("GGML_METAL_MOE_GATE_UP_IQ2_S_EP");
-    const bool ep_wide = ep && ep_env && std::strcmp(ep_env, "2") == 0 &&
-                         uint64_t(op->src[0]->ne[0]) <= max_tg_mem/sizeof(float);
+    int ep_variant = ep && ep_env && ep_env[0] >= '1' && ep_env[0] <= '5' && ep_env[1] == '\0' ? ep_env[0] - '0' : 1;
+    if (ep_variant == 2 && uint64_t(op->src[0]->ne[0]) > max_tg_mem/sizeof(float)) {
+        ep_variant = 1;
+    }
+    const bool ep_wide = ep && ep_variant == 2;
     if (ep) {
         nr0 = 2;
         nsg = 4;
@@ -1670,7 +1673,8 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_moe_gate_up(ggml
     char name[256];
     snprintf(base, sizeof(base), "kernel_moe_gate_up_%s_r%d_tg%d", ggml_type_name(op->src[0]->type), nr0, tg);
     if (ep) {
-        snprintf(base, sizeof(base), "kernel_moe_gate_up_iq2_s_ep%s", ep_wide ? "_v2" : "");
+        const char * suffix[] = { "", "", "_v2", "_lanes16", "_half", "_lanes16_half" };
+        snprintf(base, sizeof(base), "kernel_moe_gate_up_iq2_s_ep%s", suffix[ep_variant]);
     }
     if (decode != 0) {
         snprintf(base, sizeof(base), "kernel_moe_gate_up_iq2_s_r%d_tg%d_v%d", nr0, tg, decode);

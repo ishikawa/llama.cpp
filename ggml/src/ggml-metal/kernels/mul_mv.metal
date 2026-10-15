@@ -3392,6 +3392,65 @@ inline float moe_gate_up_dot_iq2_s_ep(device const char * expert, ulong block, u
     return iq2_s_ep_dot32(qs, signs, payload[64+ib], payload[72+ib], d, yl);
 }
 
+inline float iq2_s_ep_dot8_half(int index, uchar signs, half4 y0, half4 y1) {
+    const uint2 grid = ((constant uint2 *)iq2s_grid)[index];
+    const half4 g0 = half4(as_type<uchar4>(grid.x));
+    const half4 g1 = half4(as_type<uchar4>(grid.y));
+    const ushort4 mask0 = ((ushort4(signs) >> ushort4(0, 1, 2, 3)) & ushort4(1)) << 15;
+    const ushort4 mask1 = ((ushort4(signs) >> ushort4(4, 5, 6, 7)) & ushort4(1)) << 15;
+    return float(dot(as_type<half4>(as_type<ushort4>(g0) ^ mask0), y0)) +
+           float(dot(as_type<half4>(as_type<ushort4>(g1) ^ mask1), y1));
+}
+
+inline float iq2_s_ep_dot16_values(ushort q, ushort sign, uchar qh, thread const float * yl) {
+    const uchar2 qs = as_type<uchar2>(q);
+    const uchar2 signs = as_type<uchar2>(sign);
+    float sum = 0.f;
+    for (short l = 0; l < 2; ++l) {
+        const int index = qs[l] | ((qh << (8-2*l)) & 0x300);
+        constant uchar * grid = (constant uchar *)(iq2s_grid + index);
+        for (short j = 0; j < 8; ++j) {
+            sum += yl[8*l+j] * float(grid[j]) * select(1, -1, signs[l] & kmask_iq2xs[j]);
+        }
+    }
+    return sum;
+}
+
+inline float iq2_s_ep_dot16_values(ushort q, ushort sign, uchar qh, thread const half4 * yl) {
+    const uchar2 qs = as_type<uchar2>(q);
+    const uchar2 signs = as_type<uchar2>(sign);
+    float sum = 0.f;
+    for (short l = 0; l < 2; ++l) {
+        const int index = qs[l] | ((qh << (8-2*l)) & 0x300);
+        sum += iq2_s_ep_dot8_half(index, signs[l], yl[2*l], yl[2*l+1]);
+    }
+    return sum;
+}
+
+template<typename y_t>
+inline float moe_gate_up_dot_iq2_s_ep_16(device const char * expert, ulong block, ulong blocks, short il16, y_t yl) {
+    device const uchar * payload = (device const uchar *)expert + 80*block;
+    const ushort qs = *((device const ushort *)(payload + 2*il16));
+    const ushort signs = *((device const ushort *)(payload + 32 + 2*il16));
+    const short shift = 4*(il16%2);
+    const uchar qh = payload[64+il16/2] >> shift;
+    const uchar sc = (payload[72+il16/2] >> shift) & 15;
+    const float d = ((device const half *)(expert + 80*blocks))[block];
+    return d*(0.5f + sc)*iq2_s_ep_dot16_values(qs, signs, qh, yl);
+}
+
+inline float moe_gate_up_dot_iq2_s_ep_half(device const char * expert, ulong block, ulong blocks, short ib, thread const half4 * yl) {
+    device const uchar * payload = (device const uchar *)expert + 80*block;
+    const uint qs = *((device const uint *)(payload + 4*ib));
+    const uint signs = *((device const uint *)(payload + 32 + 4*ib));
+    const uchar qh = payload[64+ib];
+    const uchar sc = payload[72+ib];
+    const float d = ((device const half *)(expert + 80*blocks))[block];
+    const float lo = iq2_s_ep_dot16_values(ushort(qs), ushort(signs), qh, yl);
+    const float hi = iq2_s_ep_dot16_values(ushort(qs >> 16), ushort(signs >> 16), qh >> 4, yl + 4);
+    return d*(0.5f + (sc & 15))*lo + d*(0.5f + (sc >> 4))*hi;
+}
+
 inline float moe_gate_up_dot_iq2_s_ep_wide(device const char * expert, ulong block, ulong blocks, short half_block, threadgroup const float * y) {
     device const uchar * payload = (device const uchar *)expert + 80*block;
     const uint4 qs = *((device const uint4 *)(payload + 16*half_block));
@@ -3811,12 +3870,42 @@ kernel void kernel_moe_gate_up_iq2_s_ep(
                 sum_up[row] += moe_gate_up_dot_iq2_s_ep<true>(ue, block, blocks, ib32%8, yl);
             }
         }
-    } else {
+    } else if (VARIANT == 2) {
         for (int ih = tiisg; ih < 2*nb; ih += 32) {
             for (short row = 0; row < 2; ++row) {
                 const ulong block = ulong(first_row + row)*nb + ih/2;
                 sum_gate[row] += moe_gate_up_dot_iq2_s_ep_wide(ge, block, blocks, ih%2, sy + 128*ih);
                 sum_up[row] += moe_gate_up_dot_iq2_s_ep_wide(ue, block, blocks, ih%2, sy + 128*ih);
+            }
+        }
+    } else if (VARIANT == 3) {
+        float yl[16];
+        for (int iu = tiisg; iu < args.ne00/16; iu += 32) {
+            for (short i = 0; i < 16; ++i) {
+                yl[i] = y[16*iu+i];
+            }
+            for (short row = 0; row < 2; ++row) {
+                const ulong block = ulong(first_row + row)*nb + iu/16;
+                sum_gate[row] += moe_gate_up_dot_iq2_s_ep_16(ge, block, blocks, iu%16, yl);
+                sum_up[row] += moe_gate_up_dot_iq2_s_ep_16(ue, block, blocks, iu%16, yl);
+            }
+        }
+    } else {
+        constexpr int NU = VARIANT == 5 ? 16 : 32;
+        half4 yl[NU/4];
+        for (int iu = tiisg; iu < args.ne00/NU; iu += 32) {
+            for (short i = 0; i < NU/4; ++i) {
+                yl[i] = half4(((device const float4 *)(y + NU*iu))[i]);
+            }
+            for (short row = 0; row < 2; ++row) {
+                const ulong block = ulong(first_row + row)*nb + iu/(256/NU);
+                if (VARIANT == 5) {
+                    sum_gate[row] += moe_gate_up_dot_iq2_s_ep_16(ge, block, blocks, iu%16, yl);
+                    sum_up[row] += moe_gate_up_dot_iq2_s_ep_16(ue, block, blocks, iu%16, yl);
+                } else {
+                    sum_gate[row] += moe_gate_up_dot_iq2_s_ep_half(ge, block, blocks, iu%8, yl);
+                    sum_up[row] += moe_gate_up_dot_iq2_s_ep_half(ue, block, blocks, iu%8, yl);
+                }
             }
         }
     }
@@ -3832,6 +3921,9 @@ kernel void kernel_moe_gate_up_iq2_s_ep(
 typedef decltype(kernel_moe_gate_up_iq2_s_ep<1>) kernel_moe_gate_up_iq2_s_ep_t;
 template [[host_name("kernel_moe_gate_up_iq2_s_ep")]] kernel kernel_moe_gate_up_iq2_s_ep_t kernel_moe_gate_up_iq2_s_ep<1>;
 template [[host_name("kernel_moe_gate_up_iq2_s_ep_v2")]] kernel kernel_moe_gate_up_iq2_s_ep_t kernel_moe_gate_up_iq2_s_ep<2>;
+template [[host_name("kernel_moe_gate_up_iq2_s_ep_lanes16")]] kernel kernel_moe_gate_up_iq2_s_ep_t kernel_moe_gate_up_iq2_s_ep<3>;
+template [[host_name("kernel_moe_gate_up_iq2_s_ep_half")]] kernel kernel_moe_gate_up_iq2_s_ep_t kernel_moe_gate_up_iq2_s_ep<4>;
+template [[host_name("kernel_moe_gate_up_iq2_s_ep_lanes16_half")]] kernel kernel_moe_gate_up_iq2_s_ep_t kernel_moe_gate_up_iq2_s_ep<5>;
 
 typedef decltype(kernel_moe_gate_up<block_iq2_s, 2, false, false>) kernel_moe_gate_up_t;
 template [[host_name("kernel_moe_gate_up_iq2_s_r2_tg0")]] kernel kernel_moe_gate_up_t kernel_moe_gate_up<block_iq2_s, 2, false, false>;

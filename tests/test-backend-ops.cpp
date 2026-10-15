@@ -13391,13 +13391,14 @@ static int test_iq2_s_ep(const char * backend_name) {
         return 1;
     }
     bool ok = true;
-    for (int test = 0; test < 6; ++test) {
-        const int64_t tokens = test < 3 ? 1 : test == 3 ? 7 : 512;
-        const bool fused = test == 1 || test == 2;
-        const int ep_variant = test == 2 ? 2 : 1;
-        const bool f16 = test == 5;
+    for (int test = 0; test < 9; ++test) {
+        const int64_t tokens = test < 6 ? 1 : test == 6 ? 7 : 512;
+        const bool fused = test >= 1 && test <= 5;
+        const int ep_variant = fused ? test : 1;
+        const bool f16 = test == 8;
         setenv("GGML_METAL_FUSE_MOE_GATE_UP", fused ? "1" : "0", 1);
-        setenv("GGML_METAL_MOE_GATE_UP_IQ2_S_EP", ep_variant == 2 ? "2" : "1", 1);
+        const char ep_env[] = { char('0' + ep_variant), '\0' };
+        setenv("GGML_METAL_MOE_GATE_UP_IQ2_S_EP", ep_env, 1);
         ggml_backend_ptr backend(ggml_backend_dev_init(dev, nullptr));
         if (!backend) {
             return 1;
@@ -13496,7 +13497,9 @@ static int test_iq2_s_ep(const char * backend_name) {
                 norm += pow(double(reference[i]), 2);
             }
             const double nmse = error/std::max(norm, 1e-30);
-            const bool pass = finite && nmse < 5e-7;
+            // Half dots round both activations and four-term sums; allow 0.224% relative RMS error.
+            const double max_nmse = fused && (ep_variant == 4 || ep_variant == 5) ? 5e-6 : 5e-7;
+            const bool pass = finite && nmse < max_nmse;
             printf("IQ2_S_EP tokens=%lld fused=%d ep_variant=%d f16=%d output=%d nmse=%g %s\n", (long long)tokens, fused, ep_variant, f16, output, nmse, pass ? "OK" : "FAIL");
             ok = ok && pass;
         }

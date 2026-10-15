@@ -18,6 +18,24 @@ static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
 static const size_t GiB = 1024*MiB;
 
+// IQ2_S_EP has no row decoder. Validate the half plane of each complete expert.
+static bool llama_validate_tensor_data(const ggml_tensor * tensor, const void * data, size_t size) {
+    if (tensor->type != GGML_TYPE_IQ2_S_EP) {
+        return ggml_validate_row_data(tensor->type, data, size);
+    }
+    const size_t blocks = tensor->ne[0]/256 * tensor->ne[1];
+    if (!ggml_is_contiguous(tensor) || tensor->ne[0] % 256 != 0 || blocks == 0 ||
+        tensor->nb[2] != blocks*82 || blocks*80 % 16 != 0 || size % tensor->nb[2] != 0) {
+        return false;
+    }
+    for (size_t offset = 0; offset < size; offset += tensor->nb[2]) {
+        if (!ggml_validate_row_data(GGML_TYPE_F16, (const char *) data + offset + blocks*80, blocks*2)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 const char * llama_file_version_name(llama_fver version) {
     switch (version) {
         case GGUF_FILE_VERSION_V1: return "GGUF V1 (support until nov 2023)";
@@ -769,6 +787,7 @@ llama_model_loader::llama_model_loader(
             case GGML_TYPE_TQ2_0:   ftype = LLAMA_FTYPE_MOSTLY_TQ2_0;   break;
             case GGML_TYPE_IQ2_XXS: ftype = LLAMA_FTYPE_MOSTLY_IQ2_XXS; break;
             case GGML_TYPE_IQ2_XS:  ftype = LLAMA_FTYPE_MOSTLY_IQ2_XS;  break;
+            case GGML_TYPE_IQ2_S_EP:
             case GGML_TYPE_IQ2_S:   ftype = LLAMA_FTYPE_MOSTLY_IQ2_S;   break;
             case GGML_TYPE_IQ3_XXS: ftype = LLAMA_FTYPE_MOSTLY_IQ3_XXS; break;
             case GGML_TYPE_IQ1_S:   ftype = LLAMA_FTYPE_MOSTLY_IQ1_S;   break;
@@ -1483,7 +1502,7 @@ const void * llama_model_loader::load_data_range(const llama_tensor_weight & w, 
         file->read_raw(buf, size);
     }
 
-    if (check_tensors && !ggml_validate_row_data(w.tensor->type, data, size)) {
+    if (check_tensors && !llama_validate_tensor_data(w.tensor, data, size)) {
         throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(w.tensor)));
     }
 
@@ -1648,7 +1667,7 @@ bool llama_model_loader::load_all_data(
 
             if (check_tensors) {
                 validation_result.emplace_back(std::async(std::launch::async, [cur, data, n_size] {
-                    return std::make_pair(cur, ggml_validate_row_data(cur->type, data, n_size));
+                    return std::make_pair(cur, llama_validate_tensor_data(cur, data, n_size));
                 }));
             }
 
@@ -1676,7 +1695,7 @@ bool llama_model_loader::load_all_data(
                 file->read_raw(cur->data, n_size);
                 if (check_tensors) {
                     validation_result.emplace_back(std::async(std::launch::async, [cur, n_size] {
-                        return std::make_pair(cur, ggml_validate_row_data(cur->type, cur->data, n_size));
+                        return std::make_pair(cur, llama_validate_tensor_data(cur, cur->data, n_size));
                     }));
                 }
             } else {
@@ -1739,7 +1758,7 @@ bool llama_model_loader::load_all_data(
                     file->seek(weight->offs, SEEK_SET);
                     file->read_raw(read_buf.data(), n_size);
                     ggml_backend_tensor_set(cur, read_buf.data(), 0, n_size);
-                    if (check_tensors && !ggml_validate_row_data(cur->type, read_buf.data(), n_size)) {
+                    if (check_tensors && !llama_validate_tensor_data(cur, read_buf.data(), n_size)) {
                         throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
                     }
                 }

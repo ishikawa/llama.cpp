@@ -1777,6 +1777,20 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
     const bool has_simdgroup_reduction = dev->props.has_simdgroup_reduction;
     const bool has_bfloat              = dev->props.has_bfloat;
 
+    if (op->type == GGML_TYPE_IQ2_S_EP) {
+        return op->op == GGML_OP_NONE;
+    }
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        if (op->src[i] && op->src[i]->type == GGML_TYPE_IQ2_S_EP) {
+            const struct ggml_tensor * w = op->src[i];
+            if (i != 0 || op->op != GGML_OP_MUL_MAT_ID || !ggml_is_contiguous(w) ||
+                w->ne[0] % 256 != 0 || w->ne[3] != 1 ||
+                (op->src[1]->type != GGML_TYPE_F32 && op->src[1]->type != GGML_TYPE_F16)) {
+                return false;
+            }
+        }
+    }
+
     if (!has_bfloat) {
         if (op->type == GGML_TYPE_BF16) {
             return false;

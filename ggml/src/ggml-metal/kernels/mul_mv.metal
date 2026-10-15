@@ -3356,6 +3356,39 @@ void mmv_fn(
     disp_fn(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
+void kernel_mul_mv_iq2_s_ep_f32_impl(
+        ggml_metal_kargs_mul_mv args,
+        device const char * src0,
+        device const char * src1,
+        device char * dst,
+        threadgroup char * shmem,
+        uint3 tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    const int first_row = (tgpig.x*FC_mul_mv_nsg + sgitg)*2;
+    const int nb = args.ne00/256;
+    device const float * y = (device const float *)(src1 + tgpig.y*args.nb11);
+    float sum[2] = {0.f};
+    for (int ib32 = tiisg; ib32 < args.ne00/32; ib32 += 32) {
+        for (short row = 0; row < 2 && first_row + row < args.ne01; ++row) {
+            float4x4 lo, hi;
+            const ulong block = ulong(first_row + row)*nb + ib32/8;
+            dequantize_iq2_s_ep(src0, block, ulong(args.ne01)*nb, 2*(ib32%8), lo);
+            dequantize_iq2_s_ep(src0, block, ulong(args.ne01)*nb, 2*(ib32%8)+1, hi);
+            for (short i = 0; i < 16; ++i) {
+                sum[row] += y[32*ib32+i] * lo[i/4][i%4];
+                sum[row] += y[32*ib32+16+i] * hi[i/4][i%4];
+            }
+        }
+    }
+    for (short row = 0; row < 2; ++row) {
+        const float value = simd_sum(sum[row]);
+        if (tiisg == 0 && first_row + row < args.ne0) {
+            ((device float *)dst)[tgpig.y*args.ne0 + first_row + row] = value;
+        }
+    }
+}
+
 typedef decltype(mmv_fn<kernel_mul_mv_t_t_disp<half, half, ggml_metal_kargs_mul_mv>>) mul_mv_disp_fn_t;
 
 template<mul_mv_disp_fn_t disp_fn>
@@ -3460,6 +3493,7 @@ template [[host_name("kernel_mul_mv_id_iq2_xs_f32")]]  kernel kernel_mul_mv_id_t
 template [[host_name("kernel_mul_mv_id_iq3_xxs_f32")]] kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_iq3_xxs_f32_disp<ggml_metal_kargs_mul_mv>>>;
 template [[host_name("kernel_mul_mv_id_iq3_s_f32")]]   kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_iq3_s_f32_disp<ggml_metal_kargs_mul_mv>>>;
 template [[host_name("kernel_mul_mv_id_iq2_s_f32")]]   kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_iq2_s_f32_disp<ggml_metal_kargs_mul_mv>>>;
+template [[host_name("kernel_mul_mv_id_iq2_s_ep_f32")]] kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_iq2_s_ep_f32_impl>>;
 template [[host_name("kernel_mul_mv_id_iq4_nl_f32")]]  kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_iq4_nl_f32_impl <N_R0_IQ4_NL>>>;
 template [[host_name("kernel_mul_mv_id_iq4_xs_f32")]]  kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_iq4_xs_f32_impl <N_R0_IQ4_XS>>>;
 template [[host_name("kernel_mul_mv_id_tq2_0_f32")]]   kernel kernel_mul_mv_id_t kernel_mul_mv_id<mmv_fn<kernel_mul_mv_tq2_0_f32_impl  <N_R0_TQ2_0>>>;
@@ -3577,7 +3611,7 @@ inline float moe_gate_up_dot_iq3_s(device const block_iq3_s * xb, int ib, thread
     return d * (sum[0] + sum[1]);
 }
 
-template<typename block_t, int NR0, bool IQ3, bool TG, int DECODE = 0>
+template<typename block_t, int NR0, bool IQ3, bool TG, int DECODE = 0, bool EP = false>
 kernel void kernel_moe_gate_up(
         constant ggml_metal_kargs_mul_mv_id & args,
     device const char * gate,
@@ -3657,7 +3691,21 @@ kernel void kernel_moe_gate_up(
                 g = (device const block_t *)(weights[0] + row*args.nb01) + ibl;
                 u = (device const block_t *)(weights[1] + row*args.nb01) + ibl;
             }
-            if (IQ3) {
+            if (EP) {
+                const ulong block = ulong(first_row + row)*(args.ne00/256) + ibl;
+                float4x4 gl, gh, ul, uh;
+                device const char * ge = gate + ulong(expert)*args.nb02;
+                device const char * ue = up + ulong(expert)*args.nb02;
+                const ulong blocks = ulong(args.ne01)*(args.ne00/256);
+                dequantize_iq2_s_ep(ge, block, blocks, 2*ib, gl);
+                dequantize_iq2_s_ep(ge, block, blocks, 2*ib+1, gh);
+                dequantize_iq2_s_ep(ue, block, blocks, 2*ib, ul);
+                dequantize_iq2_s_ep(ue, block, blocks, 2*ib+1, uh);
+                for (short i = 0; i < 16; ++i) {
+                    sum_gate[row] += yl[i]*gl[i/4][i%4] + yl[16+i]*gh[i/4][i%4];
+                    sum_up[row] += yl[i]*ul[i/4][i%4] + yl[16+i]*uh[i/4][i%4];
+                }
+            } else if (IQ3) {
                 sum_gate[row] += moe_gate_up_dot_iq3_s((device const block_iq3_s *)g, ib, yl, shmem);
                 sum_up[row]   += moe_gate_up_dot_iq3_s((device const block_iq3_s *)u, ib, yl, shmem);
             } else if (DECODE == 2) {
@@ -3674,8 +3722,8 @@ kernel void kernel_moe_gate_up(
     }
 
     for (short row = 0; row < NR0; ++row) {
-        const float g = simd_sum(sum_gate[row]) * (IQ3 ? 1.f : 0.25f);
-        const float u = simd_sum(sum_up[row])   * (IQ3 ? 1.f : 0.25f);
+        const float g = simd_sum(sum_gate[row]) * ((IQ3 || EP) ? 1.f : 0.25f);
+        const float u = simd_sum(sum_up[row])   * ((IQ3 || EP) ? 1.f : 0.25f);
         if (tiisg == 0) {
             if (DECODE != 0) {
                 dst[uint(idx)*uint(args.ne0) + uint(first_row + row)] = (g / (1.f + exp(-g))) * u;
@@ -3687,6 +3735,7 @@ kernel void kernel_moe_gate_up(
 }
 
 typedef decltype(kernel_moe_gate_up<block_iq2_s, 2, false, false>) kernel_moe_gate_up_t;
+template [[host_name("kernel_moe_gate_up_iq2_s_ep")]] kernel kernel_moe_gate_up_t kernel_moe_gate_up<block_iq2_s, 2, false, false, 0, true>;
 template [[host_name("kernel_moe_gate_up_iq2_s_r2_tg0")]] kernel kernel_moe_gate_up_t kernel_moe_gate_up<block_iq2_s, 2, false, false>;
 template [[host_name("kernel_moe_gate_up_iq2_s_r2_tg1")]] kernel kernel_moe_gate_up_t kernel_moe_gate_up<block_iq2_s, 2, false, true>;
 template [[host_name("kernel_moe_gate_up_iq2_s_r4_tg0")]] kernel kernel_moe_gate_up_t kernel_moe_gate_up<block_iq2_s, 4, false, false>;

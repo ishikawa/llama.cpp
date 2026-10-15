@@ -1507,6 +1507,11 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
                     split = true;
                 }
             } break;
+        case GGML_TYPE_IQ2_S_EP:
+            {
+                nsg = 4;
+                nr0 = 2;
+            } break;
         case GGML_TYPE_IQ2_S:
             {
                 nsg = N_SG_IQ2_S;
@@ -1628,8 +1633,13 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_moe_gate_up(ggml
     const char * tg_env = std::getenv("GGML_METAL_MUL_MV_ID_IQ2_S_TG");
     int nsg = nsg_env && std::strcmp(nsg_env, "8") == 0 ? 8 : 4;
     int nr0 = nr0_env && std::strcmp(nr0_env, "4") == 0 ? 4 : 2;
+    const bool ep = op->src[0]->type == GGML_TYPE_IQ2_S_EP;
+    if (ep) {
+        nr0 = 2;
+        nsg = 4;
+    }
     const bool iq3 = op->src[0]->type == GGML_TYPE_IQ3_S;
-    bool tg = iq3 || (tg_env && std::strcmp(tg_env, "1") == 0);
+    bool tg = !ep && (iq3 || (tg_env && std::strcmp(tg_env, "1") == 0));
 
     const char * decode_env = std::getenv("GGML_METAL_MOE_GATE_UP_IQ2_S_DECODE");
     const bool iq2 = op->src[0]->type == GGML_TYPE_IQ2_S;
@@ -1656,6 +1666,9 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_moe_gate_up(ggml
     char base[256];
     char name[256];
     snprintf(base, sizeof(base), "kernel_moe_gate_up_%s_r%d_tg%d", ggml_type_name(op->src[0]->type), nr0, tg);
+    if (ep) {
+        snprintf(base, sizeof(base), "kernel_moe_gate_up_iq2_s_ep");
+    }
     if (decode != 0) {
         snprintf(base, sizeof(base), "kernel_moe_gate_up_iq2_s_r%d_tg%d_v%d", nr0, tg, decode);
     }

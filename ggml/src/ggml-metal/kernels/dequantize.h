@@ -623,6 +623,43 @@ void dequantize_iq2_s(device const block_iq2_s * xb, short il, thread type4x4 & 
     }
 }
 
+// Payload blocks are 80 bytes. Aligned experts use five uint4 loads per block.
+// Expert sizes not divisible by 16 retain the layout and use byte loads.
+inline uint4 iq2_s_ep_load16(device const uchar * p, bool aligned) {
+    if (aligned) {
+        return *((device const uint4 *)p);
+    }
+    uint4 v = uint4(0);
+    for (short i = 0; i < 16; ++i) {
+        v[i/4] |= uint(p[i]) << (8*(i%4));
+    }
+    return v;
+}
+
+inline uchar iq2_s_ep_byte(uint4 v, short i) {
+    return (v[i/4] >> (8*(i%4))) & 255;
+}
+
+template <typename type4x4>
+void dequantize_iq2_s_ep(device const char * expert, ulong block, ulong blocks, short il, thread type4x4 & reg) {
+    device const uchar * payload = (device const uchar *)expert + 80*block;
+    const int ib32 = il/2;
+    const int half32 = il%2;
+    const int entry = 4*ib32 + 2*half32;
+    const uint4 qs = iq2_s_ep_load16(payload + (entry/16)*16, blocks%8 == 0);
+    const uint4 signs = iq2_s_ep_load16(payload + 32 + (entry/16)*16, blocks%8 == 0);
+    const uint4 meta = iq2_s_ep_load16(payload + 64, blocks%8 == 0);
+    const float d = ((device const half *)(expert + blocks*80))[block];
+    const uchar qh = iq2_s_ep_byte(meta, ib32) >> (4*half32);
+    const float dl = d * (0.5f + ((iq2_s_ep_byte(meta, 8+ib32) >> (4*half32)) & 0xf)) * 0.25f;
+    constant uchar * grid1 = (constant uchar *)(iq2s_grid + (iq2_s_ep_byte(qs, entry%16) | ((qh << 8) & 0x300)));
+    constant uchar * grid2 = (constant uchar *)(iq2s_grid + (iq2_s_ep_byte(qs, entry%16+1) | ((qh << 6) & 0x300)));
+    for (short i = 0; i < 8; ++i) {
+        reg[i/4][i%4] = dl * grid1[i] * select(1, -1, iq2_s_ep_byte(signs, entry%16) & kmask_iq2xs[i]);
+        reg[i/4+2][i%4] = dl * grid2[i] * select(1, -1, iq2_s_ep_byte(signs, entry%16+1) & kmask_iq2xs[i]);
+    }
+}
+
 template <typename type4x4>
 void dequantize_iq1_s(device const block_iq1_s * xb, short il, thread type4x4 & reg) {
     // il is 0...15 for QK_K = 256 => index of block of 32 is il/2

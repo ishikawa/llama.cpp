@@ -1085,18 +1085,20 @@ static bool ggml_metal_fusion_check_moe_gate_up(
     const ggml_tensor * x = a->src[1];
     const ggml_tensor * ids = a->src[2];
     const char * decode_env = std::getenv("GGML_METAL_MOE_GATE_UP_IQ2_S_DECODE");
+    const bool ep = wa->type == GGML_TYPE_IQ2_S_EP;
     const bool decode_iq2 = wa->type == GGML_TYPE_IQ2_S && decode_env &&
                            (std::strcmp(decode_env, "1") == 0 || std::strcmp(decode_env, "2") == 0);
     const char * nr0_env = std::getenv("GGML_METAL_MUL_MV_ID_DECODE_NR0");
     const char * nsg_env = std::getenv("GGML_METAL_MUL_MV_ID_DECODE_NSG");
     const bool decode_v2 = decode_iq2 && std::strcmp(decode_env, "2") == 0;
-    const int nr0 = !decode_v2 && nr0_env && std::strcmp(nr0_env, "4") == 0 ? 4 : 2;
-    const int nsg = !decode_v2 && nsg_env && std::strcmp(nsg_env, "8") == 0 ? 8 : 4;
-    // Extend fusion only for opt-in IQ2_S with complete blocks and row tiles.
-    const bool decode_shape = decode_iq2 && wa->ne[0] > 0 && wa->ne[0] % ggml_blck_size(wa->type) == 0 &&
+    const int nr0 = !ep && !decode_v2 && nr0_env && std::strcmp(nr0_env, "4") == 0 ? 4 : 2;
+    const int nsg = !ep && !decode_v2 && nsg_env && std::strcmp(nsg_env, "8") == 0 ? 8 : 4;
+    // Decode and EP fusion require complete blocks and row tiles.
+    const bool decode_shape = (decode_iq2 || ep) && wa->ne[0] > 0 && wa->ne[0] % ggml_blck_size(wa->type) == 0 &&
                               wa->ne[1] > 0 && wa->ne[1] % (nr0*nsg) == 0 && x->nb[1] % 16 == 0 &&
                               ggml_nbytes(wa) <= UINT32_MAX && ggml_nbytes(x) <= UINT32_MAX && ggml_nbytes(out) <= UINT32_MAX;
-    if ((wa->type != GGML_TYPE_IQ2_S && wa->type != GGML_TYPE_IQ3_S) || wb->type != wa->type ||
+    if ((wa->type != GGML_TYPE_IQ2_S && wa->type != GGML_TYPE_IQ3_S && !ep) || wb->type != wa->type ||
+        (ep && (!ggml_is_contiguous(wa) || !ggml_is_contiguous(wb))) ||
         !ggml_are_same_shape(wa, wb) || !ggml_is_contiguous_1(wa) || !ggml_is_contiguous_1(wb) ||
         (!decode_shape && (wa->ne[0] != 2560 || wa->ne[1] != 640)) || wa->ne[3] != 1 ||
         x->type != GGML_TYPE_F32 || x->ne[0] != wa->ne[0] || x->ne[2] != 1 || x->ne[3] != 1 || !ggml_is_contiguous_1(x) ||

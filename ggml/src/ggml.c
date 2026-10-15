@@ -1081,6 +1081,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "RWKV_WKV7",
     "SOLVE_TRI",
     "GATED_DELTA_NET",
+    "GATED_DELTA_NET_INPLACE",
     "LIGHTNING_INDEXER",
     "DSV4_HC_COMB",
     "DSV4_HC_PRE",
@@ -1104,7 +1105,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "QSA_EXPAND",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1199,6 +1200,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "rwkv_wkv7(r, w, k, v, a, b, s)",
     "A X = B, A triangular, solve X",
     "gated_delta_net(q, k, v, g, beta, s)",
+    "gated_delta_net_inplace(q, k, v, g, beta, s, snapshots)",
     "lightning_indexer(q, k, weights, mask)",
     "dsv4_hc_comb(mixes, scale, base)",
     "dsv4_hc_pre(x, weights)",
@@ -1222,7 +1224,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "qsa_expand(x)",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5756,6 +5758,31 @@ struct ggml_tensor * ggml_ssm_conv_inplace(
     return result;
 }
 
+struct ggml_tensor * ggml_ssm_conv_snapshots_inplace(
+        struct ggml_context * ctx, struct ggml_tensor * state,
+        struct ggml_tensor * x, struct ggml_tensor * kernel) {
+    GGML_ASSERT(state->type == GGML_TYPE_F32 && x->type == GGML_TYPE_F32 && kernel->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_3d(x) && ggml_is_matrix(kernel));
+    GGML_ASSERT(state->ne[0] > 0 && state->ne[0] == kernel->ne[0] - 1);
+    GGML_ASSERT(state->ne[1] == x->ne[0] && state->ne[1] == kernel->ne[1]);
+    GGML_ASSERT(state->ne[2] == x->ne[2] && state->ne[3] > 1 && x->ne[1] <= state->ne[3]);
+    GGML_ASSERT(state->nb[0] == sizeof(float) && x->nb[0] == sizeof(float) && kernel->nb[0] == sizeof(float));
+    GGML_ASSERT(state->nb[1] >= state->ne[0]*sizeof(float));
+    GGML_ASSERT(state->nb[2] >= state->ne[1]*state->nb[1]);
+    GGML_ASSERT(state->nb[3] >= state->ne[2]*state->nb[2]);
+    ggml_set_output(state);
+    if (state->view_src) {
+        ggml_set_output(state->view_src);
+    }
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, x->ne[0], x->ne[1], x->ne[2]);
+    result->op = GGML_OP_SSM_CONV_INPLACE;
+    result->src[0] = state;
+    result->src[1] = x;
+    result->src[2] = kernel;
+    ggml_set_op_params_i32(result, 0, 1);
+    return result;
+}
+
 // ggml_ssm_scan
 
 struct ggml_tensor * ggml_ssm_scan(
@@ -6437,7 +6464,7 @@ struct ggml_tensor * ggml_solve_tri(
 
 // ggml_gated_delta_net
 
-struct ggml_tensor * ggml_gated_delta_net(
+static struct ggml_tensor * ggml_gated_delta_net_impl(
         struct ggml_context * ctx,
         struct ggml_tensor  * q,
         struct ggml_tensor  * k,
@@ -6445,7 +6472,8 @@ struct ggml_tensor * ggml_gated_delta_net(
         struct ggml_tensor  * g,
         struct ggml_tensor  * beta,
         struct ggml_tensor  * state,
-        int64_t               K) {
+        int64_t               K,
+        bool                  inplace) {
     GGML_ASSERT(ggml_is_contiguous_rows(q));
     GGML_ASSERT(ggml_is_contiguous_rows(k));
     GGML_ASSERT(ggml_is_contiguous_rows(v));
@@ -6476,12 +6504,12 @@ struct ggml_tensor * ggml_gated_delta_net(
     GGML_ASSERT(state->ne[3] == n_seqs);
     GGML_ASSERT(K >= 1);
     const int64_t state_rows = K * S_v * n_seqs;
-    const int64_t ne[4] = { S_v * H, n_tokens * n_seqs + state_rows, 1, 1 };
+    const int64_t ne[4] = { S_v * H, n_tokens * n_seqs + (inplace ? 0 : state_rows), 1, 1 };
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
 
     ggml_set_op_params_i32(result, 0, (int32_t) K);
 
-    result->op     = GGML_OP_GATED_DELTA_NET;
+    result->op     = inplace ? GGML_OP_GATED_DELTA_NET_INPLACE : GGML_OP_GATED_DELTA_NET;
     result->src[0] = q;
     result->src[1] = k;
     result->src[2] = v;
@@ -6489,6 +6517,37 @@ struct ggml_tensor * ggml_gated_delta_net(
     result->src[4] = beta;
     result->src[5] = state;
 
+    return result;
+}
+
+struct ggml_tensor * ggml_gated_delta_net(
+        struct ggml_context * ctx,
+        struct ggml_tensor * q,
+        struct ggml_tensor * k,
+        struct ggml_tensor * v,
+        struct ggml_tensor * g,
+        struct ggml_tensor * beta,
+        struct ggml_tensor * state,
+        int64_t K) {
+    return ggml_gated_delta_net_impl(ctx, q, k, v, g, beta, state, K, false);
+}
+
+struct ggml_tensor * ggml_gated_delta_net_inplace(
+        struct ggml_context * ctx, struct ggml_tensor * q, struct ggml_tensor * k,
+        struct ggml_tensor * v, struct ggml_tensor * g, struct ggml_tensor * beta,
+        struct ggml_tensor * state, struct ggml_tensor * snapshots) {
+    const int64_t D = state->ne[0]*state->ne[1]*state->ne[2];
+    GGML_ASSERT(snapshots->type == GGML_TYPE_F32 && ggml_is_3d(snapshots));
+    GGML_ASSERT(snapshots->ne[0] == D && snapshots->ne[1] == state->ne[3]);
+    GGML_ASSERT(snapshots->ne[2] > 1 && v->ne[2] <= snapshots->ne[2]);
+    GGML_ASSERT(snapshots->nb[0] == sizeof(float) && snapshots->nb[1] == D*sizeof(float));
+    GGML_ASSERT(snapshots->nb[2] >= snapshots->nb[1]*snapshots->ne[1]);
+    struct ggml_tensor * result = ggml_gated_delta_net_impl(ctx, q, k, v, g, beta, state, snapshots->ne[2], true);
+    ggml_set_output(snapshots);
+    if (snapshots->view_src) {
+        ggml_set_output(snapshots->view_src);
+    }
+    result->src[6] = snapshots;
     return result;
 }
 

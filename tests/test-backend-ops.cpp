@@ -4613,6 +4613,134 @@ struct test_ssm_conv : public test_case {
 };
 
 // GGML_OP_SSM_CONV_INPLACE
+// Check attention/convolution output and the entire cache against a scalar reference.
+struct test_gdn_snapshot_inplace : public test_case {
+    const bool conv;
+    const int64_t nt, ns, K, S;
+    const bool silu;
+    static constexpr int64_t H = 3;
+    ggml_tensor * cache;
+    ggml_tensor * q;
+    ggml_tensor * k;
+    ggml_tensor * v;
+    ggml_tensor * g;
+    ggml_tensor * beta;
+    std::vector<float> expected;
+
+    test_gdn_snapshot_inplace(bool conv, int64_t nt, int64_t ns, int64_t K, int64_t S, bool silu = false)
+        : conv(conv), nt(nt), ns(ns), K(K), S(S), silu(silu) {}
+
+    std::string op_desc(ggml_tensor *) override {
+        return conv ? "SSM_CONV_SNAPSHOTS_INPLACE" : "GATED_DELTA_NET_INPLACE";
+    }
+    std::string vars() override { return VARS_TO_STR6(conv, nt, ns, K, S, silu); }
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t D = conv ? 3*S : S*S*H;
+        const int64_t mem = ns + 2;
+        cache = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, D, mem, K + 1);
+        ggml_tensor * out;
+        if (conv) {
+            q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, S, nt, ns);
+            k = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, S);
+            ggml_tensor * state = ggml_view_4d(ctx, cache, 3, S, ns, K,
+                    3*sizeof(float), D*sizeof(float), mem*D*sizeof(float), D*sizeof(float));
+            out = ggml_ssm_conv_snapshots_inplace(ctx, state, q, k);
+            if (silu) {
+                out = ggml_silu(ctx, out);
+            }
+        } else {
+            q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, 1, nt, ns);
+            k = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, 1, nt, ns);
+            v = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, H, nt, ns);
+            g = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H, nt, ns);
+            beta = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H, nt, ns);
+            ggml_tensor * state = ggml_view_4d(ctx, cache, S, S, H, ns,
+                    S*sizeof(float), S*S*sizeof(float), D*sizeof(float), D*sizeof(float));
+            ggml_tensor * snapshots = ggml_view_3d(ctx, cache, D, ns, K,
+                    D*sizeof(float), mem*D*sizeof(float), D*sizeof(float));
+            out = ggml_gated_delta_net_inplace(ctx, q, k, v, g, beta, state, snapshots);
+        }
+        return ggml_concat(ctx, ggml_reshape_1d(ctx, out, ggml_nelements(out)),
+                ggml_reshape_1d(ctx, ggml_cont(ctx, cache), ggml_nelements(cache)), 0);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_case::initialize_tensors(ctx);
+        init_tensor_uniform(q, -0.1f, 0.1f);
+        init_tensor_uniform(k, -0.1f, 0.1f);
+        if (!conv) {
+            init_tensor_uniform(g, -2.0f, -0.01f);
+            init_tensor_uniform(beta, 0.0f, 1.0f);
+        }
+        auto history = tensor_to_float(cache);
+        const auto before = history;
+        const auto qs = tensor_to_float(q);
+        const auto ks = tensor_to_float(k);
+        const int64_t D = conv ? 3*S : S*S*H;
+        const int64_t mem = ns + 2;
+        expected.assign((conv ? S : S*H)*nt*ns, 0.0f);
+        if (conv) {
+            for (int64_t seq = 0; seq < ns; ++seq) {
+                for (int64_t c = 0; c < S; ++c) {
+                    auto sample = [&](int64_t j) { return j < 3 ? before[(seq + 1)*D + c*3 + j] : qs[(seq*nt + j - 3)*S + c]; };
+                    for (int64_t t = 0; t < nt; ++t) {
+                        float sum = 0;
+                        for (int64_t j = 0; j < 4; ++j) { sum += sample(t + j)*ks[c*4 + j]; }
+                        expected[(seq*nt + t)*S + c] = silu ? sum/(1 + std::exp(-sum)) : sum;
+                    }
+                    for (int64_t slot = 0; slot < K; ++slot) {
+                        for (int64_t j = 0; j < 3; ++j) {
+                            history[(slot*mem + seq + 1)*D + c*3 + j] = sample(std::max<int64_t>(0, nt - slot) + j);
+                        }
+                    }
+                }
+            }
+        } else {
+            const auto vs = tensor_to_float(v);
+            const auto gs = tensor_to_float(g);
+            const auto bs = tensor_to_float(beta);
+            for (int64_t seq = 0; seq < ns; ++seq) {
+                for (int64_t h = 0; h < H; ++h) {
+                    std::vector<float> state(S*S);
+                    std::copy_n(before.data() + (seq + 1)*D + h*S*S, S*S, state.data());
+                    for (int64_t t = 0; t < nt; ++t) {
+                        const int64_t ih = (seq*nt + t)*H + h;
+                        for (float & value : state) { value *= std::exp(gs[ih]); }
+                        for (int64_t j = 0; j < S; ++j) {
+                            float dot = 0;
+                            for (int64_t i = 0; i < S; ++i) { dot += state[j*S + i]*ks[(seq*nt + t)*S + i]; }
+                            const float delta = (vs[ih*S + j] - dot)*bs[ih];
+                            float y = 0;
+                            for (int64_t i = 0; i < S; ++i) {
+                                state[j*S + i] += ks[(seq*nt + t)*S + i]*delta;
+                                y += state[j*S + i]*qs[(seq*nt + t)*S + i];
+                            }
+                            expected[ih*S + j] = y/std::sqrt((float) S);
+                        }
+                        const int64_t slot = nt - 1 - t;
+                        std::copy_n(state.data(), S*S, history.data() + (slot*mem + seq + 1)*D + h*S*S);
+                    }
+                }
+            }
+        }
+        expected.insert(expected.end(), history.begin(), history.end());
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        GGML_ASSERT(n == expected.size());
+        const size_t no = (conv ? S : S*H)*nt*ns;
+        double result = 0;
+        // Check output separately so the large unchanged cache cannot hide an output error.
+        for (const auto range : {std::make_pair(size_t(0), no), std::make_pair(no, n - no)}) {
+            result = std::max(result, std::max(nmse(a + range.first, expected.data() + range.first, range.second),
+                                             nmse(b + range.first, expected.data() + range.first, range.second)));
+        }
+        return result;
+    }
+};
+
 struct test_ssm_conv_inplace : public test_case {
     const int64_t n_seqs;
     const bool strided;
@@ -10925,6 +11053,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    for (int64_t ns : {1, 2}) {
+        for (int64_t K : {2, 4}) {
+            for (int64_t nt : {1, 2}) {
+                for (int64_t S : {32, 128}) {
+                    test_cases.emplace_back(new test_gdn_snapshot_inplace(false, nt, ns, K, S));
+                }
+                for (bool silu : {false, true}) {
+                    test_cases.emplace_back(new test_gdn_snapshot_inplace(true, nt, ns, K, 10240, silu));
+                }
+            }
+        }
+    }
+    test_cases.emplace_back(new test_gdn_snapshot_inplace(false, 4, 2, 4, 128));
+    test_cases.emplace_back(new test_gdn_snapshot_inplace(true, 4, 2, 4, 32));
+    test_cases.emplace_back(new test_gdn_snapshot_inplace(false, 3, 1, 4, 128));
+    test_cases.emplace_back(new test_gdn_snapshot_inplace(true, 3, 1, 4, 32));
+
     for (int64_t d_conv : {3, 4, 9}) {
         for (int64_t d_inner: {1024, 1536, 2048}) {
             test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {d_conv, d_inner, 1, 1}, {d_conv, d_inner, 1, 1}));
@@ -10938,6 +11083,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // fused ssm_conv + (optional) bias_add + silu. The bias-only graph (no silu) is intentionally
     // not tested since there's no fusion for that pattern in ggml_cuda_can_fuse.
+    for (int64_t ns : {1, 2}) {
+        for (int64_t K : {2, 4}) {
+            for (int64_t nt : {1, 2}) {
+                for (int64_t S : {32, 128}) {
+                    test_cases.emplace_back(new test_gdn_snapshot_inplace(false, nt, ns, K, S));
+                }
+                for (bool silu : {false, true}) {
+                    test_cases.emplace_back(new test_gdn_snapshot_inplace(true, nt, ns, K, 10240, silu));
+                }
+            }
+        }
+    }
+    test_cases.emplace_back(new test_gdn_snapshot_inplace(false, 4, 2, 4, 128));
+    test_cases.emplace_back(new test_gdn_snapshot_inplace(true, 4, 2, 4, 32));
+    test_cases.emplace_back(new test_gdn_snapshot_inplace(false, 3, 1, 4, 128));
+    test_cases.emplace_back(new test_gdn_snapshot_inplace(true, 3, 1, 4, 32));
+
     for (int64_t d_conv : {3, 4, 9}) {
         for (int64_t d_inner : {1024, 1536, 2048}) {
             for (bool fuse_bias : {false, true}) {

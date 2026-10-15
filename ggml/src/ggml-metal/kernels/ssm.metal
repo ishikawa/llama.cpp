@@ -510,6 +510,29 @@ kernel void kernel_ssm_conv_inplace_f32(
     }
     device float * h = (device float *) ((device char *) state + channel*args.state_nb1 + seq*args.state_nb2);
     device const float * w = (device const float *) ((device const char *) conv_w + channel*args.kernel_nb1);
+    if (args.n_tokens > 0) {
+        device const char * tokens = (device const char *) x + seq*args.x_nb2 + channel*sizeof(float);
+        for (int64_t t = 0; t < args.n_tokens; ++t) {
+            float sum = 0.0f;
+            for (int64_t j = 0; j <= args.history; ++j) {
+                const int64_t idx = t + j;
+                const float value = idx < args.history ? h[idx] : *(device const float *) (tokens + (idx - args.history)*args.x_nb1);
+                sum += value*w[j];
+            }
+            dst[(seq*args.n_tokens + t)*args.channels + channel] = FC_ssm_conv_silu ? sum/(1.0f + exp(-sum)) : sum;
+        }
+        // One thread owns a channel. Read all convolution inputs before changing history; write slot 0 last.
+        for (int64_t slot = args.n_slots - 1; slot >= 0; --slot) {
+            device float * out = (device float *) ((device char *) h + slot*args.state_nb3);
+            const int64_t shift = max((int64_t) 0, args.n_tokens - slot);
+            // Ascending writes cannot clobber a future read: shift + j >= j.
+            for (int64_t j = 0; j < args.history; ++j) {
+                const int64_t idx = shift + j;
+                out[j] = idx < args.history ? h[idx] : *(device const float *) (tokens + (idx - args.history)*args.x_nb1);
+            }
+        }
+        return;
+    }
     const float token = ((device const float *) ((device const char *) x + seq*args.x_nb1))[channel];
     float sum = 0.0f;
     for (int64_t j = 0; j < args.history; ++j) {

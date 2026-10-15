@@ -440,6 +440,9 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
     }
 
     switch (op->op) {
+        case GGML_OP_SSM_CONV_INPLACE:
+            return op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32 &&
+                   src1->type == GGML_TYPE_F32 && op->src[2]->type == GGML_TYPE_F32;
         case GGML_OP_CPY:
         case GGML_OP_SET_ROWS:
             return

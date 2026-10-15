@@ -271,6 +271,7 @@ public:
 
 // LLAMA_GDN_STATE_VIEW=1 (read once)
 bool llm_graph_gdn_state_view_enabled();
+bool llm_graph_gdn_conv_inplace_enabled();
 
 class llm_graph_input_rs : public llm_graph_input_i {
 public:
@@ -297,6 +298,7 @@ public:
     // opt-in (LLAMA_GDN_STATE_VIEW=1) and the state copies are the identity: the graph reads the states as a view
     // of the cache instead of a gather, so a graph built with the other value cannot be reused
     bool s_identity = false;
+    bool conv_identity = false;
 };
 
 class llm_graph_input_cross_embd : public llm_graph_input_i {

@@ -15957,3 +15957,7 @@
 "MTL0","GATED_DELTA_NET","type=f32,head_count=8,head_size=32,n_seq_tokens=4,n_seqs=2,v_repeat=2,permuted=0,kda=1","support","1","yes","MTL"
 "MTL0","GATED_DELTA_NET","type=f32,head_count=4,head_size=64,n_seq_tokens=4,n_seqs=2,v_repeat=1,permuted=1,kda=1","support","1","yes","MTL"
 "MTL0","GATED_DELTA_NET","type=f32,head_count=4,head_size=16,n_seq_tokens=4,n_seqs=2,v_repeat=1,permuted=1,kda=1","support","0","no","MTL"
+"MTL0","SSM_CONV_INPLACE","state_cols=3,channels=10240,n_seqs=1,strided=0","support","1","yes","MTL"
+"MTL0","SSM_CONV_INPLACE","state_cols=3,channels=10240,n_seqs=1,strided=1","support","1","yes","MTL"
+"MTL0","SSM_CONV_INPLACE","state_cols=3,channels=10240,n_seqs=2,strided=0","support","1","yes","MTL"
+"MTL0","SSM_CONV_INPLACE","state_cols=3,channels=10240,n_seqs=2,strided=1","support","1","yes","MTL"

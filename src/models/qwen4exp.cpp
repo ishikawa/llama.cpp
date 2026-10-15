@@ -1064,8 +1064,26 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     // the channels must match how load_arch_tensors sizes wqkv, not ssm_d_inner
     const int64_t conv_channels    = head_k_dim * num_k_heads * 2 + head_v_dim * num_v_heads;
 
-    ggml_tensor * conv_input = build_conv_state_at(inp, conv_states_all, qkv_mixed,
-            conv_kernel_size - 1, conv_channels, il);
+    ggml_tensor * conv_output_proper;
+    if (inp->conv_identity && n_seq_tokens == 1 && cparams.n_rs_seq == 0) {
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            LLAMA_LOG_INFO("%s: LLAMA_GDN_CONV_INPLACE=1: GDN convolution updates identity cache rows in place\n", __func__);
+        }
+        const int64_t state_cols = conv_kernel_size - 1;
+        GGML_ASSERT(conv_states_all->ne[0] == state_cols*conv_channels);
+        ggml_tensor * state = ggml_view_3d(ctx0, conv_states_all, state_cols, conv_channels, n_seqs,
+                state_cols*ggml_element_size(conv_states_all), conv_states_all->nb[1],
+                (size_t) inp->mctx->get_head()*conv_states_all->nb[1]);
+        ggml_tensor * x = ggml_reshape_2d(ctx0, qkv_mixed, conv_channels, n_seqs);
+        conv_output_proper = ggml_ssm_conv_inplace(ctx0, state, x, conv_kernel);
+        ggml_build_forward_expand(gf, inp->s_copy);
+    } else {
+        ggml_tensor * conv_input = build_conv_state_at(inp, conv_states_all, qkv_mixed,
+                conv_kernel_size - 1, conv_channels, il);
+        conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
+    }
 
     ggml_tensor * state = nullptr;
     if (inp->s_identity && n_seq_tokens == 1) {
@@ -1088,7 +1106,6 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
     cb(state, "state_predelta", il);
 
-    ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
     cb(conv_output_proper, "conv_output_raw", il);
 
     ggml_tensor * conv_output_silu = ggml_silu(ctx0, conv_output_proper);

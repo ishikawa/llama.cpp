@@ -4612,6 +4612,86 @@ struct test_ssm_conv : public test_case {
     }
 };
 
+// GGML_OP_SSM_CONV_INPLACE
+struct test_ssm_conv_inplace : public test_case {
+    const int64_t n_seqs;
+    const bool strided;
+    const bool use_silu;
+    const bool observe_state;
+    ggml_tensor * cache;
+    ggml_tensor * x;
+    ggml_tensor * kernel;
+    std::vector<float> expected;
+    // Qwen GDN: 128 * (2 * 16 key heads + 48 value heads).
+    static constexpr int64_t channels = 128*(2*16 + 48);
+
+    test_ssm_conv_inplace(int64_t n_seqs, bool strided, bool use_silu, bool observe_state)
+        : n_seqs(n_seqs), strided(strided), use_silu(use_silu), observe_state(observe_state) {}
+
+    std::string op_desc(ggml_tensor *) override { return "SSM_CONV_INPLACE"; }
+    std::string vars() override { return VARS_TO_STR4(n_seqs, strided, use_silu, observe_state); }
+
+    bool run_whole_graph() override { return true; }
+    const char * metal_fusion_env() override { return "LLAMA_TEST_SSM_CONV_INPLACE_FUSION"; }
+    const char * metal_fusion_label() override { return "SSM_CONV_INPLACE+UNARY"; }
+    bool metal_fusion_expected() override { return use_silu; }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_case::initialize_tensors(ctx);
+        std::vector<float> history = tensor_to_float(cache);
+        const std::vector<float> before = history;
+        const std::vector<float> tokens = tensor_to_float(x);
+        const std::vector<float> weights = tensor_to_float(kernel);
+        const int64_t row = cache->ne[0];
+        expected.resize(channels*n_seqs);
+        for (int64_t seq = 0; seq < n_seqs; ++seq) {
+            for (int64_t c = 0; c < channels; ++c) {
+                const int64_t base = ((seq + 1)*channels + c)*row;
+                float sum = 0.0f;
+                for (int64_t j = 0; j < 3; ++j) {
+                    sum += history[base + j]*weights[4*c + j];
+                }
+                const float token = tokens[seq*channels + c];
+                sum += token*weights[4*c + 3];
+                expected[seq*channels + c] = use_silu ? sum/(1.0f + std::exp(-sum)) : sum;
+                history[base] = history[base + 1];
+                history[base + 1] = history[base + 2];
+                history[base + 2] = token;
+            }
+        }
+        if (observe_state) {
+            expected.insert(expected.end(), history.begin(), history.end());
+            expected.insert(expected.begin(), before.begin(), before.end());
+        }
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        GGML_ASSERT(n == expected.size());
+        return std::max(nmse(a, b, n), std::max(nmse(a, expected.data(), n), nmse(b, expected.data(), n)));
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t row = strided ? 5 : 3;
+        cache = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, row, channels, n_seqs + 2);
+        ggml_tensor * state = ggml_view_3d(ctx, cache, 3, channels, n_seqs,
+                cache->nb[1], cache->nb[2], cache->nb[2]);
+        x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, channels, n_seqs);
+        kernel = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, channels);
+        ggml_tensor * out = ggml_ssm_conv_inplace(ctx, state, x, kernel);
+        if (use_silu) {
+            out = ggml_silu(ctx, out);
+        }
+        if (observe_state) {
+            // Read the cache before and after the write, including padding and adjacent slots.
+            ggml_tensor * before = ggml_reshape_1d(ctx, ggml_cont(ctx, cache), ggml_nelements(cache));
+            out = ggml_concat(ctx, ggml_reshape_1d(ctx, out, channels*n_seqs),
+                    ggml_reshape_1d(ctx, ggml_cont(ctx, cache), ggml_nelements(cache)), 0);
+            out = ggml_concat(ctx, before, out, 0);
+        }
+        return out;
+    }
+};
+
 // GGML_OP_SSM_CONV + GGML_OP_ADD (channel-wise bias, optional) + GGML_OP_UNARY(SILU) (fused operation)
 struct test_ssm_conv_bias_silu : public test_case {
     const ggml_type type;
@@ -10835,6 +10915,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // ne[2] > 65535 exceeds the CUDA gridDim.y limit (#27901)
     test_cases.emplace_back(new test_rms_norm_mul_rope({4, 1, 65536, 1}, 1e-6f, false, false, false, GGML_ROPE_TYPE_NORMAL));
     test_cases.emplace_back(new test_rms_norm_mul_rope({4, 1, 65536, 1}, 1e-6f, false, true,  false, GGML_ROPE_TYPE_NEOX));
+    for (int64_t n_seqs : {1, 2}) {
+        for (bool strided : {false, true}) {
+            for (bool use_silu : {false, true}) {
+                for (bool observe_state : {false, true}) {
+                    test_cases.emplace_back(new test_ssm_conv_inplace(n_seqs, strided, use_silu, observe_state));
+                }
+            }
+        }
+    }
+
     for (int64_t d_conv : {3, 4, 9}) {
         for (int64_t d_inner: {1024, 1536, 2048}) {
             test_cases.emplace_back(new test_ssm_conv(GGML_TYPE_F32, {d_conv, d_inner, 1, 1}, {d_conv, d_inner, 1, 1}));

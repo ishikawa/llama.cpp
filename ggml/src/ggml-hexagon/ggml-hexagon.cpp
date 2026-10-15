@@ -8859,6 +8859,10 @@ static bool ggml_hexagon_supported_roll(const struct ggml_hexagon_session * sess
 }
 
 static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
+    if (op->op == GGML_OP_SSM_CONV_INPLACE) {
+        return false;
+    }
+
     auto dev_ctx = static_cast<ggml_backend_hexagon_device_context *>(dev->context);
     auto sess    = dev_ctx->session();
 

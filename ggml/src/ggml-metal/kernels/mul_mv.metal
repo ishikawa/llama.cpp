@@ -3356,6 +3356,57 @@ void mmv_fn(
     disp_fn(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
 }
 
+inline uint iq2_s_ep_load32(device const uchar * p, bool aligned) {
+    if (aligned) {
+        return *((device const uint *)p);
+    }
+    return uint(p[0]) | (uint(p[1]) << 8) | (uint(p[2]) << 16) | (uint(p[3]) << 24);
+}
+
+template<typename y_t>
+inline float iq2_s_ep_dot32(uint q, uint sign, uchar qh, uchar sc, float db, y_t yl) {
+    const uchar4 qs = as_type<uchar4>(q);
+    const uchar4 signs = as_type<uchar4>(sign);
+    const float d1 = db * (0.5f + (sc & 0xf));
+    const float d2 = db * (0.5f + (sc >> 4));
+    float2 sum = {0.f};
+    for (short l = 0; l < 2; ++l) {
+        const int index1 = qs[l] | ((qh << (8-2*l)) & 0x300);
+        const int index2 = qs[l+2] | ((qh << (4-2*l)) & 0x300);
+        constant uchar * grid1 = (constant uchar *)(iq2s_grid + index1);
+        constant uchar * grid2 = (constant uchar *)(iq2s_grid + index2);
+        for (short j = 0; j < 8; ++j) {
+            sum[0] += yl[8*l+j] * float(grid1[j]) * select(1, -1, signs[l] & kmask_iq2xs[j]);
+            sum[1] += yl[8*l+j+16] * float(grid2[j]) * select(1, -1, signs[l+2] & kmask_iq2xs[j]);
+        }
+    }
+    return d1*sum[0] + d2*sum[1];
+}
+
+template<bool ALIGNED = false>
+inline float moe_gate_up_dot_iq2_s_ep(device const char * expert, ulong block, ulong blocks, short ib, thread const float * yl) {
+    device const uchar * payload = (device const uchar *)expert + 80*block;
+    const uint qs = iq2_s_ep_load32(payload + 4*ib, ALIGNED || blocks%2 == 0);
+    const uint signs = iq2_s_ep_load32(payload + 32 + 4*ib, ALIGNED || blocks%2 == 0);
+    const float d = ((device const half *)(expert + 80*blocks))[block];
+    return iq2_s_ep_dot32(qs, signs, payload[64+ib], payload[72+ib], d, yl);
+}
+
+inline float moe_gate_up_dot_iq2_s_ep_wide(device const char * expert, ulong block, ulong blocks, short half_block, threadgroup const float * y) {
+    device const uchar * payload = (device const uchar *)expert + 80*block;
+    const uint4 qs = *((device const uint4 *)(payload + 16*half_block));
+    const uint4 signs = *((device const uint4 *)(payload + 32 + 16*half_block));
+    const uint qh = *((device const uint *)(payload + 64 + 4*half_block));
+    const uint sc = *((device const uint *)(payload + 72 + 4*half_block));
+    const float d = ((device const half *)(expert + 80*blocks))[block];
+    float sum = 0.f;
+#pragma unroll
+    for (short i = 0; i < 4; ++i) {
+        sum += iq2_s_ep_dot32(qs[i], signs[i], uchar(qh >> (8*i)), uchar(sc >> (8*i)), d, y + 32*i);
+    }
+    return sum;
+}
+
 void kernel_mul_mv_iq2_s_ep_f32_impl(
         ggml_metal_kargs_mul_mv args,
         device const char * src0,
@@ -3369,20 +3420,18 @@ void kernel_mul_mv_iq2_s_ep_f32_impl(
     const int nb = args.ne00/256;
     device const float * y = (device const float *)(src1 + tgpig.y*args.nb11);
     float sum[2] = {0.f};
+    float yl[32];
     for (int ib32 = tiisg; ib32 < args.ne00/32; ib32 += 32) {
+        for (short i = 0; i < 32; ++i) {
+            yl[i] = y[32*ib32+i];
+        }
         for (short row = 0; row < 2 && first_row + row < args.ne01; ++row) {
-            float4x4 lo, hi;
             const ulong block = ulong(first_row + row)*nb + ib32/8;
-            dequantize_iq2_s_ep(src0, block, ulong(args.ne01)*nb, 2*(ib32%8), lo);
-            dequantize_iq2_s_ep(src0, block, ulong(args.ne01)*nb, 2*(ib32%8)+1, hi);
-            for (short i = 0; i < 16; ++i) {
-                sum[row] += y[32*ib32+i] * lo[i/4][i%4];
-                sum[row] += y[32*ib32+16+i] * hi[i/4][i%4];
-            }
+            sum[row] += moe_gate_up_dot_iq2_s_ep(src0, block, ulong(args.ne01)*nb, ib32%8, yl);
         }
     }
     for (short row = 0; row < 2; ++row) {
-        const float value = simd_sum(sum[row]);
+        const float value = simd_sum(sum[row])*0.25f;
         if (tiisg == 0 && first_row + row < args.ne0) {
             ((device float *)dst)[tgpig.y*args.ne0 + first_row + row] = value;
         }
@@ -3611,7 +3660,7 @@ inline float moe_gate_up_dot_iq3_s(device const block_iq3_s * xb, int ib, thread
     return d * (sum[0] + sum[1]);
 }
 
-template<typename block_t, int NR0, bool IQ3, bool TG, int DECODE = 0, bool EP = false>
+template<typename block_t, int NR0, bool IQ3, bool TG, int DECODE = 0>
 kernel void kernel_moe_gate_up(
         constant ggml_metal_kargs_mul_mv_id & args,
     device const char * gate,
@@ -3691,21 +3740,7 @@ kernel void kernel_moe_gate_up(
                 g = (device const block_t *)(weights[0] + row*args.nb01) + ibl;
                 u = (device const block_t *)(weights[1] + row*args.nb01) + ibl;
             }
-            if (EP) {
-                const ulong block = ulong(first_row + row)*(args.ne00/256) + ibl;
-                float4x4 gl, gh, ul, uh;
-                device const char * ge = gate + ulong(expert)*args.nb02;
-                device const char * ue = up + ulong(expert)*args.nb02;
-                const ulong blocks = ulong(args.ne01)*(args.ne00/256);
-                dequantize_iq2_s_ep(ge, block, blocks, 2*ib, gl);
-                dequantize_iq2_s_ep(ge, block, blocks, 2*ib+1, gh);
-                dequantize_iq2_s_ep(ue, block, blocks, 2*ib, ul);
-                dequantize_iq2_s_ep(ue, block, blocks, 2*ib+1, uh);
-                for (short i = 0; i < 16; ++i) {
-                    sum_gate[row] += yl[i]*gl[i/4][i%4] + yl[16+i]*gh[i/4][i%4];
-                    sum_up[row] += yl[i]*ul[i/4][i%4] + yl[16+i]*uh[i/4][i%4];
-                }
-            } else if (IQ3) {
+            if (IQ3) {
                 sum_gate[row] += moe_gate_up_dot_iq3_s((device const block_iq3_s *)g, ib, yl, shmem);
                 sum_up[row]   += moe_gate_up_dot_iq3_s((device const block_iq3_s *)u, ib, yl, shmem);
             } else if (DECODE == 2) {
@@ -3722,8 +3757,8 @@ kernel void kernel_moe_gate_up(
     }
 
     for (short row = 0; row < NR0; ++row) {
-        const float g = simd_sum(sum_gate[row]) * ((IQ3 || EP) ? 1.f : 0.25f);
-        const float u = simd_sum(sum_up[row])   * ((IQ3 || EP) ? 1.f : 0.25f);
+        const float g = simd_sum(sum_gate[row]) * (IQ3 ? 1.f : 0.25f);
+        const float u = simd_sum(sum_up[row])   * (IQ3 ? 1.f : 0.25f);
         if (tiisg == 0) {
             if (DECODE != 0) {
                 dst[uint(idx)*uint(args.ne0) + uint(first_row + row)] = (g / (1.f + exp(-g))) * u;
@@ -3734,8 +3769,71 @@ kernel void kernel_moe_gate_up(
     }
 }
 
+// Fusion admits complete eight-row tiles, so every expert base is 16-byte aligned.
+template<int VARIANT>
+kernel void kernel_moe_gate_up_iq2_s_ep(
+        constant ggml_metal_kargs_mul_mv_id & args,
+        device const char * gate,
+        device const char * up,
+        device const char * src1,
+        device const int32_t * ids,
+        device float * dst,
+        threadgroup char * shmem [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    const int first_row = (tgpig.x*FC_mul_mv_nsg + sgitg)*2;
+    const int idx = tgpig.z;
+    const int nb = args.ne00/256;
+    const ulong blocks = ulong(args.ne01)*nb;
+    const ulong offset = ulong(ids[idx])*args.nb02;
+    device const char * ge = gate + offset;
+    device const char * ue = up + offset;
+    device const float * y = (device const float *)(src1 + (idx%args.ne11)*args.nb11);
+    threadgroup float * sy = (threadgroup float *)shmem;
+    if (VARIANT == 2) {
+        for (int i = 32*sgitg + tiisg; i < args.ne00; i += 32*FC_mul_mv_nsg) {
+            sy[i] = y[i];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float sum_gate[2] = {0.f};
+    float sum_up[2] = {0.f};
+    if (VARIANT == 1) {
+        float yl[32];
+        for (int ib32 = tiisg; ib32 < args.ne00/32; ib32 += 32) {
+            for (short i = 0; i < 32; ++i) {
+                yl[i] = y[32*ib32+i];
+            }
+            for (short row = 0; row < 2; ++row) {
+                const ulong block = ulong(first_row + row)*nb + ib32/8;
+                sum_gate[row] += moe_gate_up_dot_iq2_s_ep<true>(ge, block, blocks, ib32%8, yl);
+                sum_up[row] += moe_gate_up_dot_iq2_s_ep<true>(ue, block, blocks, ib32%8, yl);
+            }
+        }
+    } else {
+        for (int ih = tiisg; ih < 2*nb; ih += 32) {
+            for (short row = 0; row < 2; ++row) {
+                const ulong block = ulong(first_row + row)*nb + ih/2;
+                sum_gate[row] += moe_gate_up_dot_iq2_s_ep_wide(ge, block, blocks, ih%2, sy + 128*ih);
+                sum_up[row] += moe_gate_up_dot_iq2_s_ep_wide(ue, block, blocks, ih%2, sy + 128*ih);
+            }
+        }
+    }
+    for (short row = 0; row < 2; ++row) {
+        const float g = simd_sum(sum_gate[row])*0.25f;
+        const float u = simd_sum(sum_up[row])*0.25f;
+        if (tiisg == 0) {
+            dst[ulong(idx)*args.ne0 + first_row + row] = (g/(1.f + exp(-g)))*u;
+        }
+    }
+}
+
+typedef decltype(kernel_moe_gate_up_iq2_s_ep<1>) kernel_moe_gate_up_iq2_s_ep_t;
+template [[host_name("kernel_moe_gate_up_iq2_s_ep")]] kernel kernel_moe_gate_up_iq2_s_ep_t kernel_moe_gate_up_iq2_s_ep<1>;
+template [[host_name("kernel_moe_gate_up_iq2_s_ep_v2")]] kernel kernel_moe_gate_up_iq2_s_ep_t kernel_moe_gate_up_iq2_s_ep<2>;
+
 typedef decltype(kernel_moe_gate_up<block_iq2_s, 2, false, false>) kernel_moe_gate_up_t;
-template [[host_name("kernel_moe_gate_up_iq2_s_ep")]] kernel kernel_moe_gate_up_t kernel_moe_gate_up<block_iq2_s, 2, false, false, 0, true>;
 template [[host_name("kernel_moe_gate_up_iq2_s_r2_tg0")]] kernel kernel_moe_gate_up_t kernel_moe_gate_up<block_iq2_s, 2, false, false>;
 template [[host_name("kernel_moe_gate_up_iq2_s_r2_tg1")]] kernel kernel_moe_gate_up_t kernel_moe_gate_up<block_iq2_s, 2, false, true>;
 template [[host_name("kernel_moe_gate_up_iq2_s_r4_tg0")]] kernel kernel_moe_gate_up_t kernel_moe_gate_up<block_iq2_s, 4, false, false>;

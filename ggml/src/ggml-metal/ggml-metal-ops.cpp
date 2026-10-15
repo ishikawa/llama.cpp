@@ -3051,7 +3051,7 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
         const ggml_tensor * out = ctx->node(idx + 2);
         const ggml_tensor * gate = out->src[0];
         const ggml_tensor * up = out->src[1];
-        auto pipeline = ggml_metal_library_get_pipeline_moe_gate_up(lib, gate);
+        auto pipeline = ggml_metal_library_get_pipeline_moe_gate_up(lib, gate, ggml_metal_device_get_props(ctx->dev)->max_theadgroup_memory_size);
         ggml_metal_kargs_mul_mv_id args = {};
         args.ne00 = gate->src[0]->ne[0];
         args.ne01 = gate->src[0]->ne[1];

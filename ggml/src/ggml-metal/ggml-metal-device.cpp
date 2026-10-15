@@ -1627,13 +1627,16 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
     return res;
 }
 
-ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_moe_gate_up(ggml_metal_library_t lib, const ggml_tensor * op) {
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_moe_gate_up(ggml_metal_library_t lib, const ggml_tensor * op, size_t max_tg_mem) {
     const char * nsg_env = std::getenv("GGML_METAL_MUL_MV_ID_DECODE_NSG");
     const char * nr0_env = std::getenv("GGML_METAL_MUL_MV_ID_DECODE_NR0");
     const char * tg_env = std::getenv("GGML_METAL_MUL_MV_ID_IQ2_S_TG");
     int nsg = nsg_env && std::strcmp(nsg_env, "8") == 0 ? 8 : 4;
     int nr0 = nr0_env && std::strcmp(nr0_env, "4") == 0 ? 4 : 2;
     const bool ep = op->src[0]->type == GGML_TYPE_IQ2_S_EP;
+    const char * ep_env = std::getenv("GGML_METAL_MOE_GATE_UP_IQ2_S_EP");
+    const bool ep_wide = ep && ep_env && std::strcmp(ep_env, "2") == 0 &&
+                         uint64_t(op->src[0]->ne[0]) <= max_tg_mem/sizeof(float);
     if (ep) {
         nr0 = 2;
         nsg = 4;
@@ -1667,7 +1670,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_moe_gate_up(ggml
     char name[256];
     snprintf(base, sizeof(base), "kernel_moe_gate_up_%s_r%d_tg%d", ggml_type_name(op->src[0]->type), nr0, tg);
     if (ep) {
-        snprintf(base, sizeof(base), "kernel_moe_gate_up_iq2_s_ep");
+        snprintf(base, sizeof(base), "kernel_moe_gate_up_iq2_s_ep%s", ep_wide ? "_v2" : "");
     }
     if (decode != 0) {
         snprintf(base, sizeof(base), "kernel_moe_gate_up_iq2_s_r%d_tg%d_v%d", nr0, tg, decode);
@@ -1683,7 +1686,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_moe_gate_up(ggml
     res.nsg = nsg;
     res.nr0 = nr0;
     res.nr1 = 1;
-    res.smem = iq3 ? 512*sizeof(uint32_t) : tg ? 1024*sizeof(uint64_t) : 0;
+    res.smem = ep_wide ? op->src[0]->ne[0]*sizeof(float) : iq3 ? 512*sizeof(uint32_t) : tg ? 1024*sizeof(uint64_t) : 0;
     return res;
 }
 

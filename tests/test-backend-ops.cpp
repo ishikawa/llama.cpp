@@ -13390,16 +13390,18 @@ static int test_iq2_s_ep(const char * backend_name) {
         fprintf(stderr, "IQ2_S_EP comparison requires a Metal backend\n");
         return 1;
     }
-    ggml_backend_ptr backend(ggml_backend_dev_init(dev, nullptr));
-    if (!backend) {
-        return 1;
-    }
     bool ok = true;
-    for (int test = 0; test < 5; ++test) {
-        const int64_t tokens = test < 2 ? 1 : test == 2 ? 7 : 512;
-        const bool fused = test == 1;
-        const bool f16 = test == 4;
+    for (int test = 0; test < 6; ++test) {
+        const int64_t tokens = test < 3 ? 1 : test == 3 ? 7 : 512;
+        const bool fused = test == 1 || test == 2;
+        const int ep_variant = test == 2 ? 2 : 1;
+        const bool f16 = test == 5;
         setenv("GGML_METAL_FUSE_MOE_GATE_UP", fused ? "1" : "0", 1);
+        setenv("GGML_METAL_MOE_GATE_UP_IQ2_S_EP", ep_variant == 2 ? "2" : "1", 1);
+        ggml_backend_ptr backend(ggml_backend_dev_init(dev, nullptr));
+        if (!backend) {
+            return 1;
+        }
         ggml_init_params params = { 128*ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
         ggml_context_ptr ctx(ggml_init(params));
         ggml_tensor * weights[2][2];
@@ -13495,7 +13497,7 @@ static int test_iq2_s_ep(const char * backend_name) {
             }
             const double nmse = error/std::max(norm, 1e-30);
             const bool pass = finite && nmse < 5e-7;
-            printf("IQ2_S_EP tokens=%lld fused=%d f16=%d output=%d nmse=%g %s\n", (long long)tokens, fused, f16, output, nmse, pass ? "OK" : "FAIL");
+            printf("IQ2_S_EP tokens=%lld fused=%d ep_variant=%d f16=%d output=%d nmse=%g %s\n", (long long)tokens, fused, ep_variant, f16, output, nmse, pass ? "OK" : "FAIL");
             ok = ok && pass;
         }
     }

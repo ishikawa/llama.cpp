@@ -392,6 +392,14 @@ bool llm_graph_gdn_conv_inplace_enabled() {
     return enabled;
 }
 
+bool llm_graph_gdn_diag_skip_handoff_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("LLAMA_GDN_DIAG_SKIP_HANDOFF");
+        return env && atoi(env) != 0;
+    }();
+    return enabled;
+}
+
 bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
     const auto * mctx = static_cast<const llama_memory_recurrent_context *>(params.mctx);
 

@@ -600,7 +600,10 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         (size_t) mem_size * row_size,
         (size_t) kv_head * row_size);
 
-    ggml_build_forward_expand(gf, ggml_cpy(ctx0, src, dst));
+    // timing diagnostic only: leave the snapshots out of the graph (rollback reads stale rows)
+    if (!llm_graph_gdn_diag_skip_handoff_enabled()) {
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, src, dst));
+    }
 
     return output;
 }

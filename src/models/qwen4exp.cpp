@@ -1079,6 +1079,21 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
         ggml_tensor * x = ggml_reshape_2d(ctx0, qkv_mixed, conv_channels, n_seqs);
         conv_output_proper = ggml_ssm_conv_inplace(ctx0, state, x, conv_kernel);
         ggml_build_forward_expand(gf, inp->s_copy);
+    } else if (llm_graph_gdn_diag_skip_handoff_enabled() && cparams.n_rs_seq > 0) {
+        // timing diagnostic only: read slot 0 of the head row in place, no gather and no per-slot write-back
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            LLAMA_LOG_INFO("%s: LLAMA_GDN_DIAG_SKIP_HANDOFF=1: GDN state hand-off is skipped with rollback snapshots (outputs are wrong)\n", __func__);
+        }
+        const int64_t state_cols = conv_kernel_size - 1;
+        GGML_ASSERT(conv_states_all->ne[0] == state_cols*conv_channels);
+        ggml_tensor * state = ggml_view_3d(ctx0, conv_states_all, state_cols, conv_channels, n_seqs,
+                state_cols*ggml_element_size(conv_states_all), conv_states_all->nb[1],
+                (size_t) inp->mctx->get_head()*conv_states_all->nb[1]);
+        ggml_tensor * conv_input = ggml_concat(ctx0, state, ggml_transpose(ctx0, qkv_mixed), 0);
+        conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
+        ggml_build_forward_expand(gf, inp->s_copy);
     } else {
         ggml_tensor * conv_input = build_conv_state_at(inp, conv_states_all, qkv_mixed,
                 conv_kernel_size - 1, conv_channels, il);
@@ -1086,7 +1101,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     }
 
     ggml_tensor * state = nullptr;
-    if (inp->s_identity && n_seq_tokens == 1) {
+    if ((inp->s_identity && n_seq_tokens == 1) || (llm_graph_gdn_diag_skip_handoff_enabled() && cparams.n_rs_seq > 0)) {
         // every sequence reads its own slot at head + i: read the states in place instead of gathering them
         // (the new states are still written back below by build_recurrent_attn).
         // Limited to one token per sequence: the decode kernel writes each state element from the thread that

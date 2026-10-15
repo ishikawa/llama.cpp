@@ -272,6 +272,8 @@ public:
 // LLAMA_GDN_STATE_VIEW=1 (read once)
 bool llm_graph_gdn_state_view_enabled();
 bool llm_graph_gdn_conv_inplace_enabled();
+// timing diagnostic: with rollback snapshots, skip the GDN state gathers and snapshot write-backs (outputs are wrong)
+bool llm_graph_gdn_diag_skip_handoff_enabled();
 
 class llm_graph_input_rs : public llm_graph_input_i {
 public:

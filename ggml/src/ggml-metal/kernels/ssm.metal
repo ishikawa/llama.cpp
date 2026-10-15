@@ -499,7 +499,7 @@ kernel void kernel_ssm_conv_inplace_f32(
         constant ggml_metal_kargs_ssm_conv_inplace & args,
         device void * state,
         device const void * x,
-        device const void * kernel,
+        device const void * conv_w,
         device float * dst,
         uint3 tgpig [[threadgroup_position_in_grid]],
         uint3 tpitg [[thread_position_in_threadgroup]]) {
@@ -509,7 +509,7 @@ kernel void kernel_ssm_conv_inplace_f32(
         return;
     }
     device float * h = (device float *) ((device char *) state + channel*args.state_nb1 + seq*args.state_nb2);
-    device const float * w = (device const float *) ((device const char *) kernel + channel*args.kernel_nb1);
+    device const float * w = (device const float *) ((device const char *) conv_w + channel*args.kernel_nb1);
     const float token = ((device const float *) ((device const char *) x + seq*args.x_nb1))[channel];
     float sum = 0.0f;
     for (int64_t j = 0; j < args.history; ++j) {

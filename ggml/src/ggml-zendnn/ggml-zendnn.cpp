@@ -692,7 +692,7 @@ static bool ggml_zendnn_adaptive_fallback_enabled() {
 }
 
 static bool ggml_backend_zendnn_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
-    if (op->op == GGML_OP_SSM_CONV_INPLACE) {
+    if (op->op == GGML_OP_SSM_CONV_INPLACE || op->op == GGML_OP_GATED_DELTA_NET_INPLACE) {
         return false;
     }
 

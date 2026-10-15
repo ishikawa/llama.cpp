@@ -20414,3 +20414,7 @@
 "CPU","SSM_CONV_INPLACE","state_cols=3,channels=10240,n_seqs=1,strided=1","support","1","yes","CPU"
 "CPU","SSM_CONV_INPLACE","state_cols=3,channels=10240,n_seqs=2,strided=0","support","1","yes","CPU"
 "CPU","SSM_CONV_INPLACE","state_cols=3,channels=10240,n_seqs=2,strided=1","support","1","yes","CPU"
+"CPU","GATED_DELTA_NET_INPLACE","nt=2,ns=1,K=2","support","1","yes","CPU"
+"CPU","GATED_DELTA_NET_INPLACE","nt=2,ns=2,K=2","support","1","yes","CPU"
+"CPU","SSM_CONV_SNAPSHOTS_INPLACE","nt=2,ns=1,K=2","support","1","yes","CPU"
+"CPU","SSM_CONV_SNAPSHOTS_INPLACE","nt=2,ns=2,K=2","support","1","yes","CPU"

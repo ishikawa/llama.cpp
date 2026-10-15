@@ -40,6 +40,7 @@ kernel void kernel_gated_delta_net_impl(
     const uint state_in_base = (i23*args.ne21 + i21)*S_v*S_v + i20*S_v;
     device const float * s_ptr = (device const float *) (s) + state_in_base;
 
+    // Each thread reads and writes the same state elements; all token steps use these registers, including when slot 0 aliases s.
     float ls[NSG];
 
     FOR_UNROLL (short j = 0; j < NSG; j++) {

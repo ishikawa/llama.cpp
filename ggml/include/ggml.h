@@ -582,6 +582,7 @@ extern "C" {
         GGML_OP_RWKV_WKV7,
         GGML_OP_SOLVE_TRI,
         GGML_OP_GATED_DELTA_NET,
+        GGML_OP_GATED_DELTA_NET_INPLACE,
         GGML_OP_LIGHTNING_INDEXER,
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
@@ -2657,6 +2658,17 @@ extern "C" {
         bool                  left,
         bool                  lower,
         bool                  uni);
+
+    // snapshots: [S_v*S_v*H, n_seqs, K], slot 0 is the final state; may alias state in slot 0.
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_inplace(
+            struct ggml_context * ctx, struct ggml_tensor * q, struct ggml_tensor * k,
+            struct ggml_tensor * v, struct ggml_tensor * g, struct ggml_tensor * beta,
+            struct ggml_tensor * state, struct ggml_tensor * snapshots);
+
+    // state: [history, channels, n_seqs, K], x: [channels, n_tokens, n_seqs]. Updates every history slot.
+    GGML_API struct ggml_tensor * ggml_ssm_conv_snapshots_inplace(
+            struct ggml_context * ctx, struct ggml_tensor * state,
+            struct ggml_tensor * x, struct ggml_tensor * kernel);
 
     // TODO: add ggml_gated_delta_net_set_bcast() to be able to configure Q, K broadcast type: tiled vs interleaved [TAG_GGML_GDN_BCAST]
     // ref: https://github.com/ggml-org/llama.cpp/pull/19468#discussion_r2786394306

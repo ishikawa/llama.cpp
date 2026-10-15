@@ -269,6 +269,9 @@ public:
     const llm_arch arch;
 };
 
+// LLAMA_GDN_STATE_VIEW=1 (read once)
+bool llm_graph_gdn_state_view_enabled();
+
 class llm_graph_input_rs : public llm_graph_input_i {
 public:
     llm_graph_input_rs(const llama_memory_recurrent_context * mctx) : mctx(mctx) {}
@@ -290,6 +293,10 @@ public:
     // used in view offsets, need to match for valid graph reuse
     uint32_t head;
     int32_t rs_z;
+
+    // opt-in (LLAMA_GDN_STATE_VIEW=1) and the state copies are the identity: the graph reads the states as a view
+    // of the cache instead of a gather, so a graph built with the other value cannot be reused
+    bool s_identity = false;
 };
 
 class llm_graph_input_cross_embd : public llm_graph_input_i {

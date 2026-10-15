@@ -1365,6 +1365,30 @@ ggml_tensor * llama_memory_recurrent_context::get_p_l(int32_t il) const {
     return mem->p_l[il];
 }
 
+bool llama_memory_recurrent_context::is_s_copy_identity() const {
+    if (is_full || status != LLAMA_MEMORY_STATUS_SUCCESS || ubatches.empty()) {
+        return false;
+    }
+
+    if (mem->n_rs_seq != 0 || mem->rs_z >= 0) {
+        return false;
+    }
+
+    const uint32_t n_seqs = ubatches[i_next].n_seqs;
+
+    if (mem->n != n_seqs) {
+        return false;
+    }
+
+    for (uint32_t i = 0; i < n_seqs; ++i) {
+        if (mem->cells[mem->head + i].src0 != (int32_t) (mem->head + i)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 int32_t llama_memory_recurrent_context::s_copy(int i) const {
     const uint32_t cell_idx = i + mem->head;
     const int32_t  src0     = mem->cells[cell_idx].src0;

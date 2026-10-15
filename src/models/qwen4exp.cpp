@@ -1068,9 +1068,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
             conv_kernel_size - 1, conv_channels, il);
 
     ggml_tensor * state = nullptr;
-    if (inp->s_identity) {
+    if (inp->s_identity && n_seq_tokens == 1) {
         // every sequence reads its own slot at head + i: read the states in place instead of gathering them
-        // (the new states are still written back below by build_recurrent_attn)
+        // (the new states are still written back below by build_recurrent_attn).
+        // Limited to one token per sequence: the decode kernel writes each state element from the thread that
+        // read it, so updating the cache in place is safe; the chunked prefill kernels are not checked for that
         static bool logged = false;
         if (!logged) {
             logged = true;

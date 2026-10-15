@@ -182,6 +182,10 @@ public:
 
     int32_t s_copy(int i) const;
 
+    // true when the state copies of the current ubatch are the identity (every sequence reads and writes its own slot
+    // at head + i, no extra states, no state to clear, no rollback slots), so the gather can be a view of the cache
+    bool is_s_copy_identity() const;
+
 private:
     const llama_memory_status status;
 

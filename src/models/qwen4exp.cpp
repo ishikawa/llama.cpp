@@ -1067,7 +1067,22 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     ggml_tensor * conv_input = build_conv_state_at(inp, conv_states_all, qkv_mixed,
             conv_kernel_size - 1, conv_channels, il);
 
-    ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+    ggml_tensor * state = nullptr;
+    if (inp->s_identity) {
+        // every sequence reads its own slot at head + i: read the states in place instead of gathering them
+        // (the new states are still written back below by build_recurrent_attn)
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            LLAMA_LOG_INFO("%s: LLAMA_GDN_STATE_VIEW=1: GDN recurrent states are read as a cache view when the state copies are the identity\n", __func__);
+        }
+        ggml_tensor * st = ggml_reshape_2d(ctx0, ssm_states_all, hparams.n_embd_s(), ssm_states_all->ne[1]);
+        state = ggml_view_2d(ctx0, st, hparams.n_embd_s(), n_seqs, st->nb[1], (size_t) inp->mctx->get_head()*st->nb[1]);
+        // keep s_copy allocated: the conv state gather may not use it, and set_input writes it every ubatch
+        ggml_build_forward_expand(gf, inp->s_copy);
+    } else {
+        state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+    }
     state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
     cb(state, "state_predelta", il);
 

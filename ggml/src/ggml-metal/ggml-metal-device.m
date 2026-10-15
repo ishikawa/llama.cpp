@@ -2080,6 +2080,9 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 (op->src[3] == NULL || ggml_is_contiguous_rows(op->src[3]));
         case GGML_OP_SSM_SCAN:
             return has_simdgroup_reduction;
+        case GGML_OP_SSM_CONV_INPLACE:
+            return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 &&
+                   op->src[1]->type == GGML_TYPE_F32 && op->src[2]->type == GGML_TYPE_F32;
         case GGML_OP_SSM_CONV:
             return has_simdgroup_reduction;
         case GGML_OP_RWKV_WKV6:

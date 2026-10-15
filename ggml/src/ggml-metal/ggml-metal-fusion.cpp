@@ -377,7 +377,7 @@ static bool ggml_metal_fusion_check_ssm_conv_silu(
     const ggml_tensor * conv = nodes[0];
     const ggml_tensor * un   = nodes[1];
 
-    if (conv->op != GGML_OP_SSM_CONV || un->op != GGML_OP_UNARY || un->src[0] != conv || un->src[1]) {
+    if ((conv->op != GGML_OP_SSM_CONV && conv->op != GGML_OP_SSM_CONV_INPLACE) || un->op != GGML_OP_UNARY || un->src[0] != conv || un->src[1]) {
         return false;
     }
 
@@ -1147,6 +1147,7 @@ static const std::vector<ggml_op> ops_snake = { GGML_OP_MUL, GGML_OP_SIN, GGML_O
 
 static const std::vector<ggml_op> ops_gdn_cache = { GGML_OP_GATED_DELTA_NET, GGML_OP_CPY };
 
+static const std::vector<ggml_op> ops_ssm_conv_inplace_silu = { GGML_OP_SSM_CONV_INPLACE, GGML_OP_UNARY };
 static const std::vector<ggml_op> ops_ssm_conv_silu = { GGML_OP_SSM_CONV, GGML_OP_UNARY };
 
 static const std::vector<ggml_op> ops_moe_reduce_2 = {
@@ -1212,6 +1213,7 @@ static const std::vector<ggml_metal_fusion> ggml_metal_fusions = {
     { GGML_METAL_FUSION_MOE_REDUCE,     ops_moe_reduce_6,           {},     true,  ggml_metal_fusion_check_moe_reduce },
     { GGML_METAL_FUSION_MOE_REDUCE,     ops_moe_reduce_7,           {},     true,  ggml_metal_fusion_check_moe_reduce },
     { GGML_METAL_FUSION_MOE_REDUCE,     ops_moe_reduce_8,           {},     true,  ggml_metal_fusion_check_moe_reduce },
+    { GGML_METAL_FUSION_SSM_CONV_INPLACE_SILU, ops_ssm_conv_inplace_silu, {}, false, ggml_metal_fusion_check_ssm_conv_silu },
     { GGML_METAL_FUSION_SSM_CONV_SILU,  ops_ssm_conv_silu,          {},     false, ggml_metal_fusion_check_ssm_conv_silu },
     { GGML_METAL_FUSION_MUL_MAT_ADD,    ops_mul_mat_add,            {},     false, ggml_metal_fusion_check_mul_mat_add },
 };

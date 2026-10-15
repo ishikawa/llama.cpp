@@ -417,6 +417,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_soft_max(ctx, idx);
             } break;
+        case GGML_OP_SSM_CONV_INPLACE:
+            {
+                n_fuse = ggml_metal_op_ssm_conv_inplace(ctx, idx);
+            } break;
         case GGML_OP_SSM_CONV:
             {
                 n_fuse = ggml_metal_op_ssm_conv(ctx, idx);
@@ -1759,6 +1763,34 @@ int ggml_metal_op_soft_max(ggml_metal_op_t ctx, int idx) {
     ggml_metal_encoder_dispatch_threadgroups(enc, ne01, ne02, ne03, nth, 1, 1);
 
     return 1;
+}
+
+int ggml_metal_op_ssm_conv_inplace(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+    int n_fuse = 1;
+    bool use_silu = false;
+    if (ctx->use_fusion()) {
+        int n = 1;
+        const ggml_metal_fusion * fusion = ctx->can_fuse(idx, GGML_METAL_FUSION_FULL, &n);
+        if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_SSM_CONV_INPLACE_SILU) {
+            n_fuse = n;
+            use_silu = true;
+            ctx->count_fusions(fusion);
+        }
+    }
+    const ggml_tensor * state = op->src[0];
+    ggml_metal_kargs_ssm_conv_inplace args = {
+        state->ne[0], state->ne[1], state->nb[1], state->nb[2], op->src[1]->nb[1], op->src[2]->nb[1],
+    };
+    auto pipeline = ggml_metal_library_get_pipeline_ssm_conv_inplace(ctx->lib, use_silu);
+    ggml_metal_encoder_set_pipeline(ctx->enc, pipeline);
+    ggml_metal_encoder_set_bytes(ctx->enc, &args, sizeof(args), 0);
+    for (int i = 0; i < 3; ++i) {
+        ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(op->src[i]), i + 1);
+    }
+    ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(ctx->node(idx + n_fuse - 1)), 4);
+    ggml_metal_encoder_dispatch_threadgroups(ctx->enc, (state->ne[1] + 127)/128, 1, state->ne[2], 128, 1, 1);
+    return n_fuse;
 }
 
 int ggml_metal_op_ssm_conv(ggml_metal_op_t ctx, int idx) {

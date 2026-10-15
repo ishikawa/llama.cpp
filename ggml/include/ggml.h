@@ -571,6 +571,7 @@ extern "C" {
         GGML_OP_FLASH_ATTN_EXT,
         GGML_OP_FLASH_ATTN_BACK,
         GGML_OP_SSM_CONV,
+        GGML_OP_SSM_CONV_INPLACE,
         GGML_OP_SSM_SCAN,
         GGML_OP_WIN_PART,
         GGML_OP_WIN_UNPART,
@@ -2532,6 +2533,15 @@ extern "C" {
            struct ggml_tensor  * v,
            struct ggml_tensor  * d,
            bool                  masked);
+
+    // Decode one token and shift state in place. All inputs are F32.
+    // state: [history, channels, sequences], x: [channels, sequences], kernel: [history + 1, channels].
+    // Rows may be strided. The output is [channels, sequences]. Order cache readers around this op.
+    GGML_API struct ggml_tensor * ggml_ssm_conv_inplace(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * state,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * kernel);
 
     GGML_API struct ggml_tensor * ggml_ssm_conv(
             struct ggml_context * ctx,

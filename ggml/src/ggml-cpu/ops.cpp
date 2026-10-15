@@ -12474,3 +12474,28 @@ void ggml_compute_forward_lightning_indexer(
         }
     }
 }
+
+void ggml_compute_forward_ssm_conv_inplace(const ggml_compute_params * params, ggml_tensor * dst) {
+    ggml_tensor * state = dst->src[0];
+    const ggml_tensor * x = dst->src[1];
+    const ggml_tensor * kernel = dst->src[2];
+    const int64_t nh = state->ne[0];
+    const int64_t channels = state->ne[1];
+    for (int64_t i = params->ith; i < channels*state->ne[2]; i += params->nth) {
+        const int64_t channel = i % channels;
+        const int64_t seq = i / channels;
+        float * h = (float *) ((char *) state->data + channel*state->nb[1] + seq*state->nb[2]);
+        const float * w = (const float *) ((const char *) kernel->data + channel*kernel->nb[1]);
+        const float token = *(const float *) ((const char *) x->data + channel*x->nb[0] + seq*x->nb[1]);
+        float sum = 0.0f;
+        for (int64_t j = 0; j < nh; ++j) {
+            sum += h[j]*w[j];
+        }
+        sum += token*w[nh];
+        for (int64_t j = 0; j + 1 < nh; ++j) {
+            h[j] = h[j + 1];
+        }
+        h[nh - 1] = token;
+        ((float *) dst->data)[i] = sum;
+    }
+}

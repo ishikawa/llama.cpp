@@ -936,6 +936,16 @@ typedef struct {
 } ggml_metal_kargs_ssm_conv;
 
 typedef struct {
+    int64_t history;
+    int64_t channels;
+    uint64_t state_nb1;
+    uint64_t state_nb2;
+    uint64_t x_nb1;
+    uint64_t kernel_nb1;
+} ggml_metal_kargs_ssm_conv_inplace;
+
+
+typedef struct {
     int64_t  d_state;
     int64_t  d_inner;
     int64_t  n_head;

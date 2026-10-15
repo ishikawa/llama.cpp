@@ -4427,6 +4427,10 @@ static bool ggml_webgpu_supported_qtype(ggml_type type) {
 }
 
 static bool ggml_backend_webgpu_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
+    if (op->op == GGML_OP_SSM_CONV_INPLACE) {
+        return false;
+    }
+
     ggml_backend_webgpu_device_context * ctx = static_cast<ggml_backend_webgpu_device_context *>(dev->context);
 
     ggml_tensor * src0 = op->src[0];

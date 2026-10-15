@@ -5748,8 +5748,8 @@ struct test_moe_gate_up_swiglu : public test_mul_mat_id {
     const bool up_first;
     const std::string fallback;
 
-    test_moe_gate_up_swiglu(ggml_type type, bool broadcast, bool up_first = false, std::string fallback = "none")
-        : test_mul_mat_id(type, GGML_TYPE_F32, 512, 10, broadcast, 640, 1, 2560),
+    test_moe_gate_up_swiglu(ggml_type type, bool broadcast, bool up_first = false, std::string fallback = "none", int64_t k = 2560, int64_t m = 640)
+        : test_mul_mat_id(type, GGML_TYPE_F32, 512, 10, broadcast, m, 1, k),
           up_first(up_first), fallback(fallback) {}
 
     std::string vars() override {
@@ -11355,6 +11355,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    test_cases.emplace_back(new test_moe_gate_up_swiglu(GGML_TYPE_IQ2_S, true, false, "none", 1280));
+    test_cases.emplace_back(new test_moe_gate_up_swiglu(GGML_TYPE_IQ2_S, true, false, "none", 1280, 642));
     for (const char * fallback : {"input", "ids", "mixed_type", "extra_use"}) {
         test_cases.emplace_back(new test_moe_gate_up_swiglu(GGML_TYPE_IQ2_S, true, false, fallback));
     }

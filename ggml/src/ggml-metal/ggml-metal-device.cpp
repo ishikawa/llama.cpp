@@ -1626,14 +1626,39 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_moe_gate_up(ggml
     const char * nsg_env = std::getenv("GGML_METAL_MUL_MV_ID_DECODE_NSG");
     const char * nr0_env = std::getenv("GGML_METAL_MUL_MV_ID_DECODE_NR0");
     const char * tg_env = std::getenv("GGML_METAL_MUL_MV_ID_IQ2_S_TG");
-    const int nsg = nsg_env && std::strcmp(nsg_env, "8") == 0 ? 8 : 4;
-    const int nr0 = nr0_env && std::strcmp(nr0_env, "4") == 0 ? 4 : 2;
+    int nsg = nsg_env && std::strcmp(nsg_env, "8") == 0 ? 8 : 4;
+    int nr0 = nr0_env && std::strcmp(nr0_env, "4") == 0 ? 4 : 2;
     const bool iq3 = op->src[0]->type == GGML_TYPE_IQ3_S;
-    const bool tg = iq3 || (tg_env && std::strcmp(tg_env, "1") == 0);
+    bool tg = iq3 || (tg_env && std::strcmp(tg_env, "1") == 0);
+
+    const char * decode_env = std::getenv("GGML_METAL_MOE_GATE_UP_IQ2_S_DECODE");
+    const bool iq2 = op->src[0]->type == GGML_TYPE_IQ2_S;
+    int decode = iq2 && decode_env && std::strcmp(decode_env, "1") == 0 ? 1 :
+                 iq2 && decode_env && std::strcmp(decode_env, "2") == 0 ? 2 : 0;
+    // v2 ignores NR0, NSG and TG overrides; each lane decodes one 8-element entry.
+    const int decode_nr0 = decode == 2 ? 2 : nr0;
+    const int decode_nsg = decode == 2 ? 4 : nsg;
+    // Partial blocks or row tiles retain the original pipeline and dispatch parameters.
+    if (op->src[0]->ne[0] % ggml_blck_size(op->src[0]->type) != 0 || op->src[0]->ne[1] % (decode_nr0*decode_nsg) != 0 ||
+        op->src[1]->ne[2] != 1 || op->src[2]->ne[1] != 1 || op->src[1]->nb[1] % 16 != 0) {
+        decode = 0;
+    }
+    // Decode variants use 32-bit offsets; larger tensors retain the original path.
+    if (ggml_nbytes(op->src[0]) > UINT32_MAX || ggml_nbytes(op->src[1]) > UINT32_MAX || ggml_nbytes(op) > UINT32_MAX) {
+        decode = 0;
+    }
+    if (decode == 2) {
+        nr0 = 2;
+        nsg = 4;
+        tg = false;
+    }
 
     char base[256];
     char name[256];
     snprintf(base, sizeof(base), "kernel_moe_gate_up_%s_r%d_tg%d", ggml_type_name(op->src[0]->type), nr0, tg);
+    if (decode != 0) {
+        snprintf(base, sizeof(base), "kernel_moe_gate_up_iq2_s_r%d_tg%d_v%d", nr0, tg, decode);
+    }
     snprintf(name, sizeof(name), "%s_nsg=%d", base, nsg);
     auto res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {

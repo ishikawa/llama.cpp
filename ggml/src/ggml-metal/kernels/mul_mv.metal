@@ -3505,6 +3505,52 @@ inline float moe_gate_up_dot_iq2_s(device const block_iq2_s * xb, int ib, thread
     return d1 * sum[0] + d2 * sum[1];
 }
 
+inline float moe_gate_up_dot_iq2_s_grid(uint2 grid, uint sign, float4 y0, float4 y1) {
+    const float4 g0 = float4(as_type<uchar4>(grid.x));
+    const float4 g1 = float4(as_type<uchar4>(grid.y));
+    const uint4 shift = uint4(0, 1, 2, 3);
+    const float4 s0 = float4(1.f) - 2.f*float4((uint4(sign) >> shift) & uint4(1));
+    const float4 s1 = float4(1.f) - 2.f*float4((uint4(sign >> 4) >> shift) & uint4(1));
+    return dot(y0, g0*s0) + dot(y1, g1*s1);
+}
+
+template<bool TG>
+inline float moe_gate_up_dot_iq2_s_decode(device const block_iq2_s * xb, int ib, thread const float4 * yl4, threadgroup char * shmem) {
+    const threadgroup uint2 * svalues = (const threadgroup uint2 *) shmem;
+    constant uint2 * values = (constant uint2 *) iq2s_grid;
+    device const uint8_t * qs = xb->qs + 4*ib;
+    const uint qh = xb->qh[ib];
+    const uint sc = xb->scales[ib];
+    device const uint8_t * signs = qs + QK_K/8;
+    const float db = float(xb->d);
+    const float d1 = db * (0.5f + (sc & 0xf));
+    const float d2 = db * (0.5f + (sc >> 4));
+    float2 sum = {0};
+#pragma unroll(2)
+    for (short l = 0; l < 2; ++l) {
+        const int index1 = qs[l+0] | ((qh << (8-2*l)) & 0x300);
+        const int index2 = qs[l+2] | ((qh << (4-2*l)) & 0x300);
+        const uint2 grid1 = TG ? svalues[index1] : values[index1];
+        const uint2 grid2 = TG ? svalues[index2] : values[index2];
+        const uint sign1 = signs[l+0];
+        const uint sign2 = signs[l+2];
+        sum[0] += moe_gate_up_dot_iq2_s_grid(grid1, sign1, yl4[2*l+0], yl4[2*l+1]);
+        sum[1] += moe_gate_up_dot_iq2_s_grid(grid2, sign2, yl4[2*l+4], yl4[2*l+5]);
+    }
+    return d1 * sum[0] + d2 * sum[1];
+}
+
+inline float moe_gate_up_dot_iq2_s_entry(device const block_iq2_s * xb, int entry, thread const float4 * yl4) {
+    const int ib = entry/4;
+    const int l = entry%4;
+    const int index = xb->qs[entry] | ((xb->qh[ib] << (8-2*l)) & 0x300);
+    const uint2 grid = ((constant uint2 *) iq2s_grid)[index];
+    const uint signs = xb->qs[QK_K/8 + entry];
+    const uint scale = xb->scales[ib];
+    const float d = float(xb->d) * (0.5f + ((scale >> (4*(l/2))) & 0xf));
+    return d * moe_gate_up_dot_iq2_s_grid(grid, signs, yl4[0], yl4[1]);
+}
+
 inline float moe_gate_up_dot_iq3_s(device const block_iq3_s * xb, int ib, thread const float * yl, threadgroup char * shmem) {
     threadgroup uint32_t * svalues = (threadgroup uint32_t *) shmem;
     device const block_iq3_s * xr = xb;
@@ -3531,7 +3577,7 @@ inline float moe_gate_up_dot_iq3_s(device const block_iq3_s * xb, int ib, thread
     return d * (sum[0] + sum[1]);
 }
 
-template<typename block_t, int NR0, bool IQ3, bool TG>
+template<typename block_t, int NR0, bool IQ3, bool TG, int DECODE = 0>
 kernel void kernel_moe_gate_up(
         constant ggml_metal_kargs_mul_mv_id & args,
     device const char * gate,
@@ -3546,14 +3592,30 @@ kernel void kernel_moe_gate_up(
     const int first_row = (tgpig.x*FC_mul_mv_nsg + sgitg)*NR0;
     const int idx = tgpig.z;
     const int expert = ids[idx];
-    const uint64_t offset = (uint64_t)expert*args.nb02 + (uint64_t)first_row*args.nb01;
-    device const char * weights[2] = {gate + offset, up + offset};
-    device const float * y = (device const float *)(src1 + (idx % args.ne11)*args.nb11);
+    device const char * weights[2];
+    device const float * y;
+    if (DECODE != 0) {
+        const uint offset = uint(expert)*uint(args.nb02) + uint(first_row)*uint(args.nb01);
+        weights[0] = gate + offset;
+        weights[1] = up + offset;
+        y = (device const float *)(src1 + uint(idx % args.ne11)*uint(args.nb11));
+    } else {
+        const uint64_t offset = (uint64_t)expert*args.nb02 + (uint64_t)first_row*args.nb01;
+        weights[0] = gate + offset;
+        weights[1] = up + offset;
+        y = (device const float *)(src1 + (idx % args.ne11)*args.nb11);
+    }
 
     if (IQ3) {
         threadgroup uint32_t * table = (threadgroup uint32_t *) shmem;
         for (int i = 32*sgitg + tiisg; i < 512; i += 32*FC_mul_mv_nsg) {
             table[i] = iq3s_grid[i];
+        }
+    } else if (TG && DECODE != 0) {
+        threadgroup uint2 * table = (threadgroup uint2 *) shmem;
+        constant uint2 * values = (constant uint2 *) iq2s_grid;
+        for (int i = 32*sgitg + tiisg; i < 1024; i += 32*FC_mul_mv_nsg) {
+            table[i] = values[i];
         }
     } else if (TG) {
         threadgroup uint64_t * table = (threadgroup uint64_t *) shmem;
@@ -3568,18 +3630,42 @@ kernel void kernel_moe_gate_up(
     float sum_gate[NR0] = {0.f};
     float sum_up[NR0] = {0.f};
     float yl[32];
-    for (int ib32 = tiisg; ib32 < args.ne00/32; ib32 += 32) {
-        for (short i = 0; i < 32; ++i) {
-            yl[i] = y[32*ib32 + i];
+    float4 yl4[8];
+    // v1 keeps 32-element slices; v2 assigns entry tiisg of each 256-element block.
+    for (int ib32 = DECODE == 2 ? 0 : tiisg; ib32 < args.ne00/(DECODE == 2 ? QK_K : 32); ib32 += DECODE == 2 ? 1 : 32) {
+        if (DECODE != 0) {
+            const int offset_y = DECODE == 2 ? QK_K*ib32 + 8*tiisg : 32*ib32;
+            device const float4 * y4 = (device const float4 *)(y + offset_y);
+#pragma unroll
+            for (short i = 0; i < (DECODE == 2 ? 2 : 8); ++i) {
+                yl4[i] = y4[i];
+            }
+        } else {
+            for (short i = 0; i < 32; ++i) {
+                yl[i] = y[32*ib32 + i];
+            }
         }
-        const int ibl = ib32/8;
+        const int ibl = DECODE == 2 ? ib32 : ib32/8;
         const int ib = ib32%8;
         for (short row = 0; row < NR0; ++row) {
-            device const block_t * g = (device const block_t *)(weights[0] + row*args.nb01) + ibl;
-            device const block_t * u = (device const block_t *)(weights[1] + row*args.nb01) + ibl;
+            device const block_t * g;
+            device const block_t * u;
+            if (DECODE != 0) {
+                g = (device const block_t *)(weights[0] + uint(row)*uint(args.nb01)) + ibl;
+                u = (device const block_t *)(weights[1] + uint(row)*uint(args.nb01)) + ibl;
+            } else {
+                g = (device const block_t *)(weights[0] + row*args.nb01) + ibl;
+                u = (device const block_t *)(weights[1] + row*args.nb01) + ibl;
+            }
             if (IQ3) {
                 sum_gate[row] += moe_gate_up_dot_iq3_s((device const block_iq3_s *)g, ib, yl, shmem);
                 sum_up[row]   += moe_gate_up_dot_iq3_s((device const block_iq3_s *)u, ib, yl, shmem);
+            } else if (DECODE == 2) {
+                sum_gate[row] += moe_gate_up_dot_iq2_s_entry((device const block_iq2_s *)g, tiisg, yl4);
+                sum_up[row]   += moe_gate_up_dot_iq2_s_entry((device const block_iq2_s *)u, tiisg, yl4);
+            } else if (DECODE == 1) {
+                sum_gate[row] += moe_gate_up_dot_iq2_s_decode<TG>((device const block_iq2_s *)g, ib, yl4, shmem);
+                sum_up[row]   += moe_gate_up_dot_iq2_s_decode<TG>((device const block_iq2_s *)u, ib, yl4, shmem);
             } else {
                 sum_gate[row] += moe_gate_up_dot_iq2_s<TG>((device const block_iq2_s *)g, ib, yl, shmem);
                 sum_up[row]   += moe_gate_up_dot_iq2_s<TG>((device const block_iq2_s *)u, ib, yl, shmem);
@@ -3591,7 +3677,11 @@ kernel void kernel_moe_gate_up(
         const float g = simd_sum(sum_gate[row]) * (IQ3 ? 1.f : 0.25f);
         const float u = simd_sum(sum_up[row])   * (IQ3 ? 1.f : 0.25f);
         if (tiisg == 0) {
-            dst[(uint64_t)idx*args.ne0 + first_row + row] = (g / (1.f + exp(-g))) * u;
+            if (DECODE != 0) {
+                dst[uint(idx)*uint(args.ne0) + uint(first_row + row)] = (g / (1.f + exp(-g))) * u;
+            } else {
+                dst[(uint64_t)idx*args.ne0 + first_row + row] = (g / (1.f + exp(-g))) * u;
+            }
         }
     }
 }
@@ -3603,3 +3693,8 @@ template [[host_name("kernel_moe_gate_up_iq2_s_r4_tg0")]] kernel kernel_moe_gate
 template [[host_name("kernel_moe_gate_up_iq2_s_r4_tg1")]] kernel kernel_moe_gate_up_t kernel_moe_gate_up<block_iq2_s, 4, false, true>;
 template [[host_name("kernel_moe_gate_up_iq3_s_r2_tg1")]] kernel kernel_moe_gate_up_t kernel_moe_gate_up<block_iq3_s, 2, true, true>;
 template [[host_name("kernel_moe_gate_up_iq3_s_r4_tg1")]] kernel kernel_moe_gate_up_t kernel_moe_gate_up<block_iq3_s, 4, true, true>;
+template [[host_name("kernel_moe_gate_up_iq2_s_r2_tg0_v1")]] kernel kernel_moe_gate_up_t kernel_moe_gate_up<block_iq2_s, 2, false, false, 1>;
+template [[host_name("kernel_moe_gate_up_iq2_s_r2_tg1_v1")]] kernel kernel_moe_gate_up_t kernel_moe_gate_up<block_iq2_s, 2, false, true, 1>;
+template [[host_name("kernel_moe_gate_up_iq2_s_r4_tg0_v1")]] kernel kernel_moe_gate_up_t kernel_moe_gate_up<block_iq2_s, 4, false, false, 1>;
+template [[host_name("kernel_moe_gate_up_iq2_s_r4_tg1_v1")]] kernel kernel_moe_gate_up_t kernel_moe_gate_up<block_iq2_s, 4, false, true, 1>;
+template [[host_name("kernel_moe_gate_up_iq2_s_r2_tg0_v2")]] kernel kernel_moe_gate_up_t kernel_moe_gate_up<block_iq2_s, 2, false, false, 2>;

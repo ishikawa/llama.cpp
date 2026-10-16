@@ -408,6 +408,13 @@ bool llm_graph_gdn_diag_skip_handoff_enabled() {
     return enabled;
 }
 
+// the GDN cache-view paths are chosen when the graph is built, so a graph built for one choice cannot run the other
+static bool can_reuse_rs_identity(const llm_graph_input_rs * inp, const llama_memory_recurrent_context * mctx) {
+    return inp->conv_identity     == (llm_graph_gdn_conv_inplace_enabled()    && mctx->is_s_copy_identity()) &&
+           inp->snapshot_identity == (llm_graph_gdn_snapshot_inplace_enabled() && mctx->is_s_copy_snapshot_identity()) &&
+           inp->s_identity        == (llm_graph_gdn_state_view_enabled()       && mctx->is_s_copy_identity());
+}
+
 bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
     const auto * mctx = static_cast<const llama_memory_recurrent_context *>(params.mctx);
 
@@ -421,9 +428,7 @@ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
 
     res &= head == mctx->get_head();
     res &= rs_z == mctx->get_rs_z();
-    res &= conv_identity == (llm_graph_gdn_conv_inplace_enabled() && mctx->is_s_copy_identity());
-    res &= snapshot_identity == (llm_graph_gdn_snapshot_inplace_enabled() && mctx->is_s_copy_snapshot_identity());
-    res &= s_identity == (llm_graph_gdn_state_view_enabled() && mctx->is_s_copy_identity());
+    res &= can_reuse_rs_identity(this, mctx);
 
     return res;
 }
@@ -1204,6 +1209,7 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= can_reuse_rs_identity(inp_rs.get(), mctx->get_recr());
 
     return res;
 }
@@ -1246,6 +1252,7 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= can_reuse_rs_identity(inp_rs.get(), mctx->get_recr());
 
     return res;
 }
@@ -1333,6 +1340,7 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= can_reuse_rs_identity(inp_rs.get(), mctx->get_recr());
 
     return res;
 }

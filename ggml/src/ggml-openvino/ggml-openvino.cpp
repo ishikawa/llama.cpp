@@ -1890,7 +1890,7 @@ static ggml_openvino_op_support ggml_backend_openvino_device_supports_op_impl(gg
 }
 
 static bool ggml_backend_openvino_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
-    if (op->op == GGML_OP_SSM_CONV_INPLACE) {
+    if (op->op == GGML_OP_SSM_CONV_INPLACE || op->op == GGML_OP_GATED_DELTA_NET_INPLACE) {
         return false;
     }
 

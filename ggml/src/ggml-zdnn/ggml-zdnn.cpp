@@ -77,7 +77,7 @@ static enum ggml_status ggml_zdnn_graph_compute(ggml_backend_t backend, ggml_cgr
 }
 
 static bool ggml_zdnn_supports_op(const ggml_backend_zdnn_device_context * ctx_dev, const ggml_tensor * op) {
-    if (op->op == GGML_OP_SSM_CONV_INPLACE) {
+    if (op->op == GGML_OP_SSM_CONV_INPLACE || op->op == GGML_OP_GATED_DELTA_NET_INPLACE) {
         return false;
     }
 

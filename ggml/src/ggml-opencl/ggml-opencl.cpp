@@ -8847,7 +8847,7 @@ inline bool use_q5_k_bin_kernels(const ggml_backend_opencl_context *backend_ctx,
 }
 
 static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
-    if (op->op == GGML_OP_SSM_CONV_INPLACE) {
+    if (op->op == GGML_OP_SSM_CONV_INPLACE || op->op == GGML_OP_GATED_DELTA_NET_INPLACE) {
         return false;
     }
 

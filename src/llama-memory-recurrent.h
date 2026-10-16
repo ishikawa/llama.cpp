@@ -185,6 +185,8 @@ public:
     // true when the state copies of the current ubatch are the identity (every sequence reads and writes its own slot
     // at head + i, no extra states, no state to clear, no rollback slots), so the gather can be a view of the cache
     bool is_s_copy_identity() const;
+    // Slot 0 reads only, with rollback snapshots and no pending rollback or extra states. Does not consume rs_idx.
+    bool is_s_copy_snapshot_identity() const;
 
 private:
     const llama_memory_status status;

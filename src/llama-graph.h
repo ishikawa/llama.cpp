@@ -270,6 +270,7 @@ public:
 };
 
 // LLAMA_GDN_STATE_VIEW=1 (read once)
+bool llm_graph_gdn_snapshot_inplace_enabled();
 bool llm_graph_gdn_state_view_enabled();
 bool llm_graph_gdn_conv_inplace_enabled();
 
@@ -298,6 +299,7 @@ public:
     // opt-in (LLAMA_GDN_STATE_VIEW=1) and the state copies are the identity: the graph reads the states as a view
     // of the cache instead of a gather, so a graph built with the other value cannot be reused
     bool s_identity = false;
+    bool snapshot_identity = false;
     bool conv_identity = false;
 };
 

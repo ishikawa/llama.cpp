@@ -789,12 +789,13 @@ static bool ggml_metal_fusion_match_moe_shared(
     const ggml_tensor * out = gf->nodes[raw_idxs[22]];
     const ggml_tensor * x = shared->src[0];
     const ggml_tensor * gate = sigmoid->src[0];
+    const bool two_token = ggml_metal_moe_fuse_two_token_enabled() && mul->src[0]->ne[2] == 2;
     if (sigmoid->op != GGML_OP_UNARY || ggml_get_unary_op(sigmoid) != GGML_UNARY_OP_SIGMOID ||
         shared->op != GGML_OP_MUL || out->op != GGML_OP_ADD || shared->src[1] != sigmoid ||
         out->src[0] != gf->nodes[raw_idxs[19]] || out->src[1] != shared || !x || !gate ||
         !ggml_are_same_shape(x, out) || gate->ne[0] != 1 || gate->ne[1] != out->ne[1] ||
         gate->ne[2] != 1 || gate->ne[3] != 1 ||
-        (mode == GGML_METAL_FUSION_FULL && mul->src[0]->ne[2] != 1)) { return false; }
+        (mode == GGML_METAL_FUSION_FULL && mul->src[0]->ne[2] != 1 && !two_token)) { return false; }
     for (const ggml_tensor * t : { x, gate, sigmoid, shared, out }) {
         if (t->type != GGML_TYPE_F32 || !ggml_is_contiguous(t)) { return false; }
     }
@@ -803,7 +804,7 @@ static bool ggml_metal_fusion_match_moe_shared(
         const ggml_tensor * t = gf->nodes[raw_idxs[j]];
         if (t->type != GGML_TYPE_F32 || t->ne[3] != 1) { return false; }
         if (t->nb[0] != sizeof(float) ||
-            ((j == 0 || j > 10 || mode == GGML_METAL_FUSION_FULL) && !ggml_is_contiguous(t))) { return false; }
+            ((j == 0 || j > 10 || (mode == GGML_METAL_FUSION_FULL && !two_token)) && !ggml_is_contiguous(t))) { return false; }
     }
     const int output = raw_idxs[22];
     return ggml_can_fuse_subgraph_ext(gf, raw_idxs, 23, ops_moe_reduce_shared.data(), &output, 1);
@@ -951,16 +952,20 @@ static bool ggml_metal_fusion_check_moe_gate_up(
     const ggml_tensor * wb = b->src[0];
     const ggml_tensor * x = a->src[1];
     const ggml_tensor * ids = a->src[2];
+    const int64_t n_tokens = x->ne[2];
+    if (n_tokens != 1 && !(ggml_metal_moe_fuse_two_token_enabled() && n_tokens == 2)) {
+        return false;
+    }
     if ((wa->type != GGML_TYPE_IQ2_S && wa->type != GGML_TYPE_IQ3_S) || wb->type != wa->type ||
         !ggml_are_same_shape(wa, wb) || !ggml_is_contiguous_1(wa) || !ggml_is_contiguous_1(wb) ||
         wa->ne[0] != 2560 || wa->ne[1] != 640 || wa->ne[3] != 1 ||
-        x->type != GGML_TYPE_F32 || x->ne[0] != wa->ne[0] || x->ne[2] != 1 || x->ne[3] != 1 || !ggml_is_contiguous_1(x) ||
+        x->type != GGML_TYPE_F32 || x->ne[0] != wa->ne[0] || x->ne[3] != 1 || !ggml_is_contiguous_1(x) ||
         ids->type != GGML_TYPE_I32 || ids->ne[0] <= 0 || ids->ne[0] > wa->ne[2] ||
-        ids->ne[1] != 1 || ids->ne[2] != 1 || ids->ne[3] != 1 || !ggml_is_contiguous_1(ids) ||
+        ids->ne[1] != n_tokens || ids->ne[2] != 1 || ids->ne[3] != 1 || !ggml_is_contiguous_1(ids) ||
         (x->ne[1] != 1 && x->ne[1] != ids->ne[0]) ||
         out->type != GGML_TYPE_F32 || !ggml_is_contiguous(out) ||
         !ggml_are_same_shape(a, b) || !ggml_are_same_shape(a, out) ||
-        out->ne[0] != wa->ne[1] || out->ne[1] != ids->ne[0] || out->ne[2] != 1 || out->ne[3] != 1) {
+        out->ne[0] != wa->ne[1] || out->ne[1] != ids->ne[0] || out->ne[2] != n_tokens || out->ne[3] != 1) {
         return false;
     }
     for (int i = 0; i < GGML_MAX_DIMS; ++i) {

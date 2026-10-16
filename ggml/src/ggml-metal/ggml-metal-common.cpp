@@ -5,7 +5,17 @@
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 
+#include <cstdlib>
+#include <cstring>
 #include <vector>
+
+bool ggml_metal_moe_fuse_two_token_enabled(void) {
+    static const bool enabled = [] {
+        const char * env = std::getenv("GGML_METAL_MOE_FUSE_TWO_TOKEN");
+        return env && std::strcmp(env, "1") == 0;
+    }();
+    return enabled;
+}
 
 // must stay in sync with the kernel_fwht_<type>_<N> templates in misc.metal. Widths up to
 // 512 run on the simdgroup kernel and need no threadgroup memory. The wider ones allocate

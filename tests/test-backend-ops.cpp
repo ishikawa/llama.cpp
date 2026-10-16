@@ -4733,7 +4733,7 @@ struct test_gdn_snapshot_inplace : public test_case {
         const size_t no = (conv ? S : S*H)*nt*ns;
         double result = 0;
         // Check output separately so the large unchanged cache cannot hide an output error.
-        for (const auto range : {std::make_pair(size_t(0), no), std::make_pair(no, n - no)}) {
+        for (const auto & range : {std::make_pair(size_t(0), no), std::make_pair(no, n - no)}) {
             result = std::max(result, std::max(nmse(a + range.first, expected.data() + range.first, range.second),
                                              nmse(b + range.first, expected.data() + range.first, range.second)));
         }

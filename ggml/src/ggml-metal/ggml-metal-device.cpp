@@ -1571,6 +1571,9 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
         nr0 = 4;
         nsg = 4;
         suffix = "_decode_r4";
+        if (ne12 == 2) {
+            ggml_metal_moe_fuse_two_token_log_once(1, "IQ4_NL down decode kernel");
+        }
     }
 
     snprintf(base, 256, "kernel_mul_mv_id_%s_%s%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1), suffix);

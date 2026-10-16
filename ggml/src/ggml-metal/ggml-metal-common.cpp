@@ -5,6 +5,7 @@
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <vector>
@@ -15,6 +16,13 @@ bool ggml_metal_moe_fuse_two_token_enabled(void) {
         return env && std::strcmp(env, "1") == 0;
     }();
     return enabled;
+}
+
+void ggml_metal_moe_fuse_two_token_log_once(int path, const char * name) {
+    static std::atomic<bool> logged[3] = {};
+    if (path >= 0 && path < 3 && !logged[path].exchange(true)) {
+        GGML_LOG_INFO("%s: GGML_METAL_MOE_FUSE_TWO_TOKEN=1: %s runs on a two-token batch\n", __func__, name);
+    }
 }
 
 // must stay in sync with the kernel_fwht_<type>_<N> templates in misc.metal. Widths up to

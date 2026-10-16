@@ -51,6 +51,8 @@ bool ggml_mem_ranges_check(ggml_mem_ranges_t mrs, const struct ggml_tensor * ten
 void ggml_graph_optimize(struct ggml_cgraph * gf);
 
 bool ggml_metal_moe_fuse_two_token_enabled(void);
+// logs once per path the first time a two-token MoE path is encoded
+void ggml_metal_moe_fuse_two_token_log_once(int path, const char * name);
 
 // mat-mat vs mat-vec dispatch; used by both supports_op and ggml_metal_op_mul_mat*
 bool ggml_metal_op_mul_mat_use_fwht (const struct ggml_tensor * op, size_t max_tg_mem);

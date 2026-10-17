@@ -1566,10 +1566,14 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id(ggml_m
 
     const char * decode = std::getenv("GGML_METAL_MUL_MV_ID_DECODE_IQ4_NL");
     if (decode && std::strcmp(decode, "1") == 0 && tsrc0 == GGML_TYPE_IQ4_NL &&
-        ne12 == 1 && tsrc1 == GGML_TYPE_F32 && !split && ne00 == 640 && ne01 % 16 == 0) {
+        (ne12 == 1 || (ggml_metal_moe_fuse_two_token_enabled() && ne12 == 2)) &&
+        tsrc1 == GGML_TYPE_F32 && !split && ne00 == 640 && ne01 % 16 == 0) {
         nr0 = 4;
         nsg = 4;
         suffix = "_decode_r4";
+        if (ne12 == 2) {
+            ggml_metal_moe_fuse_two_token_log_once(1, "IQ4_NL down decode kernel");
+        }
     }
 
     snprintf(base, 256, "kernel_mul_mv_id_%s_%s%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1), suffix);

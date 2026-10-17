@@ -3048,7 +3048,13 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
         const ggml_tensor * gate = out->src[0];
         const ggml_tensor * up = out->src[1];
         auto pipeline = ggml_metal_library_get_pipeline_moe_gate_up(lib, gate);
+        if (out->ne[2] == 2) {
+            ggml_metal_moe_fuse_two_token_log_once(0, "MoE gate/up/SwiGLU fusion");
+        }
         ggml_metal_kargs_mul_mv_id args = {};
+        args.nei0 = gate->src[2]->ne[0];
+        args.nbi1 = gate->src[2]->nb[1];
+        args.nb12 = gate->src[1]->nb[2];
         args.ne00 = gate->src[0]->ne[0];
         args.nb01 = gate->src[0]->nb[1];
         args.nb02 = gate->src[0]->nb[2];
@@ -3063,7 +3069,7 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(gate->src[2]), 4);
         ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(out), 5);
         ggml_metal_encoder_set_threadgroup_memory_size(enc, pipeline.smem, 0);
-        ggml_metal_encoder_dispatch_threadgroups(enc, out->ne[0]/(pipeline.nsg*pipeline.nr0), 1, out->ne[1], 32, pipeline.nsg, 1);
+        ggml_metal_encoder_dispatch_threadgroups(enc, out->ne[0]/(pipeline.nsg*pipeline.nr0), 1, out->ne[1]*out->ne[2], 32, pipeline.nsg, 1);
         return n_fuse;
     }
 
@@ -6114,6 +6120,10 @@ int ggml_metal_op_moe_reduce(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(gate), 5);
     }
     ggml_metal_encoder_dispatch_threadgroups(enc, (uint32_t) args.ne02, (uint32_t) n_col_tiles, 1, nth, 1, 1);
+
+    if (shared && args.ne02 == 2) {
+        ggml_metal_moe_fuse_two_token_log_once(2, "MoE reduce/shared fusion");
+    }
 
     if (!shared) {
         ctx->count_fusions(fusion);

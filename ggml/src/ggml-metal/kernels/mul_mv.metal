@@ -3503,10 +3503,12 @@ kernel void kernel_moe_gate_up(
         ushort sgitg [[simdgroup_index_in_threadgroup]]) {
     const int first_row = (tgpig.x*FC_mul_mv_nsg + sgitg)*NR0;
     const int idx = tgpig.z;
-    const int expert = ids[idx];
+    const int token = idx/args.nei0;
+    const int slot = idx%args.nei0;
+    const int expert = ((device const int32_t *)((device const char *)ids + (uint64_t)token*args.nbi1))[slot];
     const uint64_t offset = (uint64_t)expert*args.nb02 + (uint64_t)first_row*args.nb01;
     device const char * weights[2] = {gate + offset, up + offset};
-    device const float * y = (device const float *)(src1 + (idx % args.ne11)*args.nb11);
+    device const float * y = (device const float *)(src1 + (uint64_t)token*args.nb12 + (slot % args.ne11)*args.nb11);
 
     if (IQ3) {
         threadgroup uint32_t * table = (threadgroup uint32_t *) shmem;

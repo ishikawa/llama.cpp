@@ -1,6 +1,7 @@
 #pragma once
 
 #include "llama.h"
+#include "llama-step-timing.h"
 #include "llama-ext.h"
 #include "llama-cparams.h"
 #include "llama-graph.h"
@@ -59,7 +60,15 @@ struct llama_context {
     //   - etc.
     void sched_reserve();
 
-    void synchronize();
+    void synchronize(const char * caller = "internal");
+    void synchronize_backend(const char * caller);
+
+    template<bool timed> int decode_impl(const llama_batch_ext & batch_inp);
+    template<bool timed> llm_graph_result * process_ubatch_impl(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret);
+
+    const bool step_timing_enabled = llama_step_timing_enabled();
+    llama_step_timing_record * timing_decode = nullptr;
+    int64_t timing_decode_id = -1;
 
     const llama_model   & get_model()   const;
     const llama_cparams & get_cparams() const;

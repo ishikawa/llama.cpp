@@ -859,7 +859,10 @@ int ggml_metal_op_unary(ggml_metal_op_t ctx, int idx) {
         }
         if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_HC_LOWRANK) {
             auto pipeline = ggml_metal_library_get_pipeline_small_fusion(ctx->lib, "kernel_hc_lowrank_f32");
-            int32_t n = (int32_t) op->ne[0];
+            int32_t n = (int32_t) (op->ne[0]*op->ne[1]);
+            if (op->ne[1] == 2) {
+                ggml_metal_hc_fuse_two_token_log_once(0, "HC low-rank fusion");
+            }
             const int nth = std::min(256, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
             ggml_metal_encoder_set_pipeline(ctx->enc, pipeline);
             ggml_metal_encoder_set_bytes(ctx->enc, &n, sizeof(n), 0);
@@ -1620,6 +1623,9 @@ int ggml_metal_op_dsv4_hc(ggml_metal_op_t ctx, int idx) {
     }
 
     if (fusion) {
+        if (op->src[0]->ne[1] == 2) {
+            ggml_metal_hc_fuse_two_token_log_once(1, "HC post gate fusion");
+        }
         ctx->count_fusions(fusion);
     }
     return n_fuse;

@@ -25,6 +25,21 @@ void ggml_metal_moe_fuse_two_token_log_once(int path, const char * name) {
     }
 }
 
+bool ggml_metal_hc_fuse_two_token_enabled(void) {
+    static const bool enabled = [] {
+        const char * env = std::getenv("GGML_METAL_HC_FUSE_TWO_TOKEN");
+        return env && std::strcmp(env, "1") == 0;
+    }();
+    return enabled;
+}
+
+void ggml_metal_hc_fuse_two_token_log_once(int path, const char * name) {
+    static std::atomic<bool> logged[2] = {};
+    if (path >= 0 && path < 2 && !logged[path].exchange(true)) {
+        GGML_LOG_INFO("%s: GGML_METAL_HC_FUSE_TWO_TOKEN=1: %s runs on a two-token batch\n", __func__, name);
+    }
+}
+
 // must stay in sync with the kernel_fwht_<type>_<N> templates in misc.metal. Widths up to
 // 512 run on the simdgroup kernel and need no threadgroup memory. The wider ones allocate
 // float[N] per threadgroup, so they are only available where that fits.

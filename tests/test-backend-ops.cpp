@@ -4535,10 +4535,18 @@ struct test_dsv4_hc_pre : public test_dsv4_hc {
     }
 };
 
+static bool metal_hc_fuse_two_token_enabled() {
+    static const bool enabled = [] {
+        const char * env = std::getenv("GGML_METAL_HC_FUSE_TWO_TOKEN");
+        return env && std::strcmp(env, "1") == 0;
+    }();
+    return enabled;
+}
+
 struct test_dsv4_hc_post : public test_dsv4_hc {
     const char * metal_fusion_env() override { return "GGML_METAL_FUSE_HC_POST_GATE"; }
     const char * metal_fusion_label() override { return "SCALE+UNARY+SCALE+DSV4_HC_POST"; }
-    bool metal_fusion_expected() override { return n_tokens == 1 && identity && gated && !external; }
+    bool metal_fusion_expected() override { return (n_tokens == 1 || (n_tokens == 2 && metal_hc_fuse_two_token_enabled())) && identity && gated && !external; }
     const int64_t n_embd;
     const int64_t n_tokens;
     const bool    identity;
@@ -7859,7 +7867,7 @@ struct test_topk_moe : public test_case {
 struct test_hc_lowrank : public test_case {
     const char * metal_fusion_env() override { return "GGML_METAL_FUSE_HC_LOWRANK"; }
     const char * metal_fusion_label() override { return "SCALE+UNARY"; }
-    bool metal_fusion_expected() override { return tokens == 1 && !external && !bias; }
+    bool metal_fusion_expected() override { return (tokens == 1 || (tokens == 2 && metal_hc_fuse_two_token_enabled())) && !external && !bias; }
     const int64_t n;
     const int64_t tokens;
     const bool external;
@@ -10261,6 +10269,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     test_cases.emplace_back(new test_dsv4_hc_post(2560, 1, true, true));
+    test_cases.emplace_back(new test_dsv4_hc_post(2560, 2, true, true));
+    test_cases.emplace_back(new test_dsv4_hc_post(31, 2, true, true));
+    test_cases.emplace_back(new test_dsv4_hc_post(2560, 2, true, true, true));
+    test_cases.emplace_back(new test_dsv4_hc_post(31, 2, false, true));
     test_cases.emplace_back(new test_dsv4_hc_post(2560, 1, true, true, true));
     test_cases.emplace_back(new test_dsv4_hc_post(31, 1, true, true));
     test_cases.emplace_back(new test_dsv4_hc_post(31, 1, false, true));

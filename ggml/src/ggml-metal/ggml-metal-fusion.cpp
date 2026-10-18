@@ -186,7 +186,11 @@ static bool ggml_metal_fusion_check_hc_post_gate(
     if (mode == GGML_METAL_FUSION_STRUCTURAL) {
         return true;
     }
-    if (nodes[0]->ne[0] != 4 || nodes[0]->ne[1] != 1 || nodes[0]->ne[2] != 1 || nodes[0]->ne[3] != 1) {
+    const int64_t n_tokens = nodes[0]->ne[1];
+    if (n_tokens != 1 && !(ggml_metal_hc_fuse_two_token_enabled() && n_tokens == 2)) {
+        return false;
+    }
+    if (nodes[0]->ne[0] != 4 || nodes[0]->ne[2] != 1 || nodes[0]->ne[3] != 1) {
         return false;
     }
     for (int j = 0; j < 4; ++j) {
@@ -198,8 +202,8 @@ static bool ggml_metal_fusion_check_hc_post_gate(
     }
     const ggml_tensor * x = nodes[3]->src[0];
     const ggml_tensor * r = nodes[3]->src[1];
-    if (x->ne[0] <= 0 || x->ne[0] > INT32_MAX - 31 || x->ne[1] != 1 || x->ne[2] != 1 || x->ne[3] != 1 ||
-        r->ne[0] != x->ne[0] || r->ne[1] != 4 || r->ne[2] != 1 || r->ne[3] != 1 ||
+    if (x->ne[0] <= 0 || x->ne[0] > INT32_MAX - 31 || x->ne[1] != n_tokens || x->ne[2] != 1 || x->ne[3] != 1 ||
+        r->ne[0] != x->ne[0] || r->ne[1] != 4 || r->ne[2] != n_tokens || r->ne[3] != 1 ||
         !ggml_are_same_shape(r, nodes[3])) { return false; }
     const int output = node_idxs[idx + 3];
     return ggml_can_fuse_subgraph_ext(gf, node_idxs + idx, 4, fusion->ops.data(), &output, 1);
@@ -231,8 +235,9 @@ static bool ggml_metal_fusion_check_hc_lowrank(
     return
         nodes[0]->src[0]->type == GGML_TYPE_F32 && nodes[0]->type == GGML_TYPE_F32 && nodes[1]->type == GGML_TYPE_F32 &&
         ggml_is_contiguous(nodes[0]->src[0]) && ggml_is_contiguous(nodes[0]) && ggml_is_contiguous(nodes[1]) &&
-        nodes[0]->ne[1] == 1 && nodes[0]->ne[2] == 1 && nodes[0]->ne[3] == 1 &&
-        nodes[0]->ne[0] > 0 && nodes[0]->ne[0] <= INT32_MAX - 255 &&
+        (nodes[0]->ne[1] == 1 || (ggml_metal_hc_fuse_two_token_enabled() && nodes[0]->ne[1] == 2)) &&
+        nodes[0]->ne[2] == 1 && nodes[0]->ne[3] == 1 &&
+        nodes[0]->ne[0] > 0 && nodes[0]->ne[0] <= (INT32_MAX - 255)/nodes[0]->ne[1] &&
         ggml_get_op_params_f32(nodes[0], 0) == 0.25f && ggml_get_op_params_f32(nodes[0], 1) == 0.0f;
 }
 

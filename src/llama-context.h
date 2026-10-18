@@ -360,6 +360,10 @@ private:
     std::vector<swap_info> output_swaps;
 
     ggml_backend_sched_ptr sched;
+    ggml_backend_sched_ptr sched_slot_other;
+    llm_graph_result * gf_res_slot_other = nullptr;
+    bool sched_slot_outputs = true;
+    bool sched_slots_logged = false;
 
     bool sched_need_reserve = true;
 

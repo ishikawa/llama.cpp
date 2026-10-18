@@ -377,6 +377,17 @@ void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
 }
 
 bool llm_graph_gdn_snapshot_inplace_enabled() {
+    static const bool reuse_hybrid = [] {
+        const char * env = getenv("LLAMA_GRAPH_REUSE_HYBRID");
+        const bool enabled = env && atoi(env) != 0;
+        if (enabled) {
+            LLAMA_LOG_INFO("%s: LLAMA_GRAPH_REUSE_HYBRID=1: use dynamic snapshot gathers; retain topology checks\n", __func__);
+        }
+        return enabled;
+    }();
+    if (reuse_hybrid) {
+        return false;
+    }
     static const bool enabled = [] {
         const char * env = getenv("LLAMA_GDN_SNAPSHOT_INPLACE");
         return env && atoi(env) != 0;

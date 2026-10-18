@@ -75,6 +75,8 @@ typedef struct ggml_metal_encoder * ggml_metal_encoder_t;
 
 ggml_metal_encoder_t ggml_metal_encoder_init(ggml_metal_cmd_buf_t cmd_buf_raw, bool concurrent);
 void ggml_metal_encoder_free(ggml_metal_encoder_t encoder);
+void ggml_metal_encoder_profile(ggml_metal_encoder_t encoder, void * stats, bool timing);
+void ggml_metal_encoder_profile_node(ggml_metal_encoder_t encoder, const struct ggml_tensor * node, int fused_nodes, int saved_nodes);
 
 void ggml_metal_encoder_debug_group_push(ggml_metal_encoder_t encoder, const char * name);
 void ggml_metal_encoder_debug_group_pop (ggml_metal_encoder_t encoder);

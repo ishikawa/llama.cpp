@@ -2063,6 +2063,19 @@ kernel void kernel_mul_mv_q6_K_f32_two_token_nr4(
     kernel_mul_mv_q6_K_f32_two_token_impl<4, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg);
 }
 
+[[host_name("kernel_mul_mv_q6_K_f32_two_token_nr8")]]
+kernel void kernel_mul_mv_q6_K_f32_two_token_nr8(
+        constant ggml_metal_kargs_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+
+    kernel_mul_mv_q6_K_f32_two_token_impl<8, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg);
+}
+
 // ======================= "True" 2-bit
 
 template<int nr0, typename args_t>

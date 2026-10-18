@@ -1257,6 +1257,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
             case 1: suffix = "_two_token_nr1"; break;
             case 2: suffix = "_two_token_nr2"; break;
             case 4: suffix = "_two_token_nr4"; break;
+            case 8: suffix = "_two_token_nr8"; break;
             default: GGML_ABORT("invalid two-token nr0");
         }
     }

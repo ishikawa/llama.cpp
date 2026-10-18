@@ -33,7 +33,7 @@ const ggml_metal_mul_mv_q6_k_two_token_config * ggml_metal_mul_mv_q6_k_two_token
             return result;
         }
         result.enabled = true;
-        result.nr0 = ggml_metal_mul_mv_q6_k_two_token_env("GGML_METAL_MUL_MV_Q6_K_TWO_TOKEN_NR0", false);
+        result.nr0 = ggml_metal_mul_mv_q6_k_two_token_env("GGML_METAL_MUL_MV_Q6_K_TWO_TOKEN_NR0", true);
         result.nsg = ggml_metal_mul_mv_q6_k_two_token_env("GGML_METAL_MUL_MV_Q6_K_TWO_TOKEN_NSG", true);
         GGML_LOG_INFO("%s: GGML_METAL_MUL_MV_Q6_K_TWO_TOKEN=1: enabled nr0=%d nsg=%d\n", __func__, result.nr0, result.nsg);
         static struct report_t {

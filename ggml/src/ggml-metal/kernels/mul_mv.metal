@@ -2024,8 +2024,8 @@ void kernel_mul_mv_q6_K_f32_two_token_impl(
     }
 }
 
-[[host_name("kernel_mul_mv_q6_K_f32_two_token")]]
-kernel void kernel_mul_mv_q6_K_f32_two_token(
+[[host_name("kernel_mul_mv_q6_K_f32_two_token_nr1")]]
+kernel void kernel_mul_mv_q6_K_f32_two_token_nr1(
         constant ggml_metal_kargs_mul_mv & args,
         device const char * src0,
         device const char * src1,
@@ -2034,7 +2034,33 @@ kernel void kernel_mul_mv_q6_K_f32_two_token(
         ushort tiisg[[thread_index_in_simdgroup]],
         ushort sgitg[[simdgroup_index_in_threadgroup]]) {
 
-    kernel_mul_mv_q6_K_f32_two_token_impl<N_R0_Q6_K, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg);
+    kernel_mul_mv_q6_K_f32_two_token_impl<1, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg);
+}
+
+[[host_name("kernel_mul_mv_q6_K_f32_two_token_nr2")]]
+kernel void kernel_mul_mv_q6_K_f32_two_token_nr2(
+        constant ggml_metal_kargs_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+
+    kernel_mul_mv_q6_K_f32_two_token_impl<2, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg);
+}
+
+[[host_name("kernel_mul_mv_q6_K_f32_two_token_nr4")]]
+kernel void kernel_mul_mv_q6_K_f32_two_token_nr4(
+        constant ggml_metal_kargs_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+
+    kernel_mul_mv_q6_K_f32_two_token_impl<4, constant ggml_metal_kargs_mul_mv &>(args, src0, src1, dst, nullptr, tgpig, tiisg, sgitg);
 }
 
 // ======================= "True" 2-bit

@@ -1249,8 +1249,16 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
     }
 
     if (ggml_metal_op_mul_mat_use_q6_k_two_token(op)) {
+        const auto * config = ggml_metal_mul_mv_q6_k_two_token_get_config();
+        nr0 = config->nr0;
         nr1 = 2;
-        suffix = "_two_token";
+        nsg = config->nsg;
+        switch (nr0) {
+            case 1: suffix = "_two_token_nr1"; break;
+            case 2: suffix = "_two_token_nr2"; break;
+            case 4: suffix = "_two_token_nr4"; break;
+            default: GGML_ABORT("invalid two-token nr0");
+        }
     }
 
     GGML_ASSERT(ne12 <= INT16_MAX && ne13 <= INT16_MAX);

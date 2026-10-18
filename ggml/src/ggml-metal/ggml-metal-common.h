@@ -63,6 +63,13 @@ bool ggml_metal_op_mul_mat_use_fwht (const struct ggml_tensor * op, size_t max_t
 bool ggml_metal_op_mul_mat_use_mm   (const struct ggml_tensor * op, bool has_simdgroup_mm);
 bool ggml_metal_op_mul_mat_id_use_mm(const struct ggml_tensor * op, bool has_simdgroup_mm);
 
+struct ggml_metal_mul_mv_q6_k_two_token_config {
+    bool enabled;
+    int nr0;
+    int nsg;
+};
+
+const struct ggml_metal_mul_mv_q6_k_two_token_config * ggml_metal_mul_mv_q6_k_two_token_get_config(void);
 bool ggml_metal_mul_mv_q6_k_two_token_enabled(void);
 void ggml_metal_mul_mv_q6_k_two_token_count_dispatch(void);
 bool ggml_metal_op_mul_mat_use_q6_k_two_token(const struct ggml_tensor * op);

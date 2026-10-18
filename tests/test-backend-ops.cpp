@@ -11340,6 +11340,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, m, 2, k, {1, 1}, {1, 1}));
     }
 
+    for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{{640, 2560}, {10240, 2560}, {2560, 6144}, {6144, 2560}, {12288, 2560}, {512, 2560}}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, m, 2, k, {1, 1}, {1, 1}));
+    }
+
     // few src1 rows (speculative verify): odd m, a single K block, long K, every tile width, broadcast batches
     for (int64_t n : {2, 3, 5, 8, 9, 13, 16}) {
         for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{{40, 32}, {100, 96}, {1000, 5120}, {3000, 1024}, {6144, 5120}, {17408, 512}}) {
@@ -12839,6 +12843,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             for (ggml_type type_b : {GGML_TYPE_F32}) {
                 test_cases.emplace_back(new test_mul_mat(type_a, type_b, 4096, bs, 14336, {1,  1}, {1, 1}));
             }
+        }
+    }
+
+    for (auto [m, k] : std::vector<std::pair<int64_t, int64_t>>{{640, 2560}, {10240, 2560}, {2560, 6144}, {6144, 2560}, {12288, 2560}, {512, 2560}, {248320, 2560}}) {
+        for (int64_t n : {1, 2}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, m, n, k, {1, 1}, {1, 1}));
         }
     }
 

@@ -12,20 +12,41 @@
 
 static std::atomic<uint64_t> ggml_metal_mul_mv_q6_k_two_token_dispatches{0};
 
-bool ggml_metal_mul_mv_q6_k_two_token_enabled(void) {
-    static const bool enabled = [] {
+static int ggml_metal_mul_mv_q6_k_two_token_env(const char * name, bool allow_eight) {
+    const char * env = std::getenv(name);
+    if (!env) {
+        return 2;
+    }
+    if (std::strcmp(env, "1") == 0) { return 1; }
+    if (std::strcmp(env, "2") == 0) { return 2; }
+    if (std::strcmp(env, "4") == 0) { return 4; }
+    if (allow_eight && std::strcmp(env, "8") == 0) { return 8; }
+    GGML_LOG_WARN("%s: invalid %s='%s', using 2\n", __func__, name, env);
+    return 2;
+}
+
+const ggml_metal_mul_mv_q6_k_two_token_config * ggml_metal_mul_mv_q6_k_two_token_get_config(void) {
+    static const ggml_metal_mul_mv_q6_k_two_token_config config = [] {
+        ggml_metal_mul_mv_q6_k_two_token_config result = { false, 2, 2 };
         const char * env = std::getenv("GGML_METAL_MUL_MV_Q6_K_TWO_TOKEN");
         if (!env || std::strcmp(env, "1") != 0) {
-            return false;
+            return result;
         }
-        GGML_LOG_INFO("%s: GGML_METAL_MUL_MV_Q6_K_TWO_TOKEN=1: enabled\n", __func__);
+        result.enabled = true;
+        result.nr0 = ggml_metal_mul_mv_q6_k_two_token_env("GGML_METAL_MUL_MV_Q6_K_TWO_TOKEN_NR0", false);
+        result.nsg = ggml_metal_mul_mv_q6_k_two_token_env("GGML_METAL_MUL_MV_Q6_K_TWO_TOKEN_NSG", true);
+        GGML_LOG_INFO("%s: GGML_METAL_MUL_MV_Q6_K_TWO_TOKEN=1: enabled nr0=%d nsg=%d\n", __func__, result.nr0, result.nsg);
         static struct report_t {
             ~report_t() { fprintf(stderr, "GGML_METAL_MUL_MV_Q6_K_TWO_TOKEN: replaced %llu dispatches\n", (unsigned long long) ggml_metal_mul_mv_q6_k_two_token_dispatches.load()); }
         } report;
         (void) report;
-        return true;
+        return result;
     }();
-    return enabled;
+    return &config;
+}
+
+bool ggml_metal_mul_mv_q6_k_two_token_enabled(void) {
+    return ggml_metal_mul_mv_q6_k_two_token_get_config()->enabled;
 }
 
 void ggml_metal_mul_mv_q6_k_two_token_count_dispatch(void) {

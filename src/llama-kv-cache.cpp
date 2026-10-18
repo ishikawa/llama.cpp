@@ -414,52 +414,23 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
         p1 = std::numeric_limits<llama_pos>::max();
     }
 
-    if (seq_id >= 0) {
-        auto & cells = v_cells[seq_to_stream[seq_id]];
-        auto & head  = v_heads[seq_to_stream[seq_id]];
-
-        uint32_t new_head = cells.size();
-
-        for (uint32_t i = 0; i < cells.size(); ++i) {
-            if (!cells.pos_in(i, p0, p1)) {
-                continue;
-            }
-
-            if (cells.seq_has(i, seq_id) && cells.seq_rm(i, seq_id)) {
-                if (new_head == cells.size()) {
-                    new_head = i;
-                }
-            }
+    static const bool fast = [] {
+        const char * env = getenv("LLAMA_SEQ_RM_FAST");
+        const bool enabled = env && atoi(env) != 0;
+        if (enabled) {
+            LLAMA_LOG_INFO("%s: LLAMA_SEQ_RM_FAST=1: indexed sequence removal enabled\n", "llama_kv_cache::seq_rm");
         }
+        return enabled;
+    }();
 
-        // If we freed up a slot, set head to it so searching can start there.
+    const uint32_t s0 = seq_id >= 0 ? seq_to_stream[seq_id] : 0;
+    const uint32_t s1 = seq_id >= 0 ? s0 + 1 : n_stream;
+    for (uint32_t s = s0; s < s1; ++s) {
+        auto & cells = v_cells[s];
+        auto & head  = v_heads[s];
+        const uint32_t new_head = cells.seq_rm_range(seq_id, p0, p1, fast);
         if (new_head != cells.size() && new_head < head) {
             head = new_head;
-        }
-    } else {
-        // match any sequence
-        for (uint32_t s = 0; s < n_stream; ++s) {
-            auto & cells = v_cells[s];
-            auto & head  = v_heads[s];
-
-            uint32_t new_head = cells.size();
-
-            for (uint32_t i = 0; i < cells.size(); ++i) {
-                if (!cells.pos_in(i, p0, p1)) {
-                    continue;
-                }
-
-                cells.rm(i);
-
-                if (new_head == cells.size()) {
-                    new_head = i;
-                }
-            }
-
-            // If we freed up a slot, set head to it so searching can start there.
-            if (new_head != cells.size() && new_head < head) {
-                head = new_head;
-            }
         }
     }
 

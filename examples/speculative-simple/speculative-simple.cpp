@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <clocale>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <cinttypes>
 #include <string>
@@ -25,6 +26,12 @@ static int speculative_simple_main(int argc, char ** argv) {
 
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_SPECULATIVE)) {
         return 1;
+    }
+
+    const char * env_force_accept = std::getenv("LLAMA_SPEC_DIAG_FORCE_ACCEPT");
+    const bool force_accept = env_force_accept && std::strcmp(env_force_accept, "1") == 0;
+    if (force_accept) {
+        LOG_INF("speculative: LLAMA_SPEC_DIAG_FORCE_ACCEPT=1 (diagnostic, timing only)\n");
     }
 
     if (params.n_predict < -1) {
@@ -272,7 +279,20 @@ static int speculative_simple_main(int argc, char ** argv) {
         // available logits from the batch and sample the next token until we run out of logits or the sampler
         // disagrees with the draft
         //
-        auto ids = common_sampler_sample_and_accept_n(smpl.get(), ctx_tgt, draft);
+        llama_tokens ids;
+        if (force_accept) {
+            ids.reserve(n_draft + 1);
+            for (size_t i = 0; i < n_draft; ++i) {
+                common_sampler_sample(smpl.get(), ctx_tgt, i);
+                common_sampler_accept(smpl.get(), draft[i], true);
+                ids.push_back(draft[i]);
+            }
+            const llama_token id = common_sampler_sample(smpl.get(), ctx_tgt, n_draft);
+            common_sampler_accept(smpl.get(), id, true);
+            ids.push_back(id);
+        } else {
+            ids = common_sampler_sample_and_accept_n(smpl.get(), ctx_tgt, draft);
+        }
 
         //LOG_DBG("ids: %s\n", string_from(ctx_tgt, ids).c_str());
 

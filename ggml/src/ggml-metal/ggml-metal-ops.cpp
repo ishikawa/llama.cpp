@@ -1,5 +1,7 @@
 #include "ggml-metal-ops.h"
 
+#include <atomic>
+
 #include "ggml.h"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
@@ -2825,11 +2827,55 @@ static int ggml_metal_op_mul_mat_mv(ggml_metal_op_t ctx, int idx) {
     return 1;
 }
 
+// diagnostic: zero-fill dst instead of the real MUL_MAT (see GGML_METAL_MUL_MAT_DIAG_SKIP)
+static int ggml_metal_op_diag_zero(ggml_metal_op_t ctx, ggml_tensor * op, std::atomic<uint64_t> & counter) {
+    GGML_ASSERT(op->type == GGML_TYPE_F32);
+
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    ggml_metal_kargs_diag_zero args = { /*.n =*/ (int64_t) (ggml_nbytes(op)/sizeof(float)) };
+
+    auto pipeline = ggml_metal_library_get_pipeline_diag_zero(ctx->lib);
+
+    ggml_metal_encoder_set_pipeline(enc, pipeline);
+    ggml_metal_encoder_set_bytes   (enc, &args, sizeof(args), 0);
+    ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op), 1);
+
+    const int nth = 256;
+    ggml_metal_encoder_dispatch_threadgroups(enc, (args.n + nth - 1)/nth, 1, 1, nth, 1, 1);
+
+    counter++;
+
+    return 1;
+}
+
+static int ggml_metal_op_mul_mat_diag_skip(ggml_metal_op_t ctx, ggml_tensor * op) {
+    static std::atomic<uint64_t> n_skipped{0};
+    static struct report_t {
+        ~report_t() { fprintf(stderr, "GGML_METAL_MUL_MAT_DIAG_SKIP: replaced %llu dispatches\n", (unsigned long long) n_skipped.load()); }
+    } report;
+    (void) report;
+    return ggml_metal_op_diag_zero(ctx, op, n_skipped);
+}
+
+static int ggml_metal_op_mul_mat_id_diag_skip(ggml_metal_op_t ctx, ggml_tensor * op) {
+    static std::atomic<uint64_t> n_skipped{0};
+    static struct report_t {
+        ~report_t() { fprintf(stderr, "GGML_METAL_MUL_MAT_ID_DIAG_SKIP: replaced %llu dispatches\n", (unsigned long long) n_skipped.load()); }
+    } report;
+    (void) report;
+    return ggml_metal_op_diag_zero(ctx, op, n_skipped);
+}
+
 int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
     ggml_tensor * op = ctx->node(idx);
 
     ggml_metal_library_t lib = ctx->lib;
     ggml_metal_encoder_t enc = ctx->enc;
+
+    if (ggml_metal_mul_mat_diag_skip(op)) {
+        return ggml_metal_op_mul_mat_diag_skip(ctx, op);
+    }
 
     const ggml_metal_device_props * props_dev = ggml_metal_device_get_props(ctx->dev);
 
@@ -3063,6 +3109,10 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
 
     ggml_metal_library_t lib = ctx->lib;
     ggml_metal_encoder_t enc = ctx->enc;
+
+    if (ggml_metal_mul_mat_id_diag_skip(op)) {
+        return ggml_metal_op_mul_mat_id_diag_skip(ctx, op);
+    }
 
     const int n_fuse = ggml_metal_op_try_fusion(ctx, idx, GGML_METAL_FUSION_MOE_GATE_UP);
     if (n_fuse == 3) {

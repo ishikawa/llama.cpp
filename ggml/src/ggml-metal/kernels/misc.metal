@@ -313,6 +313,15 @@ kernel void kernel_memset(
     dst[tpig] = args.val;
 }
 
+kernel void kernel_diag_zero_f32(
+        constant ggml_metal_kargs_diag_zero & args,
+        device float * dst,
+        uint tpig[[thread_position_in_grid]]) {
+    if ((int64_t) tpig < args.n) {
+        dst[tpig] = 0.0f;
+    }
+}
+
 typedef decltype(kernel_memset<int64_t>) kernel_memset_t;
 
 template [[host_name("kernel_memset_i64")]] kernel kernel_memset_t kernel_memset<int64_t>;

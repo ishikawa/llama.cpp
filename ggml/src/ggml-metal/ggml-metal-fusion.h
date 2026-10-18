@@ -18,6 +18,12 @@ extern "C" {
 
 struct ggml_metal_device_props;
 
+// diagnostic only: GGML_METAL_MUL_MAT_DIAG_SKIP=<type,...> replaces MUL_MAT nodes whose src0 type is listed
+// with a zero fill of dst; such nodes never join a fusion
+bool ggml_metal_mul_mat_diag_skip(const struct ggml_tensor * t);
+// same for MUL_MAT_ID (GGML_METAL_MUL_MAT_ID_DIAG_SKIP)
+bool ggml_metal_mul_mat_id_diag_skip(const struct ggml_tensor * t);
+
 // the maximum number of nodes that can be fused in a single kernel
 // (the opt-in MoE shared merge permits a raw packed span of 32 nodes, including views)
 #define GGML_METAL_FUSION_MAX 16

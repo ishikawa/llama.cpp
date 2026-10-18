@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <set>
@@ -1379,6 +1380,54 @@ static bool ggml_metal_fusion_check_memory_ranges(
 
 // find the longest pattern matching the node sequence starting at idx
 // (idx is a position in node_idxs, which maps to graph node indices)
+static std::vector<std::string> ggml_metal_diag_skip_parse(const char * var) {
+    std::vector<std::string> res;
+    const char * env = std::getenv(var);
+    if (!env || !*env) {
+        return res;
+    }
+    std::string cur;
+    for (const char * c = env;; ++c) {
+        if (*c == ',' || *c == '\0') {
+            if (!cur.empty()) {
+                res.push_back(cur);
+            }
+            cur.clear();
+            if (*c == '\0') {
+                break;
+            }
+        } else {
+            cur.push_back(*c);
+        }
+    }
+    std::string joined;
+    for (const auto & n : res) {
+        joined += (joined.empty() ? "" : ",") + n;
+    }
+    fprintf(stderr, "%s: %s\n", var, joined.c_str());
+    return res;
+}
+
+static bool ggml_metal_diag_skip_match(const std::vector<std::string> & types, const ggml_tensor * t) {
+    const char * name = ggml_type_name(t->src[0]->type);
+    for (const auto & n : types) {
+        if (n == name) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool ggml_metal_mul_mat_diag_skip(const ggml_tensor * t) {
+    static const std::vector<std::string> types = ggml_metal_diag_skip_parse("GGML_METAL_MUL_MAT_DIAG_SKIP");
+    return !types.empty() && t && t->op == GGML_OP_MUL_MAT && t->src[0] && ggml_metal_diag_skip_match(types, t);
+}
+
+bool ggml_metal_mul_mat_id_diag_skip(const ggml_tensor * t) {
+    static const std::vector<std::string> types = ggml_metal_diag_skip_parse("GGML_METAL_MUL_MAT_ID_DIAG_SKIP");
+    return !types.empty() && t && t->op == GGML_OP_MUL_MAT_ID && t->src[0] && ggml_metal_diag_skip_match(types, t);
+}
+
 const ggml_metal_fusion * ggml_metal_fusion_next(
         const ggml_cgraph * gf,
         const int * node_idxs,
@@ -1388,6 +1437,7 @@ const ggml_metal_fusion * ggml_metal_fusion_next(
         int * n_out) {
     const ggml_metal_fusion * res = nullptr;
     int best = 1;
+
 
     for (const ggml_metal_fusion & fusion : ggml_metal_fusions) {
         const int n_ops = (int) fusion.ops.size();
@@ -1406,7 +1456,7 @@ const ggml_metal_fusion * ggml_metal_fusion_next(
         bool ok = true;
         for (int j = 0; j < n_ops; j++) {
             nodes[j] = gf->nodes[node_idxs[idx + j]];
-            if (nodes[j]->op != fusion.ops[j]) {
+            if (nodes[j]->op != fusion.ops[j] || ggml_metal_mul_mat_diag_skip(nodes[j]) || ggml_metal_mul_mat_id_diag_skip(nodes[j])) {
                 ok = false;
                 break;
             }

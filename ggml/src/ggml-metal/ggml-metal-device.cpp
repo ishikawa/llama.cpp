@@ -2799,6 +2799,17 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_memset(ggml_meta
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_diag_zero(ggml_metal_library_t lib) {
+    const char * name = "kernel_diag_zero_f32";
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_count_equal(ggml_metal_library_t lib, const ggml_tensor *  op) {
     assert(op->op == GGML_OP_COUNT_EQUAL);
 

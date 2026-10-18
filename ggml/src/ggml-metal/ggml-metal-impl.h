@@ -1320,6 +1320,10 @@ typedef struct {
 } ggml_metal_kargs_memset;
 
 typedef struct {
+    int64_t n;
+} ggml_metal_kargs_diag_zero;
+
+typedef struct {
     int32_t  n_kv;
     int32_t  n_batch;
     int32_t  mask_ne3;

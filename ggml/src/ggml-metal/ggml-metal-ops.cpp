@@ -90,6 +90,10 @@ struct ggml_metal_op {
         ggml_mem_ranges_free(this->mem_ranges);
     }
 
+    int profile_span(int idx, int count) const {
+        return count > 1 ? idxs[idx + count - 1] - idxs[idx] + 1 : 0;
+    }
+
     int n_nodes() const {
         return idxs.size();
     }
@@ -129,6 +133,7 @@ struct ggml_metal_op {
 
     bool use_concurrency;
     bool use_capture;
+    bool profile = false;
 
     int debug_graph;
 
@@ -168,6 +173,11 @@ ggml_metal_op_t ggml_metal_op_init(
 
 void ggml_metal_op_free(ggml_metal_op_t ctx) {
     delete ctx;
+}
+
+void ggml_metal_op_profile(ggml_metal_op_t ctx, void * stats, bool timing) {
+    ctx->profile = true;
+    ggml_metal_encoder_profile(ctx->enc, stats, timing);
 }
 
 int ggml_metal_op_n_nodes(ggml_metal_op_t ctx) {
@@ -574,6 +584,9 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
 }
 
 int ggml_metal_op_encode(ggml_metal_op_t ctx, int idx) {
+    if (ctx->profile) {
+        ggml_metal_encoder_profile_node(ctx->enc, ctx->node(idx), 0, 0);
+    }
     if (ctx->use_capture) {
         ggml_metal_encoder_debug_group_push(ctx->enc, ggml_op_desc(ctx->node(idx)));
     }
@@ -588,6 +601,9 @@ int ggml_metal_op_encode(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_debug_group_pop(ctx->enc);
     }
 
+    if (ctx->profile) {
+        ggml_metal_encoder_profile_node(ctx->enc, nullptr, ctx->profile_span(idx, res), res > 1 ? res - 1 : 0);
+    }
     return res;
 }
 

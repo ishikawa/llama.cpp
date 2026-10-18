@@ -23,6 +23,10 @@ struct ggml_metal_device_props;
 bool ggml_metal_mul_mat_diag_skip(const struct ggml_tensor * t);
 // same for MUL_MAT_ID (GGML_METAL_MUL_MAT_ID_DIAG_SKIP)
 bool ggml_metal_mul_mat_id_diag_skip(const struct ggml_tensor * t);
+// GGML_METAL_OP_DIAG_SKIP: any op by ggml_op_name (UNARY:<name> / GLU:<name> for a single function)
+bool ggml_metal_op_diag_skip(const struct ggml_tensor * t);
+// any of the three above; a matching node never takes part in a fusion or reorder
+bool ggml_metal_node_diag_skip(const struct ggml_tensor * t);
 
 // the maximum number of nodes that can be fused in a single kernel
 // (the opt-in MoE shared merge permits a raw packed span of 32 nodes, including views)

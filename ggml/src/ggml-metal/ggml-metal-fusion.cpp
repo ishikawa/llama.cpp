@@ -839,6 +839,9 @@ static void ggml_metal_fusion_reorder_moe_shared(ggml_cgraph * gf) {
     for (int i = 0; i + 20 < gf->n_nodes; ++i) {
         ggml_metal_moe_reduce_match match;
         if (!ggml_metal_fusion_match_moe_reduce(gf, i, reduce, &match, 10) || match.experts->ne[0] > INT32_MAX/10) { continue; }
+        bool skipped = false;
+        for (int k = i; k < i + 20; ++k) { skipped = skipped || ggml_metal_node_diag_skip(gf->nodes[k]); }
+        if (skipped) { continue; }
         for (int j = i + 20; j + 2 < gf->n_nodes; ++j) {
             if (gf->nodes[j + 2]->op != GGML_OP_ADD || gf->nodes[j + 2]->src[0] != match.dst) { continue; }
             int raw_idxs[23];
@@ -848,8 +851,12 @@ static void ggml_metal_fusion_reorder_moe_shared(ggml_cgraph * gf) {
                 continue;
             }
             bool pure = true;
+            for (int k = j; k < j + 3; ++k) {
+                if (ggml_metal_node_diag_skip(gf->nodes[k])) { pure = false; }
+            }
             for (int k = i + 20; k < j; ++k) {
                 const ggml_tensor * t = gf->nodes[k];
+                if (ggml_metal_node_diag_skip(t)) { pure = false; break; }
                 if (ggml_op_is_empty(t->op)) { continue; }
                 if (t->view_src || (t->op != GGML_OP_MUL_MAT && t->op != GGML_OP_GLU &&
                     t->op != GGML_OP_MUL && t->op != GGML_OP_SCALE && t->op != GGML_OP_UNARY)) {
@@ -1428,6 +1435,95 @@ bool ggml_metal_mul_mat_id_diag_skip(const ggml_tensor * t) {
     return !types.empty() && t && t->op == GGML_OP_MUL_MAT_ID && t->src[0] && ggml_metal_diag_skip_match(types, t);
 }
 
+bool ggml_metal_op_diag_skip(const ggml_tensor * t) {
+    struct entry { int op; int sub; }; // sub: unary / glu op, or -1 for any
+    static const std::vector<entry> entries = [] {
+        std::vector<entry> res;
+        const char * env = std::getenv("GGML_METAL_OP_DIAG_SKIP");
+        if (!env || !*env) {
+            return res;
+        }
+        std::string all;
+        std::string cur;
+        for (const char * c = env;; ++c) {
+            if (*c != ',' && *c != '\0') {
+                cur.push_back(*c);
+                continue;
+            }
+            if (!cur.empty()) {
+                std::string base = cur;
+                std::string sub;
+                const size_t colon = cur.find(':');
+                if (colon != std::string::npos) {
+                    base = cur.substr(0, colon);
+                    sub  = cur.substr(colon + 1);
+                }
+                bool found = false;
+                for (int op = 0; op < GGML_OP_COUNT && !found; ++op) {
+                    if (base != ggml_op_name((enum ggml_op) op)) {
+                        continue;
+                    }
+                    if (ggml_op_is_empty((enum ggml_op) op)) {
+                        break; // views / reshapes are no-ops and never dispatched
+                    }
+                    int subv = -1;
+                    if (!sub.empty()) {
+                        found = false;
+                        if (op == GGML_OP_UNARY) {
+                            for (int u = 0; u < GGML_UNARY_OP_COUNT; ++u) {
+                                if (sub == ggml_unary_op_name((enum ggml_unary_op) u)) { subv = u; found = true; break; }
+                            }
+                        } else if (op == GGML_OP_GLU) {
+                            for (int u = 0; u < GGML_GLU_OP_COUNT; ++u) {
+                                if (sub == ggml_glu_op_name((enum ggml_glu_op) u)) { subv = u; found = true; break; }
+                            }
+                        }
+                        if (!found) {
+                            break;
+                        }
+                    }
+                    res.push_back({op, subv});
+                    found = true;
+                }
+                if (!found) {
+                    fprintf(stderr, "GGML_METAL_OP_DIAG_SKIP: ignoring unknown or no-op entry '%s'\n", cur.c_str());
+                } else {
+                    all += (all.empty() ? "" : ",") + cur;
+                }
+            }
+            cur.clear();
+            if (*c == '\0') {
+                break;
+            }
+        }
+        fprintf(stderr, "GGML_METAL_OP_DIAG_SKIP: %s\n", all.c_str());
+        return res;
+    }();
+
+    if (entries.empty() || !t) {
+        return false;
+    }
+    for (const entry & e : entries) {
+        if ((int) t->op != e.op) {
+            continue;
+        }
+        if (e.sub < 0) {
+            return true;
+        }
+        if (t->op == GGML_OP_UNARY && (int) ggml_get_unary_op(t) == e.sub) {
+            return true;
+        }
+        if (t->op == GGML_OP_GLU && (int) ggml_get_glu_op(t) == e.sub) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool ggml_metal_node_diag_skip(const ggml_tensor * t) {
+    return ggml_metal_mul_mat_diag_skip(t) || ggml_metal_mul_mat_id_diag_skip(t) || ggml_metal_op_diag_skip(t);
+}
+
 const ggml_metal_fusion * ggml_metal_fusion_next(
         const ggml_cgraph * gf,
         const int * node_idxs,
@@ -1456,7 +1552,7 @@ const ggml_metal_fusion * ggml_metal_fusion_next(
         bool ok = true;
         for (int j = 0; j < n_ops; j++) {
             nodes[j] = gf->nodes[node_idxs[idx + j]];
-            if (nodes[j]->op != fusion.ops[j] || ggml_metal_mul_mat_diag_skip(nodes[j]) || ggml_metal_mul_mat_id_diag_skip(nodes[j])) {
+            if (nodes[j]->op != fusion.ops[j] || ggml_metal_node_diag_skip(nodes[j])) {
                 ok = false;
                 break;
             }

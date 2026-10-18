@@ -1,6 +1,9 @@
 #include "ggml-metal-ops.h"
 
 #include <atomic>
+#include <map>
+#include <mutex>
+#include <string>
 
 #include "ggml.h"
 #include "ggml-impl.h"
@@ -320,7 +323,41 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
         }
     }
 
-    switch (node->op) {
+    if (ggml_metal_op_diag_skip(node)) {
+        // diagnostic: zero-fill dst (side effects on other tensors are dropped)
+        static std::mutex mtx;
+        static std::map<std::string, uint64_t> counts;
+        static struct report_t {
+            ~report_t() {
+                for (const auto & kv : counts) {
+                    fprintf(stderr, "GGML_METAL_OP_DIAG_SKIP: replaced %s = %llu dispatches\n", kv.first.c_str(), (unsigned long long) kv.second);
+                }
+            }
+        } report;
+        (void) report;
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            std::string key = ggml_op_name(node->op);
+            if (node->op == GGML_OP_UNARY) { key += std::string(":") + ggml_unary_op_name(ggml_get_unary_op(node)); }
+            if (node->op == GGML_OP_GLU)   { key += std::string(":") + ggml_glu_op_name(ggml_get_glu_op(node)); }
+            counts[key]++;
+        }
+
+        const size_t nbytes = ggml_nbytes(node);
+        GGML_ASSERT(nbytes % sizeof(float) == 0);
+
+        ggml_metal_kargs_diag_zero args = { /*.n =*/ (int64_t) (nbytes/sizeof(float)) };
+        auto pipeline = ggml_metal_library_get_pipeline_diag_zero(ctx->lib);
+
+        ggml_metal_encoder_set_pipeline(ctx->enc, pipeline);
+        ggml_metal_encoder_set_bytes   (ctx->enc, &args, sizeof(args), 0);
+        ggml_metal_encoder_set_buffer  (ctx->enc, ggml_metal_get_buffer_id(node), 1);
+
+        const int nth = 256;
+        ggml_metal_encoder_dispatch_threadgroups(ctx->enc, (args.n + nth - 1)/nth, 1, 1, nth, 1, 1);
+
+        n_fuse = 1;
+    } else switch (node->op) {
         case GGML_OP_CONCAT:
             {
                 n_fuse = ggml_metal_op_concat(ctx, idx);

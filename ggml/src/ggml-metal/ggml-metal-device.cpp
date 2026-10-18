@@ -24,6 +24,8 @@ typedef std::unique_ptr<ggml_metal_device, ggml_metal_device_deleter> ggml_metal
 ggml_metal_device_t ggml_metal_device_get(int device, int n_devices) {
     static std::vector<ggml_metal_device_ptr> devs;
 
+    ggml_metal_mul_mv_ext_q6_k_two_token_enabled();
+
     devs.emplace_back(ggml_metal_device_init(device, n_devices));
 
     return devs.back().get();

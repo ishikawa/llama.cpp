@@ -6254,8 +6254,13 @@ int ggml_metal_op_top_k(ggml_metal_op_t ctx, int idx) {
     const int k     = op->ne[0];
     const int nrows = ggml_nrows(op->src[0]);
 
-    const bool use_radix =
+    bool use_radix =
         ncols > 2048 && (k > 64 || (nrows > 4 && ncols >= 8192));
+
+    // diagnostic: GGML_METAL_TOP_K_FORCE=radix|bitonic
+    static const char * force = getenv("GGML_METAL_TOP_K_FORCE");
+    if (force && strcmp(force, "radix")   == 0) { use_radix = true;  }
+    if (force && strcmp(force, "bitonic") == 0) { use_radix = false; }
 
     if (use_radix) {
         ggml_metal_op_top_k_radix(ctx, idx);

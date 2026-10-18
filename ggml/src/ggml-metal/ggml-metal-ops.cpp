@@ -2920,6 +2920,12 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
         return ggml_metal_op_fwht(ctx, idx);
     }
 
+    if (ggml_metal_op_mul_mat_use_q6_k_two_token(op)) {
+        const int result = ggml_metal_op_mul_mat_mv(ctx, idx);
+        ggml_metal_mul_mv_q6_k_two_token_count_dispatch();
+        return result;
+    }
+
     if (props_dev->has_simdgroup_mm && ggml_metal_op_mul_mat_use_mma(op)) {
         return ggml_metal_op_mul_mat_mma(ctx, idx);
     }

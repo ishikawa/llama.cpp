@@ -10,6 +10,40 @@
 #include <cstring>
 #include <vector>
 
+static std::atomic<uint64_t> ggml_metal_mul_mv_q6_k_two_token_dispatches{0};
+
+bool ggml_metal_mul_mv_q6_k_two_token_enabled(void) {
+    static const bool enabled = [] {
+        const char * env = std::getenv("GGML_METAL_MUL_MV_Q6_K_TWO_TOKEN");
+        if (!env || std::strcmp(env, "1") != 0) {
+            return false;
+        }
+        GGML_LOG_INFO("%s: GGML_METAL_MUL_MV_Q6_K_TWO_TOKEN=1: enabled\n", __func__);
+        static struct report_t {
+            ~report_t() { fprintf(stderr, "GGML_METAL_MUL_MV_Q6_K_TWO_TOKEN: replaced %llu dispatches\n", (unsigned long long) ggml_metal_mul_mv_q6_k_two_token_dispatches.load()); }
+        } report;
+        (void) report;
+        return true;
+    }();
+    return enabled;
+}
+
+void ggml_metal_mul_mv_q6_k_two_token_count_dispatch(void) {
+    ggml_metal_mul_mv_q6_k_two_token_dispatches++;
+}
+
+bool ggml_metal_op_mul_mat_use_q6_k_two_token(const struct ggml_tensor * op) {
+    const ggml_tensor * src0 = op->src[0];
+    const ggml_tensor * src1 = op->src[1];
+
+    return op->op == GGML_OP_MUL_MAT && src0->type == GGML_TYPE_Q6_K && src1->type == GGML_TYPE_F32 &&
+        src1->ne[1] == 2 && ggml_metal_mul_mv_q6_k_two_token_enabled() &&
+        src0->ne[0] % 256 == 0 && src0->nb[0] == ggml_type_size(src0->type) &&
+        !ggml_is_transposed(src0) && !ggml_is_transposed(src1) && src1->nb[0] == sizeof(float) &&
+        src1->nb[1] % 16 == 0 && src1->nb[2] % 16 == 0 && src1->nb[3] % 16 == 0 &&
+        src1->ne[3] <= INT16_MAX && src1->ne[2] <= INT16_MAX && src1->ne[2]/src0->ne[2] <= INT16_MAX && src1->ne[3]/src0->ne[3] <= INT16_MAX;
+}
+
 static std::atomic<uint64_t> ggml_metal_mul_mv_ext_q6_k_two_token_dispatches{0};
 
 bool ggml_metal_mul_mv_ext_q6_k_two_token_enabled(void) {
@@ -213,7 +247,7 @@ bool ggml_metal_op_mul_mat_use_mma(const struct ggml_tensor * op) {
     // the batch shape goes into int16 function constants
     const bool batch_ok = src1->ne[2] <= INT16_MAX && src1->ne[2]/src0->ne[2] <= INT16_MAX && src1->ne[3]/src0->ne[3] <= INT16_MAX;
 
-    return !ggml_metal_op_mul_mat_use_ext_q6_k_two_token(op) && ggml_metal_mul_mat_mma_type_ok(op) && batch_ok &&
+    return !ggml_metal_op_mul_mat_use_q6_k_two_token(op) && !ggml_metal_op_mul_mat_use_ext_q6_k_two_token(op) && ggml_metal_mul_mat_mma_type_ok(op) && batch_ok &&
         src1->type == GGML_TYPE_F32 && src1->ne[1] >= ggml_metal_mul_mv_mma_rows_min(src0->type) && src1->ne[1] <= GGML_METAL_MMA_ROWS_MAX &&
         !ggml_is_transposed(src0) && !ggml_is_transposed(src1) &&
         src1->nb[0] == sizeof(float) && src1->nb[1] % 16 == 0 && src1->nb[2] % 16 == 0 && src1->nb[3] % 16 == 0;

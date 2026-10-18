@@ -24,6 +24,7 @@ typedef std::unique_ptr<ggml_metal_device, ggml_metal_device_deleter> ggml_metal
 ggml_metal_device_t ggml_metal_device_get(int device, int n_devices) {
     static std::vector<ggml_metal_device_ptr> devs;
 
+    ggml_metal_mul_mv_q6_k_two_token_enabled();
     ggml_metal_mul_mv_ext_q6_k_two_token_enabled();
 
     devs.emplace_back(ggml_metal_device_init(device, n_devices));
@@ -1245,6 +1246,11 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv(ggml_meta
         nsg = 4;
         smem = 0;
         suffix = "_shortk";
+    }
+
+    if (ggml_metal_op_mul_mat_use_q6_k_two_token(op)) {
+        nr1 = 2;
+        suffix = "_two_token";
     }
 
     GGML_ASSERT(ne12 <= INT16_MAX && ne13 <= INT16_MAX);

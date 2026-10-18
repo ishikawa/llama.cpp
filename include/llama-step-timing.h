@@ -55,6 +55,7 @@ struct llama_step_timing_record {
         if (owner) {
             *owner = nullptr;
         }
+        if (!llama_step_timing_enabled()) { return; }
         std::string json = "{\"type\":" + llama_step_timing_quote(type) + ",\"context\":" + llama_step_timing_quote(context);
         json += ",\"step\":" + std::to_string(step) + ",\"status\":" + std::to_string(status);
         if (type == "decode") {

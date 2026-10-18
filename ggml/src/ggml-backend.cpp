@@ -22,12 +22,73 @@
 #include <algorithm>
 #include <unordered_map>
 #include <vector>
+#include <mutex>
+#include <string>
+#include <chrono>
+#ifdef __APPLE__
+#include <mach/mach_time.h>
+#endif
 
 #ifdef __APPLE__
 #include <sys/types.h>
 #include <sys/sysctl.h>
 #endif
 
+
+namespace {
+struct ggml_backend_timing_sink {
+    std::string path;
+    std::string records;
+    std::mutex mutex;
+    ggml_backend_timing_sink() {
+        const char * value = getenv("GGML_FIRST_CB_TIMING");
+        if (value) { path = value; }
+    }
+    ~ggml_backend_timing_sink() {
+        if (path.empty()) { return; }
+        FILE * file = fopen(path.c_str(), "w");
+        if (!file) {
+            fprintf(stderr, "GGML_FIRST_CB_TIMING: cannot open %s\n", path.c_str());
+            return;
+        }
+        if (fwrite(records.data(), 1, records.size(), file) != records.size()) {
+            fprintf(stderr, "GGML_FIRST_CB_TIMING: write failed\n");
+        }
+        if (fclose(file) != 0) { fprintf(stderr, "GGML_FIRST_CB_TIMING: close failed\n"); }
+    }
+};
+ggml_backend_timing_sink & ggml_backend_timing_sink_get() {
+    static ggml_backend_timing_sink sink;
+    return sink;
+}
+thread_local ggml_backend_timing_scope ggml_backend_timing_current = {-1, -1, 0, -1, 0, "unknown", -1};
+}
+
+bool ggml_backend_timing_enabled(void) {
+    return !ggml_backend_timing_sink_get().path.empty();
+}
+
+double ggml_backend_timing_clock(void) {
+#ifdef __APPLE__
+    static const mach_timebase_info_data_t timebase = [] {
+        mach_timebase_info_data_t value;
+        mach_timebase_info(&value);
+        return value;
+    }();
+    return (double) mach_absolute_time() * timebase.numer / timebase.denom * 1e-9;
+#else
+    return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
+#endif
+}
+
+ggml_backend_timing_scope ggml_backend_timing_get(void) { return ggml_backend_timing_current; }
+void ggml_backend_timing_set(ggml_backend_timing_scope scope) { ggml_backend_timing_current = scope; }
+void ggml_backend_timing_submit(const char * json) {
+    auto & sink = ggml_backend_timing_sink_get();
+    std::lock_guard<std::mutex> lock(sink.mutex);
+    sink.records += json;
+    sink.records += '\n';
+}
 
 // backend buffer type
 
@@ -1865,12 +1926,20 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
 
+    const bool timed = ggml_backend_timing_enabled();
     int prev_backend_id = -1;
 
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+
+        const double split_start = timed ? ggml_backend_timing_clock() : 0;
+        if (timed) {
+            auto scope = ggml_backend_timing_get();
+            scope.split_id = split_id;
+            ggml_backend_timing_set(scope);
+        }
 
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
@@ -1895,8 +1964,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        const double copy_end = timed ? ggml_backend_timing_clock() : 0;
+        double compute_us = 0;
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+            if (timed) { compute_us += (ggml_backend_timing_clock() - copy_end) * 1e6; }
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
             }
@@ -1918,7 +1990,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                 struct ggml_cgraph gv = ggml_graph_view(&split->graph, j0, j1 + 1);
 
+                const double compute_start = timed ? ggml_backend_timing_clock() : 0;
                 enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &gv);
+                if (timed) { compute_us += (ggml_backend_timing_clock() - compute_start) * 1e6; }
                 if (ec != GGML_STATUS_SUCCESS) {
                     return ec;
                 }
@@ -1932,6 +2006,22 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                 j0 = j1;
             }
+        }
+
+        if (timed) {
+            const auto scope = ggml_backend_timing_get();
+            std::string backend = ggml_backend_name(split_backend);
+            std::string quoted;
+            for (unsigned char c : backend) {
+                if (c == '"' || c == '\\') { quoted += '\\'; }
+                quoted += c < 32 ? '?' : c;
+            }
+            char record[2048];
+            snprintf(record, sizeof(record), "{\"type\":\"split\",\"decode_id\":%lld,\"step\":%lld,\"context\":\"%s\",\"n_tokens\":%lld,\"graph_id\":%lld,\"split_id\":%d,\"backend\":\"%s\",\"n_nodes\":%d,\"start_s\":%.9f,\"us\":{\"input_copy\":%.3f,\"compute_async\":%.3f}}",
+                (long long) scope.decode_id, (long long) scope.step, scope.context, (long long) scope.n_tokens,
+                (long long) scope.graph_id, split_id, quoted.c_str(), split->graph.n_nodes, split_start,
+                (copy_end - split_start) * 1e6, compute_us);
+            ggml_backend_timing_submit(record);
         }
 
         // record the event of this split

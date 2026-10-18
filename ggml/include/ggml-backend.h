@@ -447,6 +447,22 @@ extern "C" {
     GGML_API ggml_backend_buffer_t      ggml_backend_cpu_buffer_from_ptr(void * ptr, size_t size);
     GGML_API ggml_backend_buffer_type_t ggml_backend_cpu_buffer_type(void);
 
+    // Experimental first-command-buffer timing, enabled by GGML_FIRST_CB_TIMING.
+    struct ggml_backend_timing_scope {
+        int64_t decode_id;
+        int64_t step;
+        int64_t n_tokens;
+        int64_t graph_id;
+        double graph_start;
+        const char * context;
+        int split_id;
+    };
+    GGML_API bool ggml_backend_timing_enabled(void);
+    GGML_API double ggml_backend_timing_clock(void);
+    GGML_API struct ggml_backend_timing_scope ggml_backend_timing_get(void);
+    GGML_API void ggml_backend_timing_set(struct ggml_backend_timing_scope scope);
+    GGML_API void ggml_backend_timing_submit(const char * json);
+
 #ifdef  __cplusplus
 }
 #endif

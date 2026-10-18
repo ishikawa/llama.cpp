@@ -88,6 +88,12 @@ struct ggml_metal {
     // error state - set when a command buffer fails during synchronize
     // once set, graph_compute will return GGML_STATUS_FAILED until the backend is recreated
     bool has_error;
+    bool first_cb_timing;
+    struct ggml_backend_timing_scope timing_scope;
+    double timing_start;
+    double timing_commits[GGML_METAL_MAX_COMMAND_BUFFERS + 1];
+    double timing_commit_ends[GGML_METAL_MAX_COMMAND_BUFFERS + 1];
+    NSMutableArray * timing_pending;
     char * stats_path;
     bool dispatch_timing;
     NSMutableDictionary * dispatch_stats[GGML_METAL_MAX_COMMAND_BUFFERS + 1];
@@ -125,6 +131,8 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
 
         // init context
         ggml_metal_t res = calloc(1, sizeof(struct ggml_metal));
+        res->first_cb_timing = ggml_backend_timing_enabled();
+        if (res->first_cb_timing) { res->timing_pending = [NSMutableArray new]; }
 
         id<MTLDevice> device = ggml_metal_device_get_obj(dev);
 
@@ -237,6 +245,10 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
 
 void ggml_metal_free(ggml_metal_t ctx) {
     GGML_LOG_INFO("%s: deallocating\n", __func__);
+    if (ctx->first_cb_timing) {
+        ggml_metal_synchronize(ctx);
+        [ctx->timing_pending release];
+    }
 
     for (int i = 0; i < GGML_METAL_MAX_COMMAND_BUFFERS; ++i) {
         if (ctx->cmd_bufs[i].obj) {
@@ -295,12 +307,55 @@ const char * ggml_metal_get_name(ggml_metal_t ctx) {
     return ctx->name;
 }
 
+static void ggml_metal_timing_flush(ggml_metal_t ctx) {
+    @autoreleasepool {
+        for (NSDictionary * graph in ctx->timing_pending) {
+            NSMutableDictionary * record = [[graph mutableCopy] autorelease];
+            NSMutableArray * buffers = [NSMutableArray array];
+            double first = DBL_MAX;
+            double last = 0;
+            for (NSDictionary * entry in graph[@"buffers"]) {
+                id<MTLCommandBuffer> cb = entry[@"buffer"];
+                // Uncommitted buffers can occur on the abort path.
+                if (cb.status < MTLCommandBufferStatusCommitted) { continue; }
+                [cb waitUntilCompleted];
+                NSMutableDictionary * item = [[entry mutableCopy] autorelease];
+                [item removeObjectForKey:@"buffer"];
+                item[@"status"] = @(cb.status);
+                if (cb.status == MTLCommandBufferStatusCompleted && cb.GPUStartTime > 0 && cb.GPUEndTime >= cb.GPUStartTime) {
+                    item[@"gpu_start_s"] = @(cb.GPUStartTime);
+                    item[@"gpu_end_s"] = @(cb.GPUEndTime);
+                    first = MIN(first, cb.GPUStartTime);
+                    last = MAX(last, cb.GPUEndTime);
+                }
+                [buffers addObject:item];
+            }
+            record[@"buffers"] = buffers;
+            if (last > 0) {
+                record[@"gpu_start_s"] = @(first);
+                record[@"gpu_end_s"] = @(last);
+                record[@"us"] = @{@"graph_to_metal":@(([graph[@"metal_start_s"] doubleValue] - [graph[@"graph_start_s"] doubleValue]) * 1e6),
+                                  @"graph_to_gpu_start":@((first - [graph[@"graph_start_s"] doubleValue]) * 1e6),
+                                  @"metal_to_gpu_start":@((first - [graph[@"metal_start_s"] doubleValue]) * 1e6)};
+            }
+            NSData * data = [NSJSONSerialization dataWithJSONObject:record options:0 error:nil];
+            if (data) {
+                NSString * json = [[[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] autorelease];
+                ggml_backend_timing_submit(json.UTF8String);
+            }
+        }
+        [ctx->timing_pending removeAllObjects];
+    }
+}
+
 void ggml_metal_synchronize(ggml_metal_t ctx) {
     // wait for any backend operations to finish
     if (ctx->cmd_buf_last) {
         [ctx->cmd_buf_last waitUntilCompleted];
         ctx->cmd_buf_last = nil;
     }
+
+    if (ctx->first_cb_timing) { ggml_metal_timing_flush(ctx); }
 
     // check status of all command buffers
     {
@@ -735,6 +790,11 @@ static void ggml_metal_profile_write(ggml_metal_t ctx, int64_t start, int64_t en
 }
 
 enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph * gf) {
+    if (ctx->first_cb_timing) {
+        ctx->timing_start = ggml_backend_timing_clock();
+        ctx->timing_scope = ggml_backend_timing_get();
+        memset(ctx->timing_commits, 0, sizeof(ctx->timing_commits));
+    }
     if (ctx->has_error) {
         GGML_LOG_ERROR("%s: backend is in error state from a previous command buffer failure - recreate the backend to recover\n", __func__);
         return GGML_STATUS_FAILED;
@@ -913,7 +973,9 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
                         ctx->has_error = true;
                         break;
                     }
+                    if (ctx->first_cb_timing) { ctx->timing_commits[i] = ggml_backend_timing_clock(); }
                     [cb commit];
+                    if (ctx->first_cb_timing) { ctx->timing_commit_ends[i] = ggml_backend_timing_clock(); }
                 }
                 [cb waitUntilCompleted];
                 if (cb.status != MTLCommandBufferStatusCompleted) {
@@ -978,13 +1040,32 @@ enum ggml_status ggml_metal_graph_compute(ggml_metal_t ctx, struct ggml_cgraph *
                     return GGML_STATUS_ABORTED;
                 }
 
+                if (ctx->first_cb_timing) { ctx->timing_commits[i + 1] = ggml_backend_timing_clock(); }
                 [next_buffer commit];
+                if (ctx->first_cb_timing) { ctx->timing_commit_ends[i + 1] = ggml_backend_timing_clock(); }
             }
 
             [ctx->capture_scope endScope];
             [[MTLCaptureManager sharedCaptureManager] stopCapture];
 
             ctx->capture_started = false;
+        }
+        if (ctx->first_cb_timing) {
+            const struct ggml_backend_timing_scope scope = ctx->timing_scope;
+            NSMutableArray * buffers = [NSMutableArray array];
+            for (int j = 0; j <= n_cb; ++j) {
+                const int i = j == 0 ? n_cb : j - 1;
+                if (ctx->timing_commits[i] == 0) { continue; }
+                [buffers addObject:@{@"index":@(j), @"buffer":ctx->cmd_bufs[i].obj,
+                    @"commit_s":@(ctx->timing_commits[i]),
+                    @"commit_return_s":@(ctx->timing_commit_ends[i]),
+                    @"graph_to_commit_us":@((ctx->timing_commit_ends[i] - scope.graph_start) * 1e6),
+                    @"metal_to_commit_us":@((ctx->timing_commit_ends[i] - ctx->timing_start) * 1e6)}];
+            }
+            [ctx->timing_pending addObject:@{@"type":@"metal_graph", @"decode_id":@(scope.decode_id),
+                @"step":@(scope.step), @"context":@(scope.context), @"n_tokens":@(scope.n_tokens),
+                @"graph_id":@(scope.graph_id), @"split_id":@(scope.split_id),
+                @"graph_start_s":@(scope.graph_start), @"metal_start_s":@(ctx->timing_start), @"buffers":buffers}];
         }
     }
 
@@ -1102,7 +1183,9 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
         ggml_metal_op_free(ctx_op);
 
         if (cb_idx < 2 || ctx->abort_callback == NULL) {
+            if (ctx->first_cb_timing) { ctx->timing_commits[cb_idx] = ggml_backend_timing_clock(); }
             [cmd_buf commit];
+            if (ctx->first_cb_timing) { ctx->timing_commit_ends[cb_idx] = ggml_backend_timing_clock(); }
         }
     });
 }

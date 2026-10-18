@@ -15,6 +15,7 @@
 #include "llama-sampler.h"
 #include "llama.h"
 
+#include <atomic>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -1791,7 +1792,7 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch_ext & batch_inp) {
-    if (step_timing_enabled) {
+    if (step_timing_enabled || ggml_backend_timing_enabled()) {
         return decode_impl<true>(batch_inp);
     }
     return decode_impl<false>(batch_inp);
@@ -2732,6 +2733,20 @@ llm_graph_params llama_context::graph_params(
 ggml_status llama_context::graph_compute(
             ggml_cgraph * gf,
                    bool   batched) {
+    const bool first_cb_timing = ggml_backend_timing_enabled();
+    const auto previous_scope = first_cb_timing ? ggml_backend_timing_get() : ggml_backend_timing_scope{};
+    if (first_cb_timing) {
+        static std::atomic<int64_t> next_graph{0};
+        ggml_backend_timing_scope scope = {};
+        scope.graph_start = ggml_backend_timing_clock();
+        scope.graph_id = ++next_graph;
+        scope.decode_id = timing_decode ? timing_decode->decode_id : -1;
+        scope.step = llama_step_timing_step();
+        scope.n_tokens = timing_decode ? timing_decode->n_tokens : 0;
+        scope.context = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ? "mtp" : "target";
+        scope.split_id = -1;
+        ggml_backend_timing_set(scope);
+    }
     int n_threads        = batched ? cparams.n_threads_batch : cparams.n_threads;
     ggml_threadpool_t tp = batched ? threadpool_batch        : threadpool;
 
@@ -2751,6 +2766,7 @@ ggml_status llama_context::graph_compute(
     copy_experts.reset();
 
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
+    if (first_cb_timing) { ggml_backend_timing_set(previous_scope); }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
     }

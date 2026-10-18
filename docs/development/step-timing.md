@@ -60,3 +60,28 @@ Verification without model/backend execution:
 cmake --build build-decode-dev -j
 python3 scripts/test_step_timing_summary.py
 ```
+
+## First command buffer timing
+
+Set `GGML_FIRST_CB_TIMING` to a separate JSONL path. Do not use the same path as `LLAMA_STEP_TIMING`: both overwrite their output at normal exit. The environment is cached once. When disabled, the backend paths check the cached flag without clocks, records, or extra synchronization. When enabled, decode IDs are allocated even if `LLAMA_STEP_TIMING` is absent. The additional records contain `decode_id`, `step`, `context`, logical decode `n_tokens`, process-wide `graph_id` (one per llama graph_compute call), and scheduler `split_id`. Calls outside decode use decode ID -1 and n_tokens 0.
+
+`split` records include backend name, node count, absolute `start_s`, and host `us.input_copy` and `us.compute_async`. Input copy includes inter-backend dependency waits and input copy submission, including CPU PLE get_rows output copies to Metal. Compute time sums graph_compute_async calls, including callback subgraphs, but excludes callback evaluation and callback synchronization. These are host durations, not device copy durations.
+
+`metal_graph` records include `graph_start_s` (llama graph_compute entry), `metal_start_s` (Metal graph_compute entry), and a `buffers` array in queue order (main buffer first, then worker buffers). Each buffer has `index`, `commit_s` (before commit), `commit_return_s`, `graph_to_commit_us`, `metal_to_commit_us` (both through commit return), `status`, and, for successful buffers with valid GPU timestamps, `gpu_start_s` and `gpu_end_s`. A GPU can start before commit returns; commit-to-GPU-start uses the timestamp before commit. Graph `gpu_start_s`/`gpu_end_s` are the earliest start and latest end. Graph `us` includes `graph_to_metal`, `graph_to_gpu_start`, and `metal_to_gpu_start`.
+
+Absolute times are seconds on the mach_absolute_time clock on Apple platforms, matching Metal GPUStartTime/GPUEndTime. GPU results are read only after waiting for completion, at the next normal backend synchronize (or backend destruction). Pending graphs retain their command buffers across later submissions. No wait is inserted into graph_compute. Failed/uncommitted buffers have no GPU intervals; early aborts can omit a graph record. The memory buffer and retained command buffers grow until synchronization. Existing dispatch profiling can still introduce its own waits; leave `GGML_METAL_DISPATCH_STATS` unset when measuring normal scheduling.
+
+The summary's `first_cb_ms_per_record` groups by context and logical n_tokens. It reports median and mean per split/Metal graph/CB occurrence, rather than per generation step. `gpu_idle` is the nonnegative interval from the preceding Metal graph's latest GPU end to this graph's earliest GPU start, across contexts and splits, ordered by GPU start. The predecessor is selected before warmup/prefill filtering. The first observed graph has no idle sample. This graph-to-graph gap can contain copy/event work and is not a proof that the entire GPU was idle. Multiple devices/independent queues must be measured in separate runs. JSONL line order follows flushing, not necessarily submission order.
+
+Example commands below execute Metal and are provided for a separate measurement run; they are not build/CPU verification commands. Replace the model path and tensor placement expression for your model.
+
+```sh
+GGML_METAL_N_CB=4 GGML_FIRST_CB_TIMING=/tmp/mtp-cb.jsonl LLAMA_STEP_TIMING=/tmp/mtp-step.jsonl \
+    build-decode-dev/bin/llama-speculative-simple -m /path/to/model.gguf \
+    --spec-type draft-mtp --spec-draft-n-max 1 -ot '.*per_layer_token_embd.*=CPU' -p 'Hello' -n 128
+GGML_METAL_N_CB=4 GGML_FIRST_CB_TIMING=/tmp/base-cb.jsonl LLAMA_STEP_TIMING=/tmp/base-step.jsonl \
+    build-decode-dev/bin/llama-completion -m /path/to/model.gguf \
+    -ot '.*per_layer_token_embd.*=CPU' -p 'Hello' -n 128
+python3 scripts/step_timing_summary.py /tmp/mtp-step.jsonl /tmp/mtp-cb.jsonl --max-tokens 2 --skip-steps 5
+python3 scripts/step_timing_summary.py /tmp/base-step.jsonl /tmp/base-cb.jsonl --max-tokens 2 --json
+```

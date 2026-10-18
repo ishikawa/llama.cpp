@@ -72,6 +72,23 @@ class StepTimingSummaryTest(unittest.TestCase):
         self.assertEqual(stats["graphs"], 3)
         self.assertAlmostEqual(stats["reuse_rate"], 2 / 3)
 
+    def test_first_cb_order_contexts_and_filters(self):
+        def graph(context, graph_id, start, end, tokens=2, step=1):
+            return {"type": "metal_graph", "context": context, "graph_id": graph_id,
+                    "split_id": 0, "step": step, "n_tokens": tokens,
+                    "gpu_start_s": start, "gpu_end_s": end,
+                    "us": {"graph_to_gpu_start": 1000},
+                    "buffers": [{"index": 0, "commit_s": start - 0.002,
+                                 "graph_to_commit_us": 100, "metal_to_commit_us": 50,
+                                 "gpu_start_s": start, "gpu_end_s": end}]}
+        records = [graph("target", 3, 1.010, 1.012), graph("mtp", 2, 1.005, 1.006, 1),
+                   graph("target", 1, 1.000, 1.002, 100, -1)]
+        result = summarize(records, skip_steps=1, max_tokens=2)["first_cb_ms_per_record"]
+        self.assertAlmostEqual(result["target.n_tokens=2"]["gpu_idle"]["mean_ms"], 4)
+        self.assertAlmostEqual(result["mtp.n_tokens=1"]["gpu_idle"]["median_ms"], 3)
+        self.assertAlmostEqual(result["target.n_tokens=2"]["cb0.commit_to_gpu_start"]["mean_ms"], 2)
+        self.assertNotIn("target.n_tokens=100", result)
+
     def test_cli(self):
         script = Path(__file__).with_name("step_timing_summary.py")
         with tempfile.TemporaryDirectory() as directory:

@@ -645,8 +645,10 @@ void llama_context::sched_reserve() {
     for (auto & res : gf_res_prev) {
         res.reset();
     }
+    sched_slot_other.reset();
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
     gf_res_prev_active = nullptr;
+    gf_res_slot_other = nullptr;
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
@@ -902,6 +904,7 @@ bool llama_context::memory_update(bool optimize) {
             }
         }
         gf_res_prev_active = nullptr;
+        gf_res_slot_other = nullptr;
 
         if (!mctx->apply()) {
             LLAMA_LOG_ERROR("%s: failed to apply memory update\n", __func__);
@@ -2554,6 +2557,29 @@ llm_graph_result * llama_context::get_gf_res_reserve() const {
 }
 
 llm_graph_result * llama_context::get_gf_res_prev() {
+    const char * keep_slots = getenv("LLAMA_GRAPH_KEEP_SLOTS");
+    if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && !cparams.training && keep_slots && atoi(keep_slots) != 0) {
+        if (!sched_slot_other) {
+            sched_slot_other.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(),
+                    gf_res_reserve->get_max_nodes(), cparams.pipeline_parallel, cparams.op_offload));
+            ggml_backend_sched_set_copy_callback(sched_slot_other.get(), sched_copy_experts, this);
+            sched_slot_outputs = n_outputs > 0;
+        }
+        if (sched_slot_outputs != (n_outputs > 0)) {
+            sched.swap(sched_slot_other);
+            std::swap(gf_res_prev_active, gf_res_slot_other);
+            sched_slot_outputs = n_outputs > 0;
+        }
+        if (!sched_slots_logged && gf_res_prev_active && gf_res_slot_other) {
+            size_t extra = 0;
+            for (auto * backend : backend_ptrs) {
+                extra += std::min(ggml_backend_sched_get_buffer_size(sched.get(), backend),
+                                  ggml_backend_sched_get_buffer_size(sched_slot_other.get(), backend));
+            }
+            LLAMA_LOG_INFO("%s: LLAMA_GRAPH_KEEP_SLOTS=1: MTP only, estimated extra compute buffers = %.2f MiB\n", __func__, extra / (1024.0 * 1024.0));
+            sched_slots_logged = true;
+        }
+    }
     auto & res = gf_res_prev[n_outputs > 0];
     if (!res) {
         res.reset(new llm_graph_result(gf_res_reserve->get_max_nodes()));
@@ -2637,6 +2663,7 @@ ggml_cgraph * llama_context::graph_reserve(
         }
     }
     gf_res_prev_active = nullptr;
+    gf_res_slot_other = nullptr;
 
     // store the n_outputs as it is, and restore it afterwards
     // TODO: not sure if needed, might simplify in the future by removing this

@@ -1474,7 +1474,16 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
 }
 
 bool llm_graph_result::can_reuse(const llm_graph_params & params) {
-    if (!this->params.allow_reuse(params)) {
+    return can_reuse_impl<false>(params, nullptr);
+}
+
+bool llm_graph_result::can_reuse(const llm_graph_params & params, std::vector<std::string> * reasons) {
+    return can_reuse_impl<true>(params, reasons);
+}
+
+template<bool timed>
+bool llm_graph_result::can_reuse_impl(const llm_graph_params & params, std::vector<std::string> * reasons) {
+    if (!this->params.allow_reuse(params, timed ? reasons : nullptr)) {
         if (debug > 1) {
             LLAMA_LOG_DEBUG("%s: cannot reuse graph due to incompatible graph parameters\n", __func__);
         }
@@ -1490,6 +1499,11 @@ bool llm_graph_result::can_reuse(const llm_graph_params & params) {
 
     for (auto & input : inputs) {
         const bool cur = input->can_reuse(params);
+        if constexpr (timed) {
+            if (!cur) {
+                reasons->push_back(std::string("input.") + input->name());
+            }
+        }
 
         if (debug > 1) {
             LLAMA_LOG_DEBUG("%s: can_reuse = %d\n", "placeholder", cur);

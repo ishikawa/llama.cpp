@@ -7,6 +7,7 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
+#include "llama-memory-hybrid.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-moe-cache.h"
@@ -491,7 +492,7 @@ llama_context::llama_context(
 
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
-    synchronize();
+    synchronize(__func__);
 
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.hparams.no_alloc && !opt_ctx) {
@@ -630,7 +631,7 @@ void llama_context::sched_reserve() {
 
     LLAMA_LOG_INFO("%s: reserving ...\n", __func__);
 
-    synchronize();
+    synchronize(__func__);
 
     const int64_t t_start_us = ggml_time_us();
 
@@ -779,12 +780,25 @@ void llama_context::sched_reserve() {
             __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
 }
 
-void llama_context::synchronize() {
+void llama_context::synchronize_backend(const char * caller) {
+    if (!step_timing_enabled) {
+        ggml_backend_sched_synchronize(sched.get());
+        return;
+    }
+    llama_step_timing_record timing("synchronize", cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ? "mtp" : "target");
+    timing.decode_id = timing_decode_id;
+    ggml_backend_sched_synchronize(sched.get());
+    timing.mark("wait");
+    timing.caller = caller;
+    timing.status = 0;
+}
+
+void llama_context::synchronize(const char * caller) {
     if (!sched) {
         return;
     }
 
-    ggml_backend_sched_synchronize(sched.get());
+    synchronize_backend(caller);
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
@@ -1415,11 +1429,21 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    if (timing_decode) {
+        return process_ubatch_impl<true>(ubatch, gtype, mctx, ret);
+    }
+    return process_ubatch_impl<false>(ubatch, gtype, mctx, ret);
+}
+
+template<bool timed>
+llm_graph_result * llama_context::process_ubatch_impl(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
     if (mctx && !mctx->apply()) {
-        LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
+        LLAMA_LOG_ERROR("%s: failed to apply memory context\n", "process_ubatch");
         ret = GGML_STATUS_FAILED;
         return nullptr;
     }
+
+    if constexpr (timed) { timing_decode->mark("memory_apply"); }
 
     auto * res = get_gf_res_prev();
     auto * gf  = res->get_gf();
@@ -1428,16 +1452,46 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
-    if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams)) {
-        //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
+    bool reused;
+    if constexpr (timed) {
+        reused = !graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams, &timing_decode->reasons);
+    } else {
+        reused = !graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams);
+    }
+    if constexpr (timed) {
+        const int active_slot = gf_res_prev_active == nullptr ? -1 : (gf_res_prev_active == gf_res_prev[1].get() ? 1 : 0);
+        timing_decode->mark("reuse_check");
+        timing_decode->reused &= reused;
+        timing_decode->n_ubatches++;
+        int64_t n_kv = -1;
+        if (auto * kv = dynamic_cast<llama_kv_cache_context *>(mctx)) {
+            n_kv = kv->get_n_kv();
+        } else if (auto * hybrid = dynamic_cast<llama_memory_hybrid_context *>(mctx)) {
+            n_kv = hybrid->get_attn()->get_n_kv();
+        }
+        timing_decode->n_kv = std::max(timing_decode->n_kv, n_kv);
+        if (graph_reuse_disable) {
+            timing_decode->reasons.push_back("graph_reuse_disable");
+        } else if (gf_res_prev_active != res) {
+            timing_decode->reasons.push_back("active_mismatch:" + std::to_string(active_slot) + "->" + std::to_string(n_outputs > 0));
+        }
+        timing_decode->graphs.push_back("{\"slot\":" + std::to_string(n_outputs > 0) + ",\"active_slot\":" + std::to_string(active_slot) +
+                ",\"n_tokens\":" + std::to_string(ubatch.n_tokens) + ",\"n_outputs\":" + std::to_string(n_outputs) +
+                ",\"n_kv\":" + std::to_string(n_kv) + ",\"reused\":" + (reused ? "true" : "false") + "}");
+        timing_decode->last = ggml_time_us();
+    }
+
+    if (reused) {
+        //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", "process_ubatch");
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
         // on the GPU. we must synchronize before set_inputs to avoid overwriting input tensors
         // that the previous compute is still reading.
         if (cparams.pipeline_parallel) {
-            ggml_backend_sched_synchronize(sched.get());
+            synchronize_backend("process_ubatch.pipeline_parallel");
         }
 
+        if constexpr (timed) { timing_decode->mark("reuse_sync"); }
         n_reused++;
     } else {
         gf_res_prev_active = nullptr;
@@ -1448,18 +1502,23 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         //const auto t_start_us = ggml_time_us();
 
+        if constexpr (timed) { timing_decode->mark("sched_reset"); }
+
         gf = model.build_graph(gparams);
+        if constexpr (timed) { timing_decode->mark("build_graph"); }
 
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
 
         if (!gf) {
-            LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
+            LLAMA_LOG_ERROR("%s: failed to initialize graph\n", "process_ubatch");
             ret = GGML_STATUS_FAILED;
             return nullptr;
         }
 
-        if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
-            LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
+        const bool allocated = ggml_backend_sched_alloc_graph(sched.get(), gf);
+        if constexpr (timed) { timing_decode->mark("sched_alloc_graph"); }
+        if (!allocated) {
+            LLAMA_LOG_ERROR("%s: failed to allocate graph\n", "process_ubatch");
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
@@ -1477,9 +1536,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    if constexpr (timed) { timing_decode->mark("set_inputs"); }
+
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    if constexpr (timed) { timing_decode->mark("graph_compute"); }
     if (status != GGML_STATUS_SUCCESS) {
-        LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
+        LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", "process_ubatch", status);
         ret = status;
         return nullptr;
     }
@@ -1524,7 +1586,7 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
     // TODO: this clear of the buffer can easily be forgotten - need something better
     // sync first so any in-flight async copies into embd_seq complete before it is freed
     if (!embd_seq.empty()) {
-        synchronize();
+        synchronize(__func__);
     }
     embd_seq.clear();
 
@@ -1651,7 +1713,7 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
     if (model.arch == LLM_ARCH_T5 && t_embd) {
         //cross.t_embd = t_embd;
 
-        synchronize();
+        synchronize(__func__);
 
         cross.n_embd = t_embd->ne[0];
         cross.n_enc  = t_embd->ne[1];
@@ -1729,19 +1791,34 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch_ext & batch_inp) {
+    if (step_timing_enabled) {
+        return decode_impl<true>(batch_inp);
+    }
+    return decode_impl<false>(batch_inp);
+}
+
+template<bool timed>
+int llama_context::decode_impl(const llama_batch_ext & batch_inp) {
+    std::unique_ptr<llama_step_timing_record> timing;
+    if constexpr (timed) {
+        timing.reset(new llama_step_timing_record("decode", cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP ? "mtp" : "target", &timing_decode));
+        timing_decode_id = timing->decode_id = llama_step_timing_next_decode();
+        timing->n_tokens = batch_inp.tokens.size();
+    }
+
     if (!memory) {
-        LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
+        LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", "decode");
         return encode(batch_inp);
     }
 
     if (batch_inp.tokens.empty()) {
-        LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
+        LLAMA_LOG_ERROR("%s: n_tokens == 0\n", "decode");
         return -1;
     }
 
     if (batch_inp.n_embd > 0 && batch_inp.n_embd != batch_inp.n_embd_inp) {
         LLAMA_LOG_ERROR("%s: embd row width %zu does not match the decoder input %zu\n",
-                __func__, batch_inp.n_embd, batch_inp.n_embd_inp);
+                "decode", batch_inp.n_embd, batch_inp.n_embd_inp);
         return -1;
     }
 
@@ -1776,7 +1853,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 if (sampler != sampling.samplers.end() &&
                         seq_output_count[seq_id] > (int32_t) cparams.n_outputs_max_per_seq) {
                     LLAMA_LOG_ERROR("%s: backend sampling supports at most %u outputs per sequence "
-                            "(seq_id %d had %d)\n", __func__, cparams.n_outputs_max_per_seq,
+                            "(seq_id %d had %d)\n", "decode", cparams.n_outputs_max_per_seq,
                             seq_id, seq_output_count[seq_id]);
                     return -1;
                 }
@@ -1785,18 +1862,23 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     }
 
     if (!balloc->init(batch_inp, vocab, output_all)) {
-        LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
+        LLAMA_LOG_ERROR("%s: failed to initialize batch\n", "decode");
         return -1;
     }
 
     const uint32_t n_tokens_all  = balloc->get_n_tokens();
     const uint32_t n_outputs_all = balloc->get_n_outputs();
 
+    if constexpr (timed) {
+        timing->n_outputs = n_outputs_all;
+        timing->mark("batch_prepare");
+    }
+
     if (output_all) {
         // require that all tokens are output
         if (n_outputs_all != n_tokens_all) {
             LLAMA_LOG_ERROR("%s: pooled embedding requires that all tokens are output (n_outputs_all = %d, n_tokens_all = %d)\n",
-                    __func__, n_outputs_all, n_tokens_all);
+                    "decode", n_outputs_all, n_tokens_all);
             return -1;
         }
     }
@@ -1808,7 +1890,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     // TODO: this clear of the buffer can easily be forgotten - need something better
     // sync first so any in-flight async copies into embd_seq complete before it is freed
     if (!embd_seq.empty()) {
-        synchronize();
+        synchronize("decode");
     }
     embd_seq.clear();
 
@@ -1841,7 +1923,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 } break;
             case LLAMA_MEMORY_STATUS_NO_UPDATE:
                 {
-                    LLAMA_LOG_ERROR("%s: unexpected memory context status: %d\n", __func__, mctx->get_status());
+                    LLAMA_LOG_ERROR("%s: unexpected memory context status: %d\n", "decode", mctx->get_status());
 
                     return -2;
                 }
@@ -1851,19 +1933,19 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                         did_optimize = true;
 
                         if (memory_update(true)) {
-                            LLAMA_LOG_DEBUG("%s: retrying batch size %d after cache optimization\n", __func__, balloc->get_n_tokens());
+                            LLAMA_LOG_DEBUG("%s: retrying batch size %d after cache optimization\n", "decode", balloc->get_n_tokens());
 
                             continue;
                         }
                     }
 
-                    LLAMA_LOG_WARN("%s: failed to find a memory slot for batch of size %d\n", __func__, balloc->get_n_tokens());
+                    LLAMA_LOG_WARN("%s: failed to find a memory slot for batch of size %d\n", "decode", balloc->get_n_tokens());
 
                     return 1;
                 }
             case LLAMA_MEMORY_STATUS_FAILED_COMPUTE:
                 {
-                    LLAMA_LOG_ERROR("%s: compute failed while preparing batch of size %d\n", __func__, balloc->get_n_tokens());
+                    LLAMA_LOG_ERROR("%s: compute failed while preparing batch of size %d\n", "decode", balloc->get_n_tokens());
 
                     return -2;
                 }
@@ -1872,9 +1954,11 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         break;
     }
 
+    if constexpr (timed) { timing->mark("memory_prepare"); }
+
     // reserve output buffer
     if (output_reserve(n_outputs_all) < n_outputs_all) {
-        LLAMA_LOG_ERROR("%s: could not reserve space for batch with %d outputs\n", __func__, n_outputs_all);
+        LLAMA_LOG_ERROR("%s: could not reserve space for batch with %d outputs\n", "decode", n_outputs_all);
         return -2;
     };
 
@@ -1882,6 +1966,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     for (const auto & entry : sampling.samplers) {
         llama_sampler_backend_begin(entry.second);
     }
+
+    if constexpr (timed) { timing->mark("output_prepare"); }
 
     int64_t n_outputs_prev = 0;
     int64_t n_tokens_prev  = 0;
@@ -1905,9 +1991,11 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             n_outputs = n_outputs_new;
         }
 
+        if constexpr (timed) { timing->mark("ubatch_prepare"); }
+
         ggml_status status;
 
-        const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+        const auto * res = process_ubatch_impl<timed>(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
 
         if (!res) {
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
@@ -1927,7 +2015,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                     continue;
                 }
 
-                LLAMA_LOG_WARN("%s: removing memory module entries for seq_id = %d, pos = [%d, +inf)\n", __func__, s, pos_min[s]);
+                LLAMA_LOG_WARN("%s: removing memory module entries for seq_id = %d, pos = [%d, +inf)\n", "decode", s, pos_min[s]);
 
                 memory->seq_rm(s, pos_min[s], -1);
             }
@@ -2068,6 +2156,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             copy_tensor_async_rows(res->t_candidates,     sampling.candidates, stride, n_outputs_prev, sched.get(), &sampling.candidates_count);
         }
 
+        if constexpr (timed) { timing->mark("output_transfer"); }
+
         n_outputs_prev += n_outputs;
         n_tokens_prev  += ubatch.n_tokens;
     } while (mctx->next());
@@ -2124,6 +2214,11 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
+
+    if constexpr (timed) {
+        timing->mark("output_mapping");
+        timing->status = 0;
+    }
 
     return 0;
 }
@@ -2198,7 +2293,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
             // This doesn't happen often, but may be annoying in some cases (like the HellaSwag benchmark)
             LLAMA_LOG_DEBUG("%s: reallocating output buffer from size %.02f MiB to %.02f MiB\n", __func__, prev_size / 1024.0 / 1024.0, new_size / 1024.0 / 1024.0);
 #endif
-            synchronize();
+            synchronize(__func__);
 
             // TODO: not needed?
             buf_output = nullptr;
@@ -4113,17 +4208,17 @@ void llama_set_warmup(llama_context * ctx, bool warmup) {
 }
 
 void llama_synchronize(llama_context * ctx) {
-    ctx->synchronize();
+    ctx->synchronize(__func__);
 }
 
 float * llama_get_logits(llama_context * ctx) {
-    ctx->synchronize();
+    ctx->synchronize(__func__);
 
     return ctx->get_logits();
 }
 
 float * llama_get_logits_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize(__func__);
 
     float * res = nullptr;
 
@@ -4137,19 +4232,19 @@ float * llama_get_logits_ith(llama_context * ctx, int32_t i) {
 }
 
 float * llama_get_embeddings(llama_context * ctx) {
-    ctx->synchronize();
+    ctx->synchronize(__func__);
 
     return ctx->get_embeddings();
 }
 
 float * llama_get_embeddings_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize(__func__);
 
     return ctx->get_embeddings_ith(i);
 }
 
 float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
-    ctx->synchronize();
+    ctx->synchronize(__func__);
 
     return ctx->get_embeddings_seq(seq_id);
 }
@@ -4175,19 +4270,19 @@ llama_memory_t llama_get_memory(const struct llama_context * ctx) {
 }
 
 float * llama_get_embeddings_nextn(llama_context * ctx) {
-    ctx->synchronize();
+    ctx->synchronize(__func__);
 
     return ctx->get_embeddings_nextn();
 }
 
 float * llama_get_embeddings_nextn_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize(__func__);
 
     return ctx->get_embeddings_nextn_ith(i);
 }
 
 float * llama_get_embeddings_layer_inp(llama_context * ctx, uint32_t lid) {
-    ctx->synchronize();
+    ctx->synchronize(__func__);
 
     return ctx->get_embeddings_layer_inp(lid);
 }
@@ -4197,43 +4292,43 @@ bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler *
 }
 
 llama_token llama_get_sampled_token_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize(__func__);
 
     return ctx->get_sampled_token_ith(i);
 }
 
 float * llama_get_sampled_probs_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize(__func__);
 
     return ctx->get_sampled_probs_ith(i);
 }
 
 float * llama_get_sampled_logits_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize(__func__);
 
     return ctx->get_sampled_logits_ith(i);
 }
 
 llama_token * llama_get_sampled_candidates_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize(__func__);
 
     return const_cast<llama_token *>(ctx->get_sampled_candidates_ith(i));
 }
 
 uint32_t llama_get_sampled_candidates_count_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize(__func__);
 
     return static_cast<uint32_t>(ctx->get_sampled_candidates_count(i));
 }
 
 uint32_t llama_get_sampled_logits_count_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize(__func__);
 
     return static_cast<uint32_t>(ctx->get_sampled_logits_count(i));
 }
 
 uint32_t llama_get_sampled_probs_count_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
+    ctx->synchronize(__func__);
 
     return static_cast<uint32_t>(ctx->get_sampled_probs_count(i));
 }
@@ -4414,20 +4509,20 @@ size_t llama_state_get_size(llama_context * ctx) {
 }
 
 size_t llama_state_get_data(llama_context * ctx, uint8_t * dst, size_t size) {
-    ctx->synchronize();
+    ctx->synchronize(__func__);
 
     return ctx->state_get_data(dst, size);
 }
 
 // Sets the state reading from the specified source address
 size_t llama_state_set_data(llama_context * ctx, const uint8_t * src, size_t size) {
-    ctx->synchronize();
+    ctx->synchronize(__func__);
 
     return ctx->state_set_data(src, size);
 }
 
 bool llama_state_load_file(llama_context * ctx, const char * path_session, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
-    ctx->synchronize();
+    ctx->synchronize(__func__);
 
     try {
         return ctx->state_load_file(path_session, tokens_out, n_token_capacity, n_token_count_out);
@@ -4438,7 +4533,7 @@ bool llama_state_load_file(llama_context * ctx, const char * path_session, llama
 }
 
 bool llama_state_save_file(llama_context * ctx, const char * path_session, const llama_token * tokens, size_t n_token_count) {
-    ctx->synchronize();
+    ctx->synchronize(__func__);
 
     try {
         return ctx->state_save_file(path_session, tokens, n_token_count);
@@ -4465,18 +4560,18 @@ size_t llama_state_seq_get_size_ext(llama_context * ctx, llama_seq_id seq_id, ll
 }
 
 size_t llama_state_seq_get_data_ext(llama_context * ctx, uint8_t * dst, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    ctx->synchronize();
+    ctx->synchronize(__func__);
 
     return ctx->state_seq_get_data(seq_id, dst, size, flags);
 }
 size_t llama_state_seq_set_data_ext(llama_context * ctx, const uint8_t * src, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    ctx->synchronize();
+    ctx->synchronize(__func__);
 
     return ctx->state_seq_set_data(seq_id, src, size, flags);
 }
 
 size_t llama_state_seq_save_file(llama_context * ctx, const char * filepath, llama_seq_id seq_id, const llama_token * tokens, size_t n_token_count) {
-    ctx->synchronize();
+    ctx->synchronize(__func__);
 
     try {
         return ctx->state_seq_save_file(seq_id, filepath, tokens, n_token_count);
@@ -4487,7 +4582,7 @@ size_t llama_state_seq_save_file(llama_context * ctx, const char * filepath, lla
 }
 
 size_t llama_state_seq_load_file(llama_context * ctx, const char * filepath, llama_seq_id dest_seq_id, llama_token * tokens_out, size_t n_token_capacity, size_t * n_token_count_out) {
-    ctx->synchronize();
+    ctx->synchronize(__func__);
 
     try {
         return ctx->state_seq_load_file(dest_seq_id, filepath, tokens_out, n_token_capacity, n_token_count_out);

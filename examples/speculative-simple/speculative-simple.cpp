@@ -4,6 +4,7 @@
 #include "speculative.h"
 #include "log.h"
 #include "llama.h"
+#include "llama-step-timing.h"
 
 #include <algorithm>
 #include <clocale>
@@ -14,7 +15,8 @@
 #include <vector>
 #include <utility>
 
-int main(int argc, char ** argv) {
+template<bool timed>
+static int speculative_simple_main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
 
     common_params params;
@@ -26,7 +28,7 @@ int main(int argc, char ** argv) {
     }
 
     if (params.n_predict < -1) {
-        LOG_ERR("%s: --n-predict must be >= -1\n", __func__);
+        LOG_ERR("%s: --n-predict must be >= -1\n", "main");
         return 1;
     }
 
@@ -78,13 +80,13 @@ int main(int argc, char ** argv) {
     inp = common_tokenize(ctx_tgt, params.prompt, true, true);
 
     if (llama_n_ctx(ctx_tgt) < (uint32_t) inp.size()) {
-        LOG_ERR("%s: the prompt exceeds the context size (%d tokens, ctx %d)\n", __func__, (int) inp.size(), llama_n_ctx(ctx_tgt));
+        LOG_ERR("%s: the prompt exceeds the context size (%d tokens, ctx %d)\n", "main", (int) inp.size(), llama_n_ctx(ctx_tgt));
 
         return 1;
     }
 
     if (llama_n_batch(ctx_tgt) < (uint32_t) inp.size()) {
-        LOG_ERR("%s: the prompt exceeds the batch size (%d tokens, batch %d)\n", __func__, (int) inp.size(), llama_n_batch(ctx_tgt));
+        LOG_ERR("%s: the prompt exceeds the batch size (%d tokens, batch %d)\n", "main", (int) inp.size(), llama_n_batch(ctx_tgt));
 
         return 1;
     }
@@ -159,7 +161,15 @@ int main(int argc, char ** argv) {
 
     const auto t_dec_start = ggml_time_us();
 
+    int64_t step = 0;
+
     while (true) {
+        std::unique_ptr<llama_step_timing_record> timing;
+        if constexpr (timed) {
+            llama_step_timing_step(step++);
+            timing.reset(new llama_step_timing_record("step", "speculative-simple"));
+        }
+
         // generate or reuse draft tokens
         //
         // this is the most important part of the speculation. the more probable tokens that are provided here
@@ -193,7 +203,9 @@ int main(int argc, char ** argv) {
                 /* .prompt     = */ &prompt_tgt,
                 /* .result     = */ &draft, // output
             };
+            if constexpr (timed) { timing->mark("checkpoint_prepare"); }
             common_speculative_draft(spec);
+            if constexpr (timed) { timing->mark("draft"); }
 
             // save a checkpoint of the target context before evaluating the draft
             // this allows us to restore the state if partial draft acceptance occurs
@@ -218,6 +230,8 @@ int main(int argc, char ** argv) {
             }
         }
 
+        if constexpr (timed) { timing->mark("checkpoint_seq_rm"); }
+
         // always have a token to evaluate from before - id_last
         batch_tgt.clear();
         batch_tgt.add(id_last, n_past++, seq_id, true);
@@ -229,7 +243,9 @@ int main(int argc, char ** argv) {
             }
 
 
+            if constexpr (timed) { timing->mark("verify_batch"); }
             llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch_tgt.get());
+            if constexpr (timed) { timing->mark("verify_decode"); }
         }
 
         // feed the batch to the speculative implementation(s) - this drives the draft model, MTP, Eagle3, etc.
@@ -237,6 +253,8 @@ int main(int argc, char ** argv) {
             LOG_ERR("%s", "failed to process speculative batch\n");
             break;
         }
+
+        if constexpr (timed) { timing->mark("speculative_process"); }
 
         // only save the sampler sampler state if we use checkpoints
         common_sampler_ptr smpl_save;
@@ -260,11 +278,18 @@ int main(int argc, char ** argv) {
 
         GGML_ASSERT(ids.size() > 0); // there will always be at least one accepted token
 
+        if constexpr (timed) {
+            timing->drafted = n_draft;
+            timing->accepted = ids.size() - 1;
+        }
+
         // check for partial draft acceptance:
         // if the context doesn't support partial sequence removal, restore the checkpoint
         // and make the accepted tokens the new partial draft for the next iteration
         if (use_ckpt_tgt && ids.size() - 1 < n_draft) {
             LOG_DBG("partial acceptance: %zu < %zu, restoring checkpoint\n", ids.size() - 1, n_draft);
+
+            if constexpr (timed) { timing->mark("sampling_accept"); }
 
             draft = std::move(ids);
 
@@ -285,6 +310,10 @@ int main(int argc, char ** argv) {
 
             n_past = (int) prompt_tgt.size();
 
+            if constexpr (timed) {
+                timing->mark("checkpoint_restore_seq_rm");
+                timing->status = 1;
+            }
             continue;
         }
 
@@ -295,6 +324,8 @@ int main(int argc, char ** argv) {
         n_drafted += n_draft; // note: we ignore the discarded small drafts
         n_accept  += ids.size() - 1;
         n_predict += ids.size();
+
+        if constexpr (timed) { timing->mark("sampling_accept"); }
 
         // process the accepted tokens and update contexts
         //
@@ -325,20 +356,30 @@ int main(int argc, char ** argv) {
         // clear the draft since it has been consumed
         draft.clear();
 
+        if constexpr (timed) { timing->mark("output"); }
+
         {
             LOG_DBG("clear kv cache from any extra tokens, n_past = %d\n", n_past);
 
             llama_memory_seq_rm(llama_get_memory(ctx_tgt), seq_id, n_past, -1);
+            if constexpr (timed) { timing->mark("seq_rm_target"); }
 
             if (ctx_dft) {
                 llama_memory_seq_rm(llama_get_memory(ctx_dft), seq_id, n_past, -1);
             }
         }
 
+        if constexpr (timed) {
+            timing->mark("seq_rm_draft");
+            timing->status = 0;
+        }
+
         if ((params.n_predict >= 0 && n_predict > params.n_predict) || has_eos) {
             break;
         }
     }
+
+    if constexpr (timed) { llama_step_timing_step(-1); }
 
     auto t_dec_end = ggml_time_us();
 
@@ -372,4 +413,11 @@ int main(int argc, char ** argv) {
     LOG("\n\n");
 
     return 0;
+}
+
+int main(int argc, char ** argv) {
+    if (llama_step_timing_enabled()) {
+        return speculative_simple_main<true>(argc, argv);
+    }
+    return speculative_simple_main<false>(argc, argv);
 }

@@ -397,7 +397,6 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_rwkv(ctx, idx);
             } break;
-        case GGML_OP_GATED_DELTA_NET_INPLACE:
         case GGML_OP_GATED_DELTA_NET:
             {
                 n_fuse = ggml_metal_op_gated_delta_net(ctx, idx);
@@ -1739,8 +1738,6 @@ int ggml_metal_op_ssm_conv_inplace(ggml_metal_op_t ctx, int idx) {
     const ggml_tensor * state = op->src[0];
     ggml_metal_kargs_ssm_conv_inplace args = {
         state->ne[0], state->ne[1], state->nb[1], state->nb[2], op->src[1]->nb[1], op->src[2]->nb[1],
-        ggml_get_op_params_i32(op, 0) ? op->src[1]->ne[1] : 0,
-        state->ne[3], state->nb[3], op->src[1]->nb[2],
     };
     auto pipeline = ggml_metal_library_get_pipeline_ssm_conv_inplace(ctx->lib, use_silu);
     ggml_metal_encoder_set_pipeline(ctx->enc, pipeline);
@@ -2024,7 +2021,7 @@ int ggml_metal_op_rwkv(ggml_metal_op_t ctx, int idx) {
 }
 
 bool ggml_metal_op_gated_delta_net_use_r4d(const ggml_tensor * op, bool has_simdgroup_mm, size_t max_threadgroup_memory_size) {
-    assert(op->op == GGML_OP_GATED_DELTA_NET || op->op == GGML_OP_GATED_DELTA_NET_INPLACE);
+    assert(op->op == GGML_OP_GATED_DELTA_NET);
 
     const int64_t K = ggml_get_op_params_i32(op, 0);
     // Allocation sizing and execution must make the same choice. Treat this as a process-start
@@ -2042,7 +2039,7 @@ bool ggml_metal_op_gated_delta_net_use_r4d(const ggml_tensor * op, bool has_simd
     }();
 
     // Keep the product spike opt-in until whole-model quality and throughput gates are complete.
-    return enabled && op->op == GGML_OP_GATED_DELTA_NET &&
+    return enabled &&
         has_simdgroup_mm &&
         max_threadgroup_memory_size >= 32*1024 &&
         K == 1 &&
@@ -2078,7 +2075,7 @@ bool ggml_metal_op_gated_delta_net_use_r4d(const ggml_tensor * op, bool has_simd
 }
 
 size_t ggml_metal_op_gated_delta_net_extra_inverse(const ggml_tensor * op) {
-    assert(op->op == GGML_OP_GATED_DELTA_NET || op->op == GGML_OP_GATED_DELTA_NET_INPLACE);
+    assert(op->op == GGML_OP_GATED_DELTA_NET);
 
     const int64_t n_chunks = op->src[2]->ne[2]/32;
     const int64_t n_heads  = op->src[2]->ne[1];
@@ -2111,10 +2108,6 @@ int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
     // recurrent cache and the cpy is skipped (see GGML_METAL_FUSION_GDN_CACHE)
     ggml_metal_buffer_id bid_out = ggml_metal_get_buffer_id(op);
     uint64_t nb_out = 0;
-    if (op->op == GGML_OP_GATED_DELTA_NET_INPLACE) {
-        bid_out = ggml_metal_get_buffer_id(op->src[6]);
-        nb_out = op->src[6]->nb[2]/sizeof(float);
-    }
     int n_fuse = 1;
 
     if (use_fusion) {

@@ -1389,28 +1389,6 @@ bool llama_memory_recurrent_context::is_s_copy_identity() const {
     return true;
 }
 
-bool llama_memory_recurrent_context::is_s_copy_snapshot_identity() const {
-    if (is_full || status != LLAMA_MEMORY_STATUS_SUCCESS || ubatches.empty() || mem->n_rs_seq == 0 || mem->rs_z >= 0) {
-        return false;
-    }
-    const auto & ubatch = ubatches[i_next];
-    if (mem->n != ubatch.n_seqs || ubatch.n_seq_tokens > mem->n_rs_seq + 1) {
-        return false;
-    }
-    for (uint32_t i = 0; i < ubatch.n_seqs; ++i) {
-        const auto & cell = mem->cells[mem->head + i];
-        if (cell.src0 != (int32_t) (mem->head + i)) {
-            return false;
-        }
-        for (const llama_seq_id seq : cell.seq_id) {
-            if (seq >= 0 && (size_t) seq < mem->rs_idx.size() && mem->rs_idx[seq] != 0) {
-                return false;
-            }
-        }
-    }
-    return true;
-}
-
 int32_t llama_memory_recurrent_context::s_copy(int i) const {
     const uint32_t cell_idx = i + mem->head;
     const int32_t  src0     = mem->cells[cell_idx].src0;

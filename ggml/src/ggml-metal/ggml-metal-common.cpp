@@ -269,9 +269,6 @@ bool ggml_mem_ranges_add(ggml_mem_ranges_t mrs, const ggml_tensor * tensor) {
         }
     }
 
-    if (tensor->op == GGML_OP_GATED_DELTA_NET_INPLACE) {
-        ggml_mem_ranges_add_dst(mrs, tensor->src[6]);
-    }
     if (tensor->op == GGML_OP_SSM_CONV_INPLACE) {
         ggml_mem_ranges_add_dst(mrs, tensor->src[0]);
     }
@@ -338,9 +335,6 @@ bool ggml_mem_ranges_check(ggml_mem_ranges_t mrs, const ggml_tensor * tensor) {
         }
     }
 
-    if (tensor->op == GGML_OP_GATED_DELTA_NET_INPLACE && !ggml_mem_ranges_check_dst(mrs, tensor->src[6])) {
-        return false;
-    }
     if (tensor->op == GGML_OP_SSM_CONV_INPLACE && !ggml_mem_ranges_check_dst(mrs, tensor->src[0])) {
         return false;
     }
@@ -405,9 +399,6 @@ static std::vector<int> ggml_metal_graph_optimize_reorder(const std::vector<node
             }
         }
 
-        if (node.op() == GGML_OP_GATED_DELTA_NET_INPLACE) {
-            ggml_mem_ranges_add_dst(mrs, node.node->src[6]);
-        }
         if (node.op() == GGML_OP_SSM_CONV_INPLACE) {
             ggml_mem_ranges_add_dst(mrs, node.node->src[0]);
         }
@@ -447,9 +438,6 @@ static std::vector<int> ggml_metal_graph_optimize_reorder(const std::vector<node
             }
         }
 
-        if (node.op() == GGML_OP_GATED_DELTA_NET_INPLACE && !ggml_mem_ranges_check_dst(mrs, node.node->src[6])) {
-            return false;
-        }
         if (node.op() == GGML_OP_SSM_CONV_INPLACE && !ggml_mem_ranges_check_dst(mrs, node.node->src[0])) {
             return false;
         }

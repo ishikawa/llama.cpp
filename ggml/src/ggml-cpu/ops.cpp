@@ -11220,9 +11220,7 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
     const int64_t attn_score_elems    = S_v * H * n_tokens * n_seqs;
     const int64_t state_size_per_snap = S_v * S_v * H * n_seqs;
     float * attn_out_base  = (float *)dst->data;
-    ggml_tensor * snapshots = dst->op == GGML_OP_GATED_DELTA_NET_INPLACE ? dst->src[6] : nullptr;
-    float * state_out_base = snapshots ? (float *) snapshots->data : (float *)dst->data + attn_score_elems;
-    const int64_t slot_stride = snapshots ? snapshots->nb[2]/sizeof(float) : state_size_per_snap;
+    float * state_out_base = (float *)dst->data + attn_score_elems;
 
     // snapshot slot mapping: slot 0 = most recent state, slot s = s tokens back.
     // When n_tokens < K only slots 0..n_tokens-1 are written; older slots are caller-owned.
@@ -11308,7 +11306,7 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
             if (K > 1) {
                 const int64_t target_slot = n_tokens - 1 - t;
                 if (target_slot >= 0 && target_slot < K) {
-                    float * curr_state_o = state_out_base + target_slot * slot_stride +
+                    float * curr_state_o = state_out_base + target_slot * state_size_per_snap +
                                      (iv3 * H + iv1) * S_v * S_v;
                     memcpy(curr_state_o, s_out, S_v * S_v * sizeof(float));
                 }
@@ -12483,35 +12481,6 @@ void ggml_compute_forward_ssm_conv_inplace(const ggml_compute_params * params, g
     const ggml_tensor * kernel = dst->src[2];
     const int64_t nh = state->ne[0];
     const int64_t channels = state->ne[1];
-    const bool snapshots = ggml_get_op_params_i32(dst, 0) != 0;
-    if (snapshots) {
-        const int64_t nt = x->ne[1];
-        for (int64_t i = params->ith; i < channels*state->ne[2]; i += params->nth) {
-            const int64_t c = i % channels;
-            const int64_t seq = i / channels;
-            float * h = (float *) ((char *) state->data + c*state->nb[1] + seq*state->nb[2]);
-            const float * w = (const float *) ((const char *) kernel->data + c*kernel->nb[1]);
-            auto sample = [&](int64_t j) {
-                return j < nh ? h[j] : *(const float *) ((const char *) x->data + c*x->nb[0] + (j - nh)*x->nb[1] + seq*x->nb[2]);
-            };
-            for (int64_t t = 0; t < nt; ++t) {
-                float sum = 0.0f;
-                for (int64_t j = 0; j <= nh; ++j) {
-                    sum += sample(t + j)*w[j];
-                }
-                ((float *) dst->data)[(seq*nt + t)*channels + c] = sum;
-            }
-            // Slot 0 is written last, in ascending order: each source history index is at least its destination index.
-            for (int64_t slot = state->ne[3] - 1; slot >= 0; --slot) {
-                float * out = (float *) ((char *) h + slot*state->nb[3]);
-                const int64_t shift = std::max<int64_t>(0, nt - slot);
-                for (int64_t j = 0; j < nh; ++j) {
-                    out[j] = sample(shift + j);
-                }
-            }
-        }
-        return;
-    }
     for (int64_t i = params->ith; i < channels*state->ne[2]; i += params->nth) {
         const int64_t channel = i % channels;
         const int64_t seq = i / channels;

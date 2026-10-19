@@ -1,4 +1,5 @@
 #include "common.h"
+#include "log.h"
 #include "speculative.h"
 #include "ggml-backend.h"
 #include "../../src/llama-ext.h"
@@ -7,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
+#include <list>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -25,6 +27,10 @@ static void usage() {
               "  --batch-length N       logical batch (default 2048)\n"
               "  --repetitions N        repetitions (default 3)\n"
               "  --gpu-layers N         offloaded layers (default 99)\n"
+              "  --cpu-tensor REGEX     keep matching tensors in CPU memory (repeatable,\n"
+              "                        e.g. 'per_layer_token_embd\\.weight' as in the server -ot)\n"
+              "  --verbosity N          log verbosity threshold (4 shows libllama INFO lines,\n"
+              "                        including mtp_profile_ubatch)\n"
               "  --help\n"
               "draft-only first captures target+draft rows, then clears draft KV and replays.\n"
               "Capture copies and context initialization are excluded from timings.\n"
@@ -71,6 +77,8 @@ int main(int argc, char ** argv) {
         int32_t n_repetitions = 3;
         int32_t n_ubatch_dft = 0;
         std::string mode = "all";
+        std::list<std::string> cpu_tensor_patterns;
+        int32_t verbosity = -1;
         for (int i = 1; i < argc; ++i) {
             const std::string arg = argv[i];
             if (arg == "--help" || arg == "-h") {
@@ -93,6 +101,8 @@ int main(int argc, char ** argv) {
                 check(end == value.size() && n >= 0 && n <= std::numeric_limits<int32_t>::max(), "invalid GPU layer count");
                 params.n_gpu_layers = (int32_t) n;
             }
+            else if (arg == "--verbosity")     { verbosity = positive(value); }
+            else if (arg == "--cpu-tensor")    { cpu_tensor_patterns.push_back(value); }
             else if (arg == "--target-k")      { params.cache_type_k = kv_type(value); }
             else if (arg == "--target-v")      { params.cache_type_v = kv_type(value); }
             else if (arg == "--draft-k")       { params.speculative.draft.cache_type_k = kv_type(value); }
@@ -102,9 +112,32 @@ int main(int argc, char ** argv) {
         check(!params.model.path.empty(), "--model is required");
         check(n_prompt <= params.n_ctx, "prompt exceeds context size");
         check(mode == "all" || mode == "target-only" || mode == "target+draft" || mode == "draft-only", "invalid mode");
+        // common_params_parse normally resolves the -1 thread defaults
+        postprocess_cpu_params(params.cpuparams, nullptr);
+        postprocess_cpu_params(params.cpuparams_batch, &params.cpuparams);
+        postprocess_cpu_params(params.speculative.draft.cpuparams, &params.cpuparams);
+        postprocess_cpu_params(params.speculative.draft.cpuparams_batch, &params.cpuparams_batch);
+        // the MTP head tensors are only loaded when requested before the model is created
+        params.load_mtp = mode != "target-only";
         common_init();
+        if (verbosity >= 0) {
+            common_log_set_verbosity_thold(verbosity);
+        }
         llama_backend_init();
         ggml_backend_load_all();
+        if (!cpu_tensor_patterns.empty()) {
+            ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+            check(cpu_dev != nullptr, "CPU backend device not found");
+            ggml_backend_buffer_type_t cpu_buft = ggml_backend_dev_buffer_type(cpu_dev);
+            for (const auto & pattern : cpu_tensor_patterns) {
+                params.tensor_buft_overrides.push_back({ pattern.c_str(), cpu_buft });
+            }
+            // terminate and pad the same way common_params_parse does for llama_params_fit
+            const size_t ntbo = llama_max_tensor_buft_overrides();
+            while (params.tensor_buft_overrides.size() < ntbo) {
+                params.tensor_buft_overrides.push_back({ nullptr, nullptr });
+            }
+        }
         auto target = common_init_from_params(params);
         auto * ctx_tgt = target->context();
         auto * model = target->model();

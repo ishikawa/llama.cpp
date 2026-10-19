@@ -5953,25 +5953,15 @@ struct test_mul_mat_id_fusion : public test_case {
     }
 };
 
-static bool metal_moe_fuse_two_token_enabled() {
-    static const bool enabled = [] {
-        const char * env = std::getenv("GGML_METAL_MOE_FUSE_TWO_TOKEN");
-        return env && std::strcmp(env, "1") == 0;
-    }();
-    return enabled;
-}
-
 struct test_moe_gate_up_swiglu : public test_mul_mat_id {
     const char * metal_fusion_env() override { return "GGML_METAL_FUSE_MOE_GATE_UP"; }
     const char * metal_fusion_label() override { return "MUL_MAT_ID+MUL_MAT_ID+GLU"; }
-    bool metal_fusion_expected() override {
-        return fallback == "none" && (n == 1 || (n == 2 && metal_moe_fuse_two_token_enabled()));
-    }
+    bool metal_fusion_expected() override { return fallback == "none"; }
     const bool up_first;
     const std::string fallback;
 
-    test_moe_gate_up_swiglu(ggml_type type, bool broadcast, bool up_first = false, std::string fallback = "none", int64_t tokens = 1)
-        : test_mul_mat_id(type, GGML_TYPE_F32, 512, 10, broadcast, 640, tokens, 2560),
+    test_moe_gate_up_swiglu(ggml_type type, bool broadcast, bool up_first = false, std::string fallback = "none")
+        : test_mul_mat_id(type, GGML_TYPE_F32, 512, 10, broadcast, 640, 1, 2560),
           up_first(up_first), fallback(fallback) {}
 
     std::string vars() override {
@@ -5993,9 +5983,7 @@ struct test_moe_gate_up_swiglu : public test_mul_mat_id {
         ggml_tensor * gate_w = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
         ggml_tensor * up_w = ggml_new_tensor_3d(ctx, fallback == "mixed_type" ? GGML_TYPE_IQ3_S : type_a, k, m, n_mats);
         ggml_tensor * x = ggml_new_tensor_3d(ctx, type_b, k, b ? 1 : n_used, n);
-        ggml_set_name(x, "moe_input");
         ggml_tensor * ids_all = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
-        ggml_set_name(ids_all, "moe_ids");
         ggml_tensor * ids = ggml_view_2d(ctx, ids_all, n_used, n, ids_all->nb[1], 0);
         ggml_tensor * up_x = x;
         ggml_tensor * up_ids = ids;
@@ -6019,31 +6007,6 @@ struct test_moe_gate_up_swiglu : public test_mul_mat_id {
             out = ggml_add(ctx, out, gate);
         }
         return out;
-    }
-
-    void initialize_tensors(ggml_context * ctx) override {
-        test_mul_mat_id::initialize_tensors(ctx);
-        if (n != 2) {
-            return;
-        }
-        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
-            if (std::strcmp(t->name, "moe_input") == 0) {
-                std::vector<float> data(ggml_nelements(t));
-                const int64_t token_size = t->ne[0]*t->ne[1];
-                for (int64_t i = 0; i < ggml_nelements(t); ++i) {
-                    data[i] = float(i%127 - 63)*0.01f + float(i/token_size)*0.125f;
-                }
-                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
-            } else if (std::strcmp(t->name, "moe_ids") == 0) {
-                std::vector<int32_t> data(ggml_nelements(t));
-                for (int64_t token = 0; token < n; ++token) {
-                    for (int i = 0; i < n_mats; ++i) {
-                        data[token*n_mats + i] = int32_t((i + token*(n_mats/2))%n_mats);
-                    }
-                }
-                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
-            }
-        }
     }
 };
 
@@ -7953,7 +7916,7 @@ struct test_moe_reduce_shared : public test_moe_reduce {
     const char * metal_fusion_env() override { return "GGML_METAL_FUSE_MOE_REDUCE_SHARED"; }
     const char * metal_fusion_label() override { return "MUL+ADD+ADD+ADD+ADD+ADD+ADD+ADD+ADD+ADD+UNARY+MUL+ADD"; }
     bool metal_fusion_expected() override {
-        return (n_tokens == 1 || (n_tokens == 2 && metal_moe_fuse_two_token_enabled())) && !external && !interleaved_views_adds;
+        return n_tokens == 1 && !external && !interleaved_views_adds;
     }
     const bool external;
     const bool matmul_shared;
@@ -11589,7 +11552,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (bool broadcast : {false, true}) {
             for (bool up_first : {false, true}) {
                 test_cases.emplace_back(new test_moe_gate_up_swiglu(type, broadcast, up_first));
-                test_cases.emplace_back(new test_moe_gate_up_swiglu(type, broadcast, up_first, "none", 2));
             }
         }
     }
@@ -11603,7 +11565,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat_id(type, GGML_TYPE_F32, 512, 10, broadcast, 640, 1, 2560));
         }
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 512, 10, broadcast, 2560, 1, 640));
-        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 512, 10, broadcast, 2560, 2, 640));
     }
 
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ2_XXS, GGML_TYPE_F32, 1, 1, false, 1, 8192, 4096));

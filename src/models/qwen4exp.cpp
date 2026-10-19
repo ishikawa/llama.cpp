@@ -566,8 +566,7 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     ggml_build_forward_expand(gf, inp_hyb->get_recr()->s_copy);
 
     llm_graph_input_kpool * inp_kpool = nullptr;
-    // a dense MTP layer leaves the pool input out of the graph, so it must not be built
-    if (mctx_hyb->get_idx() && hparams.dsv4_compress_ratios[il] > 0) {
+    if (mctx_hyb->get_idx() && hparams.indexer_kpool > 0) {
         GGML_ASSERT(mctx_hyb->get_idx()->get_n_kv() == mctx_hyb->get_attn()->get_n_kv() &&
                 "the indexer cache must track the attention cache cell for cell");
         inp_kpool = build_inp_kpool(mctx_hyb);

@@ -942,10 +942,6 @@ typedef struct {
     uint64_t state_nb2;
     uint64_t x_nb1;
     uint64_t kernel_nb1;
-    int64_t n_tokens;
-    int64_t n_slots;
-    uint64_t state_nb3;
-    uint64_t x_nb2;
 } ggml_metal_kargs_ssm_conv_inplace;
 
 

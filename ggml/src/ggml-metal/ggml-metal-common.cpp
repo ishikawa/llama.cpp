@@ -5,40 +5,7 @@
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 
-#include <atomic>
-#include <cstdlib>
-#include <cstring>
 #include <vector>
-
-bool ggml_metal_moe_fuse_two_token_enabled(void) {
-    static const bool enabled = [] {
-        const char * env = std::getenv("GGML_METAL_MOE_FUSE_TWO_TOKEN");
-        return env && std::strcmp(env, "1") == 0;
-    }();
-    return enabled;
-}
-
-void ggml_metal_moe_fuse_two_token_log_once(int path, const char * name) {
-    static std::atomic<bool> logged[3] = {};
-    if (path >= 0 && path < 3 && !logged[path].exchange(true)) {
-        GGML_LOG_INFO("%s: GGML_METAL_MOE_FUSE_TWO_TOKEN=1: %s runs on a two-token batch\n", __func__, name);
-    }
-}
-
-bool ggml_metal_hc_fuse_two_token_enabled(void) {
-    static const bool enabled = [] {
-        const char * env = std::getenv("GGML_METAL_HC_FUSE_TWO_TOKEN");
-        return env && std::strcmp(env, "1") == 0;
-    }();
-    return enabled;
-}
-
-void ggml_metal_hc_fuse_two_token_log_once(int path, const char * name) {
-    static std::atomic<bool> logged[2] = {};
-    if (path >= 0 && path < 2 && !logged[path].exchange(true)) {
-        GGML_LOG_INFO("%s: GGML_METAL_HC_FUSE_TWO_TOKEN=1: %s runs on a two-token batch\n", __func__, name);
-    }
-}
 
 // must stay in sync with the kernel_fwht_<type>_<N> templates in misc.metal. Widths up to
 // 512 run on the simdgroup kernel and need no threadgroup memory. The wider ones allocate
@@ -302,9 +269,6 @@ bool ggml_mem_ranges_add(ggml_mem_ranges_t mrs, const ggml_tensor * tensor) {
         }
     }
 
-    if (tensor->op == GGML_OP_GATED_DELTA_NET_INPLACE) {
-        ggml_mem_ranges_add_dst(mrs, tensor->src[6]);
-    }
     if (tensor->op == GGML_OP_SSM_CONV_INPLACE) {
         ggml_mem_ranges_add_dst(mrs, tensor->src[0]);
     }
@@ -371,9 +335,6 @@ bool ggml_mem_ranges_check(ggml_mem_ranges_t mrs, const ggml_tensor * tensor) {
         }
     }
 
-    if (tensor->op == GGML_OP_GATED_DELTA_NET_INPLACE && !ggml_mem_ranges_check_dst(mrs, tensor->src[6])) {
-        return false;
-    }
     if (tensor->op == GGML_OP_SSM_CONV_INPLACE && !ggml_mem_ranges_check_dst(mrs, tensor->src[0])) {
         return false;
     }
@@ -438,9 +399,6 @@ static std::vector<int> ggml_metal_graph_optimize_reorder(const std::vector<node
             }
         }
 
-        if (node.op() == GGML_OP_GATED_DELTA_NET_INPLACE) {
-            ggml_mem_ranges_add_dst(mrs, node.node->src[6]);
-        }
         if (node.op() == GGML_OP_SSM_CONV_INPLACE) {
             ggml_mem_ranges_add_dst(mrs, node.node->src[0]);
         }
@@ -480,9 +438,6 @@ static std::vector<int> ggml_metal_graph_optimize_reorder(const std::vector<node
             }
         }
 
-        if (node.op() == GGML_OP_GATED_DELTA_NET_INPLACE && !ggml_mem_ranges_check_dst(mrs, node.node->src[6])) {
-            return false;
-        }
         if (node.op() == GGML_OP_SSM_CONV_INPLACE && !ggml_mem_ranges_check_dst(mrs, node.node->src[0])) {
             return false;
         }

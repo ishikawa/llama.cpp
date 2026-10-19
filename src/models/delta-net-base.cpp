@@ -563,15 +563,8 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     const int64_t D = S_v * S_v * H_v;
     const int64_t K = cparams.n_rs_seq + 1;
 
-    // State s is [S_v, S_v, H_v, n_seqs]; snapshots go to the cache directly or to the output tail.
-    ggml_tensor * gdn_out;
-    if (inp->snapshot_identity) {
-        ggml_tensor * snapshots = ggml_view_3d(ctx0, ssm_states_all, D, n_seqs, K,
-                ssm_states_all->nb[1], (size_t) mem_size*ssm_states_all->nb[1], (size_t) kv_head*ssm_states_all->nb[1]);
-        gdn_out = ggml_gated_delta_net_inplace(ctx0, q, k, v, g, b, s, snapshots);
-    } else {
-        gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K);
-    }
+    // state s is 4D [S_v, S_v, H_v, n_seqs]; K snapshot slots are written into the output.
+    ggml_tensor * gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K);
     if (n_seq_tokens > 1) {
         res->add_fused_node({LLM_FUSED_OP_GDN_CH, gdn_out, il});
     } else {
@@ -588,10 +581,6 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         ggml_row_size(gdn_out->type, S_v * H_v * n_seq_tokens),
         0);
     cb(output, "attn_output", il);
-
-    if (inp->snapshot_identity) {
-        return output;
-    }
 
     const size_t row_size = hparams.n_embd_s() * ggml_element_size(ssm_states_all);
 

@@ -397,7 +397,6 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_rwkv(ctx, idx);
             } break;
-        case GGML_OP_GATED_DELTA_NET_INPLACE:
         case GGML_OP_GATED_DELTA_NET:
             {
                 n_fuse = ggml_metal_op_gated_delta_net(ctx, idx);
@@ -859,10 +858,7 @@ int ggml_metal_op_unary(ggml_metal_op_t ctx, int idx) {
         }
         if (fusion && ggml_metal_fusion_get_id(fusion) == GGML_METAL_FUSION_HC_LOWRANK) {
             auto pipeline = ggml_metal_library_get_pipeline_small_fusion(ctx->lib, "kernel_hc_lowrank_f32");
-            int32_t n = (int32_t) (op->ne[0]*op->ne[1]);
-            if (op->ne[1] == 2) {
-                ggml_metal_hc_fuse_two_token_log_once(0, "HC low-rank fusion");
-            }
+            int32_t n = (int32_t) op->ne[0];
             const int nth = std::min(256, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
             ggml_metal_encoder_set_pipeline(ctx->enc, pipeline);
             ggml_metal_encoder_set_bytes(ctx->enc, &n, sizeof(n), 0);
@@ -1623,9 +1619,6 @@ int ggml_metal_op_dsv4_hc(ggml_metal_op_t ctx, int idx) {
     }
 
     if (fusion) {
-        if (op->src[0]->ne[1] == 2) {
-            ggml_metal_hc_fuse_two_token_log_once(1, "HC post gate fusion");
-        }
         ctx->count_fusions(fusion);
     }
     return n_fuse;
@@ -1745,8 +1738,6 @@ int ggml_metal_op_ssm_conv_inplace(ggml_metal_op_t ctx, int idx) {
     const ggml_tensor * state = op->src[0];
     ggml_metal_kargs_ssm_conv_inplace args = {
         state->ne[0], state->ne[1], state->nb[1], state->nb[2], op->src[1]->nb[1], op->src[2]->nb[1],
-        ggml_get_op_params_i32(op, 0) ? op->src[1]->ne[1] : 0,
-        state->ne[3], state->nb[3], op->src[1]->nb[2],
     };
     auto pipeline = ggml_metal_library_get_pipeline_ssm_conv_inplace(ctx->lib, use_silu);
     ggml_metal_encoder_set_pipeline(ctx->enc, pipeline);
@@ -2030,7 +2021,7 @@ int ggml_metal_op_rwkv(ggml_metal_op_t ctx, int idx) {
 }
 
 bool ggml_metal_op_gated_delta_net_use_r4d(const ggml_tensor * op, bool has_simdgroup_mm, size_t max_threadgroup_memory_size) {
-    assert(op->op == GGML_OP_GATED_DELTA_NET || op->op == GGML_OP_GATED_DELTA_NET_INPLACE);
+    assert(op->op == GGML_OP_GATED_DELTA_NET);
 
     const int64_t K = ggml_get_op_params_i32(op, 0);
     // Allocation sizing and execution must make the same choice. Treat this as a process-start
@@ -2048,7 +2039,7 @@ bool ggml_metal_op_gated_delta_net_use_r4d(const ggml_tensor * op, bool has_simd
     }();
 
     // Keep the product spike opt-in until whole-model quality and throughput gates are complete.
-    return enabled && op->op == GGML_OP_GATED_DELTA_NET &&
+    return enabled &&
         has_simdgroup_mm &&
         max_threadgroup_memory_size >= 32*1024 &&
         K == 1 &&
@@ -2084,7 +2075,7 @@ bool ggml_metal_op_gated_delta_net_use_r4d(const ggml_tensor * op, bool has_simd
 }
 
 size_t ggml_metal_op_gated_delta_net_extra_inverse(const ggml_tensor * op) {
-    assert(op->op == GGML_OP_GATED_DELTA_NET || op->op == GGML_OP_GATED_DELTA_NET_INPLACE);
+    assert(op->op == GGML_OP_GATED_DELTA_NET);
 
     const int64_t n_chunks = op->src[2]->ne[2]/32;
     const int64_t n_heads  = op->src[2]->ne[1];
@@ -2117,10 +2108,6 @@ int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
     // recurrent cache and the cpy is skipped (see GGML_METAL_FUSION_GDN_CACHE)
     ggml_metal_buffer_id bid_out = ggml_metal_get_buffer_id(op);
     uint64_t nb_out = 0;
-    if (op->op == GGML_OP_GATED_DELTA_NET_INPLACE) {
-        bid_out = ggml_metal_get_buffer_id(op->src[6]);
-        nb_out = op->src[6]->nb[2]/sizeof(float);
-    }
     int n_fuse = 1;
 
     if (use_fusion) {
@@ -3054,13 +3041,7 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
         const ggml_tensor * gate = out->src[0];
         const ggml_tensor * up = out->src[1];
         auto pipeline = ggml_metal_library_get_pipeline_moe_gate_up(lib, gate);
-        if (out->ne[2] == 2) {
-            ggml_metal_moe_fuse_two_token_log_once(0, "MoE gate/up/SwiGLU fusion");
-        }
         ggml_metal_kargs_mul_mv_id args = {};
-        args.nei0 = gate->src[2]->ne[0];
-        args.nbi1 = gate->src[2]->nb[1];
-        args.nb12 = gate->src[1]->nb[2];
         args.ne00 = gate->src[0]->ne[0];
         args.nb01 = gate->src[0]->nb[1];
         args.nb02 = gate->src[0]->nb[2];
@@ -3075,7 +3056,7 @@ int ggml_metal_op_mul_mat_id(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(gate->src[2]), 4);
         ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(out), 5);
         ggml_metal_encoder_set_threadgroup_memory_size(enc, pipeline.smem, 0);
-        ggml_metal_encoder_dispatch_threadgroups(enc, out->ne[0]/(pipeline.nsg*pipeline.nr0), 1, out->ne[1]*out->ne[2], 32, pipeline.nsg, 1);
+        ggml_metal_encoder_dispatch_threadgroups(enc, out->ne[0]/(pipeline.nsg*pipeline.nr0), 1, out->ne[1], 32, pipeline.nsg, 1);
         return n_fuse;
     }
 
@@ -3646,11 +3627,10 @@ size_t ggml_metal_op_flash_attn_ext_extra_tmp(const ggml_tensor * op) {
 size_t ggml_metal_op_flash_attn_ext_extra_kv_f16(const ggml_tensor * op) {
     assert(op->op == GGML_OP_FLASH_ATTN_EXT);
 
-    // the f16 copy spans the whole KV, so skip it when the kernel reads the quantized KV directly
-    // (e.g. a small-ubatch draft context at long n_ctx would otherwise reserve ~1 GiB unused)
-    if (!ggml_metal_op_flash_attn_ext_use_kv_f16(op)) {
-        return 0;
-    }
+    // note: always reserve the temp buffer to avoid graph reallocations
+    //if (!ggml_metal_op_flash_attn_ext_use_kv_f16(op)) {
+    //    return 0;
+    //}
 
     GGML_TENSOR_LOCALS( int32_t, ne2, op->src[2], ne);
 
@@ -6126,10 +6106,6 @@ int ggml_metal_op_moe_reduce(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(gate), 5);
     }
     ggml_metal_encoder_dispatch_threadgroups(enc, (uint32_t) args.ne02, (uint32_t) n_col_tiles, 1, nth, 1, 1);
-
-    if (shared && args.ne02 == 2) {
-        ggml_metal_moe_fuse_two_token_log_once(2, "MoE reduce/shared fusion");
-    }
 
     if (!shared) {
         ctx->count_fusions(fusion);

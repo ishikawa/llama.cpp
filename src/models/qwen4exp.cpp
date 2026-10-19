@@ -566,8 +566,7 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     ggml_build_forward_expand(gf, inp_hyb->get_recr()->s_copy);
 
     llm_graph_input_kpool * inp_kpool = nullptr;
-    // a dense MTP layer leaves the pool input out of the graph, so it must not be built
-    if (mctx_hyb->get_idx() && hparams.dsv4_compress_ratios[il] > 0) {
+    if (mctx_hyb->get_idx() && hparams.indexer_kpool > 0) {
         GGML_ASSERT(mctx_hyb->get_idx()->get_n_kv() == mctx_hyb->get_attn()->get_n_kv() &&
                 "the indexer cache must track the attention cache cell for cell");
         inp_kpool = build_inp_kpool(mctx_hyb);
@@ -1065,20 +1064,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     const int64_t conv_channels    = head_k_dim * num_k_heads * 2 + head_v_dim * num_v_heads;
 
     ggml_tensor * conv_output_proper;
-    if (inp->snapshot_identity) {
-        static bool logged = false;
-        if (!logged) {
-            logged = true;
-            LLAMA_LOG_INFO("%s: LLAMA_GDN_SNAPSHOT_INPLACE=1: GDN snapshots update identity cache rows in place\n", __func__);
-        }
-        const int64_t state_cols = conv_kernel_size - 1;
-        GGML_ASSERT(conv_states_all->ne[0] == state_cols*conv_channels);
-        ggml_tensor * state = ggml_view_4d(ctx0, conv_states_all, state_cols, conv_channels, n_seqs, cparams.n_rs_seq + 1,
-                state_cols*ggml_element_size(conv_states_all), conv_states_all->nb[1],
-                mctx_cur->get_size()*conv_states_all->nb[1], (size_t) mctx_cur->get_head()*conv_states_all->nb[1]);
-        conv_output_proper = ggml_ssm_conv_snapshots_inplace(ctx0, state, qkv_mixed, conv_kernel);
-        ggml_build_forward_expand(gf, inp->s_copy);
-    } else if (inp->conv_identity && n_seq_tokens == 1 && cparams.n_rs_seq == 0) {
+    if (inp->conv_identity && n_seq_tokens == 1 && cparams.n_rs_seq == 0) {
         static bool logged = false;
         if (!logged) {
             logged = true;
@@ -1099,11 +1085,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(
     }
 
     ggml_tensor * state = nullptr;
-    if (inp->snapshot_identity || (inp->s_identity && n_seq_tokens == 1)) {
-        // Each sequence reads slot 0 at head + i. Snapshot updates use the AR kernel, which owns each state element in one thread.
-        // The older state-view path stays limited to one token per sequence.
+    if (inp->s_identity && n_seq_tokens == 1) {
+        // every sequence reads its own slot at head + i: read the states in place instead of gathering them
+        // (the new states are still written back below by build_recurrent_attn).
+        // Limited to one token per sequence: the decode kernel writes each state element from the thread that
+        // read it, so updating the cache in place is safe; the chunked prefill kernels are not checked for that
         static bool logged = false;
-        if (!logged && !inp->snapshot_identity) {
+        if (!logged) {
             logged = true;
             LLAMA_LOG_INFO("%s: LLAMA_GDN_STATE_VIEW=1: GDN recurrent states are read as a cache view when the state copies are the identity\n", __func__);
         }

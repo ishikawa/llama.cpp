@@ -54,10 +54,6 @@ bool ggml_metal_moe_fuse_two_token_enabled(void);
 // logs once per path the first time a two-token MoE path is encoded
 void ggml_metal_moe_fuse_two_token_log_once(int path, const char * name);
 
-bool ggml_metal_hc_fuse_two_token_enabled(void);
-// logs once per path the first time a two-token HC fusion is encoded
-void ggml_metal_hc_fuse_two_token_log_once(int path, const char * name);
-
 // mat-mat vs mat-vec dispatch; used by both supports_op and ggml_metal_op_mul_mat*
 bool ggml_metal_op_mul_mat_use_fwht (const struct ggml_tensor * op, size_t max_tg_mem);
 bool ggml_metal_op_mul_mat_use_mm   (const struct ggml_tensor * op, bool has_simdgroup_mm);
